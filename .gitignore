@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.pgdata/
+.env
+blobs/
+*.log
+.DS_Store
+apns-key.p8
