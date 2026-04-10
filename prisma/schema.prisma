@@ -37,6 +37,11 @@ model Device {
   launchPresets LaunchPreset[]
   knownProjects KnownProject[]
 
+  // Subscription / trial fields (only meaningful for iOS devices)
+  subscriptionStatus String   @default("none") // none | trial | active | expired
+  trialStartedAt     DateTime?
+  trialExpiresAt     DateTime?
+
   // Device linking (paired devices can see each other's sessions)
   linksAsSource DeviceLink[] @relation("LinkSource")
   linksAsTarget DeviceLink[] @relation("LinkTarget")
@@ -142,6 +147,35 @@ model PushToken {
   updatedAt DateTime @updatedAt
 
   @@unique([deviceId, token])
+}
+
+/// Subscription record — one per originalTransactionId from StoreKit 2.
+/// Tracks payment status independently from devices.
+model Subscription {
+  id                    String    @id @default(cuid())
+  originalTransactionId String    @unique
+  status                String    @default("trial") // trial | active | expired | revoked
+  trialStartedAt        DateTime?
+  trialExpiresAt        DateTime?
+  paidAt                DateTime?
+  revokedAt             DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  devices SubscriptionDevice[]
+}
+
+/// Links a device to a subscription (many devices can share one subscription
+/// via the same Apple ID, but concurrency is enforced at the socket layer).
+model SubscriptionDevice {
+  id             String       @id @default(cuid())
+  subscriptionId String
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id])
+  deviceId       String
+  createdAt      DateTime     @default(now())
+
+  @@unique([subscriptionId, deviceId])
+  @@index([deviceId])
 }
 
 /// Live Activity push token (scoped to a session).

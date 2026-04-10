@@ -3,6 +3,8 @@ import { startApi } from '@/api';
 import { startSocket } from '@/socket/socketServer';
 import { initBlobStore } from '@/blob/blobStore';
 import { config } from '@/config';
+import { expireStaleTrials, findExpiringTrials } from '@/subscription/subscriptionService';
+import { sendTrialExpiryNotification } from '@/push/apns';
 
 async function main() {
     if (!config.masterSecret || config.masterSecret === 'change-me-to-a-random-string') {
@@ -48,6 +50,28 @@ async function main() {
         }
     }, 60 * 60 * 1000); // Run every hour
     console.log('Auto-cleanup scheduled (hourly, 4h threshold)');
+
+    // Subscription cleanup: expire trials + send day-2 notifications (every 30 min)
+    if (config.enforceSubscription) {
+        setInterval(async () => {
+            try {
+                // 1. Expire stale trials
+                await expireStaleTrials();
+
+                // 2. Send push notifications to devices whose trial expires within 24h
+                const expiring = await findExpiringTrials();
+                for (const device of expiring) {
+                    await sendTrialExpiryNotification(device.id);
+                }
+                if (expiring.length > 0) {
+                    console.log(`[subscription-cleanup] Sent trial expiry notifications to ${expiring.length} devices`);
+                }
+            } catch (err) {
+                console.error('[subscription-cleanup] Error:', err);
+            }
+        }, 30 * 60 * 1000); // Every 30 minutes
+        console.log('Subscription cleanup scheduled (every 30 min)');
+    }
 
     const shutdown = async () => {
         console.log('Shutting down...');
