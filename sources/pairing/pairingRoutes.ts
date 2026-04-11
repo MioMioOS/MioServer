@@ -110,6 +110,11 @@ export async function pairingRoutes(app: FastifyInstance) {
             return reply.code(404).send({ error: 'Not found' });
         }
 
+        // Only the initiator can poll their own pairing request
+        if (pairing.responseDeviceId && pairing.response === null && pairing.responseDeviceId !== request.deviceId!) {
+            return reply.code(403).send({ error: 'Access denied' });
+        }
+
         if (pairing.response) {
             // Clean up — pairing complete
             await db.pairingRequest.delete({ where: { id: pairing.id } });

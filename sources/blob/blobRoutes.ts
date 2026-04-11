@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { authMiddleware } from '@/auth/middleware';
+import { getAccessibleDeviceIds } from '@/auth/deviceAccess';
 import { putBlob, readBlob, getBlob } from './blobStore';
 
 const MAX_BLOB_BYTES = 8 * 1024 * 1024; // 8 MB per blob
@@ -47,6 +48,7 @@ export async function blobRoutes(app: FastifyInstance) {
     });
 
     // Download a blob. MioIsland fetches this, then acks via socket to trigger delete.
+    // Scoped: only the uploader or a linked device can download.
     app.get('/v1/blobs/:id', {
         preHandler: authMiddleware,
     }, async (request, reply) => {
@@ -54,6 +56,10 @@ export async function blobRoutes(app: FastifyInstance) {
         const rec = getBlob(id);
         if (!rec) {
             return reply.code(404).send({ error: 'Blob not found' });
+        }
+        const accessible = await getAccessibleDeviceIds(request.deviceId!);
+        if (!accessible.includes(rec.deviceId)) {
+            return reply.code(403).send({ error: 'Access denied' });
         }
         const data = await readBlob(id);
         if (!data) {

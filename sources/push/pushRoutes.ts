@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '@/storage/db';
 import { authMiddleware } from '@/auth/middleware';
+import { canAccessSession } from '@/auth/deviceAccess';
 
 export async function pushRoutes(app: FastifyInstance) {
 
@@ -128,9 +129,14 @@ export async function pushRoutes(app: FastifyInstance) {
                 token: z.string(),
             }),
         },
-    }, async (request) => {
+    }, async (request, reply) => {
         const { sessionId, token } = request.body as { sessionId: string; token: string };
         const deviceId = request.deviceId!;
+
+        // __global__ is a special session ID for the global Live Activity — always allowed.
+        if (sessionId !== '__global__' && !await canAccessSession(deviceId, sessionId)) {
+            return reply.code(403).send({ error: 'Access denied' });
+        }
 
         await db.liveActivityToken.upsert({
             where: { deviceId_sessionId: { deviceId, sessionId } },
