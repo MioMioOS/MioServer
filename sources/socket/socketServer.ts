@@ -6,7 +6,7 @@ import { config } from '@/config';
 import { EventRouter, type ClientConnection } from './eventRouter';
 import { registerSessionHandler } from './sessionHandler';
 import { registerRpcHandler } from './rpcHandler';
-import { checkAccess, getDeviceSubscription } from '@/subscription/subscriptionService';
+import { checkAccess, getDeviceSubscription, startTrial } from '@/subscription/subscriptionService';
 import * as concurrencyGuard from '@/subscription/concurrencyGuard';
 
 export const eventRouter = new EventRouter();
@@ -42,7 +42,15 @@ export function startSocket(server: HttpServer) {
         // ── Subscription check ──────────────────────────────────────────
         let trackedTransactionId: string | null = null;
         if (config.enforceSubscription) {
-            const access = await checkAccess(payload.deviceId);
+            let access = await checkAccess(payload.deviceId);
+
+            // Auto-start trial for iOS devices that have no subscription yet
+            // (covers existing users who paired before subscription system was deployed)
+            if (!access.allowed && access.reason === 'no_subscription') {
+                await startTrial(payload.deviceId);
+                access = await checkAccess(payload.deviceId);
+            }
+
             if (!access.allowed) {
                 socket.emit('subscription-required', {
                     reason: access.reason,
