@@ -8,6 +8,31 @@ import { getActiveCount } from './concurrencyGuard';
 import { config } from '@/config';
 import { eventRouter } from '@/socket/socketServer';
 
+// Apple Root CA - G3 (ECDSA P-384)
+// Source: https://www.apple.com/certificateauthority/AppleRootCA-G3.cer
+// SHA-256: 63:34:3A:BF:B8:9A:6A:03:EB:B5:7E:9B:3F:5F:A7:BE:7C:4F:5C:75:6F:30:17:B3:A8:C4:88:C3:65:3E:91:79
+const APPLE_ROOT_CA_G3_PEM = `-----BEGIN CERTIFICATE-----
+MIICQzCCAcmgAwIBAgIILcX8iNLFS5UwCgYIKoZIzj0EAwMwZzEbMBkGA1UEAwwS
+QXBwbGUgUm9vdCBDQSAtIEczMSYwJAYDVQQLDB1BcHBsZSBDZXJ0aWZpY2F0aW9u
+IEF1dGhvcml0eTETMBEGA1UECgwKQXBwbGUgSW5jLjELMAkGA1UEBhMCVVMwHhcN
+MTQwNDMwMTgxOTA2WhcNMzkwNDMwMTgxOTA2WjBnMRswGQYDVQQDDBJBcHBsZSBS
+b290IENBIC0gRzMxJjAkBgNVBAsMHUFwcGxlIENlcnRpZmljYXRpb24gQXV0aG9y
+aXR5MRMwEQYDVQQKDApBcHBsZSBJbmMuMQswCQYDVQQGEwJVUzB2MBAGByqGSM49
+AgEGBSuBBAAiA2IABJjpLz1AcqTtkyJygRMc3RCV8cWjTnHcFBbZDuWmBSp3ZHtf
+TjjTuxxEtX/1H7YyYl3J6YRbTzBPEVoA/VhYDKX1DyxNB0cTddqXl5dvMVztK517
+IDvYuVTZXpmkOlEKMaNCMEAwHQYDVR0OBBYEFLuw3qFYM4iapIqZ3r6966/ayySr
+MA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMDA2gA
+MGUCMQCD6cHEFl4aXTQY2e3v9GwOAEZLuN+yRhHFD/3meoyhpmvOwgPUnPWTxnS4
+at+qIxUCMG1mihDK1A3UT82NQz60imOlM27jbdoXt2QfyFMm+YhidDkLF1vLUagM
+6BgD56KyKA==
+-----END CERTIFICATE-----`;
+
+const APPLE_ROOT_CA_G3_FINGERPRINT =
+    '63:34:3A:BF:B8:9A:6A:03:EB:B5:7E:9B:3F:5F:A7:BE:7C:4F:5C:75:6F:30:17:B3:A8:C4:88:C3:65:3E:91:79';
+
+// Pre-instantiate once at module load so startup errors surface immediately
+const TRUSTED_ROOT = new X509Certificate(APPLE_ROOT_CA_G3_PEM);
+
 /**
  * Verify an Apple App Store Server Notification JWS token.
  *
@@ -15,8 +40,9 @@ import { eventRouter } from '@/socket/socketServer';
  * chain is embedded in the JWS header (x5c). Verification steps:
  *  1. Parse x5c → build certificate chain (leaf, intermediate, …, root)
  *  2. Verify each cert is signed by the next one in the chain
- *  3. Confirm the root cert is issued by Apple (subject check)
- *  4. Verify the JWS signature using the leaf cert's public key
+ *  3. Confirm the root cert's SHA-256 fingerprint exactly matches Apple Root CA G3
+ *  4. Verify the chain connects to the trusted root (intermediate signed by root)
+ *  5. Verify the JWS ECDSA signature using the leaf cert's public key
  *
  * Returns the verified decoded payload, or throws on failure.
  */
@@ -41,13 +67,16 @@ async function verifyAppleJWS(token: string): Promise<unknown> {
         }
     }
 
-    // Root cert must be self-signed by an Apple Root CA
+    // Root cert must exactly match the pinned Apple Root CA G3 fingerprint
     const root = certs[certs.length - 1];
-    if (!root.subject.includes('Apple Root CA')) {
-        throw new Error(`Root certificate is not an Apple Root CA (subject: ${root.subject})`);
+    if (root.fingerprint256 !== APPLE_ROOT_CA_G3_FINGERPRINT) {
+        throw new Error(`Root certificate fingerprint mismatch (got ${root.fingerprint256})`);
     }
-    if (!root.verify(root.publicKey)) {
-        throw new Error('Root certificate is not self-signed');
+
+    // Final check: last intermediate must be signed by our trusted root copy
+    const lastIntermediate = certs[certs.length - 2];
+    if (!lastIntermediate.verify(TRUSTED_ROOT.publicKey)) {
+        throw new Error('Certificate chain does not connect to trusted Apple Root CA G3');
     }
 
     // Verify JWS signature with leaf cert's public key
