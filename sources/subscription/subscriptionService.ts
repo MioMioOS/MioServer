@@ -94,15 +94,19 @@ export async function verifyPayment(
     deviceId: string,
     originalTransactionId: string
 ): Promise<{ success: boolean; status: string; error?: string }> {
-    // 如果配置了 Apple API 密钥，先和 Apple 核实
+    // Fail-closed: production enforcement requires Apple API keys.
+    // Without them a jailbroken client could fake any transactionId.
     if (config.appleApiKeyId) {
         const isValid = await verifyWithApple(originalTransactionId);
         if (!isValid) {
             console.warn(`[subscription] Apple verification failed for txn=${originalTransactionId}`);
             return { success: false, status: 'invalid', error: 'apple_verification_failed' };
         }
+    } else if (config.enforceSubscription) {
+        console.error('[subscription] APPLE_API_KEY_ID not configured but ENFORCE_SUBSCRIPTION=true — rejecting payment to prevent bypass');
+        return { success: false, status: 'invalid', error: 'server_misconfigured' };
     } else {
-        console.warn(`[subscription] APPLE_API_KEY_ID not set, skipping Apple verification (dev mode)`);
+        console.warn('[subscription] APPLE_API_KEY_ID not set, skipping Apple verification (dev/self-hosted mode)');
     }
 
     const subscription = await db.subscription.upsert({

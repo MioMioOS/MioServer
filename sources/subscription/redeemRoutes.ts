@@ -4,6 +4,31 @@ import { authMiddleware } from '@/auth/middleware';
 import { db } from '@/storage/db';
 import { eventRouter } from '@/socket/socketServer';
 
+// In-memory rate limiter for redeem attempts: max 10 failed attempts per device per hour.
+// Prevents brute-force guessing of FREE-XXXXXXXX codes.
+const redeemFailures = new Map<string, { count: number; resetAt: number }>();
+
+function isRateLimited(deviceId: string): boolean {
+    const now = Date.now();
+    const entry = redeemFailures.get(deviceId);
+    if (!entry || entry.resetAt < now) return false;
+    return entry.count >= 10;
+}
+
+function recordFailure(deviceId: string): void {
+    const now = Date.now();
+    const entry = redeemFailures.get(deviceId);
+    if (!entry || entry.resetAt < now) {
+        redeemFailures.set(deviceId, { count: 1, resetAt: now + 60 * 60 * 1000 });
+    } else {
+        entry.count++;
+    }
+}
+
+function clearFailures(deviceId: string): void {
+    redeemFailures.delete(deviceId);
+}
+
 export async function redeemRoutes(app: FastifyInstance) {
     // ─────────────────────────────────────────────────────────────────────
     // Redeem a promotional code for free access
@@ -20,12 +45,17 @@ export async function redeemRoutes(app: FastifyInstance) {
         const deviceId = request.deviceId!;
         const normalized = code.trim().toUpperCase();
 
+        if (isRateLimited(deviceId)) {
+            return reply.code(429).send({ error: 'rate_limited', message: 'Too many failed attempts. Try again in an hour.' });
+        }
+
         // 查找兑换码
         const redeemCode = await db.redeemCode.findUnique({
             where: { code: normalized },
         });
 
         if (!redeemCode) {
+            recordFailure(deviceId);
             return reply.code(404).send({ error: 'invalid_code', message: 'Invalid redeem code' });
         }
 
@@ -77,6 +107,8 @@ export async function redeemRoutes(app: FastifyInstance) {
                 },
             }),
         ]);
+
+        clearFailures(deviceId);
 
         // 通知连接的 socket
         eventRouter.emitToDevice(deviceId, 'subscription-updated', { status: 'active' });
