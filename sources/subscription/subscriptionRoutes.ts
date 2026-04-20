@@ -1,10 +1,60 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { X509Certificate } from 'node:crypto';
+import { compactVerify, importX509 } from 'jose';
 import { authMiddleware } from '@/auth/middleware';
 import { verifyPayment, checkAccess, getDeviceSubscription, revokeSubscription } from './subscriptionService';
 import { getActiveCount } from './concurrencyGuard';
 import { config } from '@/config';
 import { eventRouter } from '@/socket/socketServer';
+
+/**
+ * Verify an Apple App Store Server Notification JWS token.
+ *
+ * Apple signs all notification payloads with an ECDSA key whose certificate
+ * chain is embedded in the JWS header (x5c). Verification steps:
+ *  1. Parse x5c → build certificate chain (leaf, intermediate, …, root)
+ *  2. Verify each cert is signed by the next one in the chain
+ *  3. Confirm the root cert is issued by Apple (subject check)
+ *  4. Verify the JWS signature using the leaf cert's public key
+ *
+ * Returns the verified decoded payload, or throws on failure.
+ */
+async function verifyAppleJWS(token: string): Promise<unknown> {
+    const parts = token.split('.');
+    if (parts.length !== 3) throw new Error('Not a valid JWS (expected 3 parts)');
+
+    const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    if (!Array.isArray(header.x5c) || header.x5c.length < 2) {
+        throw new Error('JWS header missing x5c certificate chain');
+    }
+
+    const toPEM = (der: string) =>
+        `-----BEGIN CERTIFICATE-----\n${der.match(/.{1,64}/g)!.join('\n')}\n-----END CERTIFICATE-----`;
+
+    const certs = (header.x5c as string[]).map(der => new X509Certificate(toPEM(der)));
+
+    // Verify chain: cert[i] must be signed by cert[i+1]
+    for (let i = 0; i < certs.length - 1; i++) {
+        if (!certs[i].verify(certs[i + 1].publicKey)) {
+            throw new Error(`Certificate chain broken between index ${i} and ${i + 1}`);
+        }
+    }
+
+    // Root cert must be self-signed by an Apple Root CA
+    const root = certs[certs.length - 1];
+    if (!root.subject.includes('Apple Root CA')) {
+        throw new Error(`Root certificate is not an Apple Root CA (subject: ${root.subject})`);
+    }
+    if (!root.verify(root.publicKey)) {
+        throw new Error('Root certificate is not self-signed');
+    }
+
+    // Verify JWS signature with leaf cert's public key
+    const leafPublicKey = await importX509(toPEM(header.x5c[0]), header.alg ?? 'ES256');
+    const { payload } = await compactVerify(token, leafPublicKey);
+    return JSON.parse(new TextDecoder().decode(payload));
+}
 
 export async function subscriptionRoutes(app: FastifyInstance) {
     // ─────────────────────────────────────────────────────────────────────
@@ -85,16 +135,10 @@ export async function subscriptionRoutes(app: FastifyInstance) {
         }
 
         try {
-            const parts = signedPayload.split('.');
-            if (parts.length !== 3) {
-                return reply.code(400).send({ error: 'Invalid JWS format' });
-            }
-
-            const payloadJson = Buffer.from(parts[1], 'base64url').toString('utf8');
-            const payload = JSON.parse(payloadJson);
+            // Verify outer notification JWS (Apple certificate chain + signature)
+            const payload = await verifyAppleJWS(signedPayload) as any;
 
             const notificationType = payload.notificationType;
-
             if (notificationType !== 'REFUND' && notificationType !== 'REVOKE') {
                 return { ok: true, handled: false };
             }
@@ -104,13 +148,8 @@ export async function subscriptionRoutes(app: FastifyInstance) {
                 return reply.code(400).send({ error: 'Missing signedTransactionInfo' });
             }
 
-            const txnParts = signedTxnInfo.split('.');
-            if (txnParts.length !== 3) {
-                return reply.code(400).send({ error: 'Invalid transaction JWS' });
-            }
-
-            const txnJson = Buffer.from(txnParts[1], 'base64url').toString('utf8');
-            const txnInfo = JSON.parse(txnJson);
+            // Verify inner transaction JWS (also signed by Apple)
+            const txnInfo = await verifyAppleJWS(signedTxnInfo) as any;
             const originalTransactionId = txnInfo.originalTransactionId;
 
             if (!originalTransactionId) {
