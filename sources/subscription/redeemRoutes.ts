@@ -118,7 +118,8 @@ export async function redeemRoutes(app: FastifyInstance) {
         clearFailures(deviceId);
 
         // 通知连接的 socket
-        eventRouter.emitToDevice(deviceId, 'subscription-updated', { status: 'active' });
+        const daysLeft = Math.ceil((grantedUntil.getTime() - Date.now()) / (24 * 60 * 60 * 1000));
+        eventRouter.emitToDevice(deviceId, 'subscription-updated', { status: 'active', daysLeft });
 
         console.log(`[redeem] Code ${normalized} redeemed by device ${deviceId}, access until ${grantedUntil.toISOString()}`);
 

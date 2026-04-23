@@ -124,6 +124,7 @@ export async function subscriptionRoutes(app: FastifyInstance) {
             allowed: access.allowed,
             reason: access.reason,
             daysLeft: access.daysLeft,
+            expiresAt: access.expiresAt ?? null,
             maxDevices: config.maxConcurrentDevices,
             currentDevices: sub?.originalTransactionId
                 ? getActiveCount(sub.originalTransactionId)

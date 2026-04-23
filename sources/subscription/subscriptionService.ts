@@ -7,6 +7,7 @@ export interface AccessCheck {
     reason: string;
     status: string;
     daysLeft?: number;
+    expiresAt?: string; // ISO8601 — only set when access has a finite expiry (trial or redeemed)
 }
 
 /** Start a 3-day trial for an iOS device. No-op if already trialing or paid. */
@@ -51,7 +52,7 @@ export async function checkAccess(deviceId: string): Promise<AccessCheck> {
             if (device.trialExpiresAt > now) {
                 const msLeft = device.trialExpiresAt.getTime() - now.getTime();
                 const daysLeft = Math.ceil(msLeft / (24 * 60 * 60 * 1000));
-                return { allowed: true, reason: 'redeemed', status: 'active', daysLeft };
+                return { allowed: true, reason: 'redeemed', status: 'active', daysLeft, expiresAt: device.trialExpiresAt.toISOString() };
             }
             // 兑换码到期
             await db.device.updateMany({
@@ -68,7 +69,7 @@ export async function checkAccess(deviceId: string): Promise<AccessCheck> {
         if (device.trialExpiresAt > now) {
             const msLeft = device.trialExpiresAt.getTime() - now.getTime();
             const daysLeft = Math.ceil(msLeft / (24 * 60 * 60 * 1000));
-            return { allowed: true, reason: 'trial', status: 'trial', daysLeft };
+            return { allowed: true, reason: 'trial', status: 'trial', daysLeft, expiresAt: device.trialExpiresAt.toISOString() };
         }
         // FIX #4: 加条件防止竞态，只更新仍为 trial 状态的记录
         await db.device.updateMany({
