@@ -6,7 +6,7 @@
     "scripts": {
         "build": "tsc --noEmit",
         "dev": "tsx --env-file=.env.dev ./sources/main.ts",
-        "start": "tsx ./sources/main.ts",
+        "start": "prisma migrate deploy && prisma generate && tsx ./sources/main.ts",
         "test": "vitest run",
         "migrate": "dotenv -e .env.dev -- prisma migrate dev",
         "generate": "prisma generate",
