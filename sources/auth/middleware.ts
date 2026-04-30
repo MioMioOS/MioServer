@@ -26,9 +26,11 @@ export function bumpLastSeenAt(deviceId: string) {
     if (prev && now - prev < LAST_SEEN_THROTTLE_MS) return;
     lastSeenWriteAt.set(deviceId, now);
     // Fire-and-forget — never block the request on this.
-    db.device.update({
+    // upsert ensures JWT-only devices (no publicKey) are auto-registered on first auth.
+    db.device.upsert({
         where: { id: deviceId },
-        data: { lastSeenAt: new Date() },
+        create: { id: deviceId, name: 'JWT Device', lastSeenAt: new Date() },
+        update: { lastSeenAt: new Date() },
     }).catch(() => {
         // Most likely cause: deviceId no longer exists (device was deleted
         // out from under us). Drop the throttle entry so a re-registered
