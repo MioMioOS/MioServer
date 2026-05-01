@@ -8,6 +8,15 @@ import { eventRouter } from '@/socket/socketServer';
 
 export async function sessionRoutes(app: FastifyInstance) {
 
+    // Debug: check if device exists
+    app.get('/v1/debug/device/:deviceId', {
+        preHandler: authMiddleware,
+    }, async (request) => {
+        const { deviceId } = request.params as { deviceId: string };
+        const device = await db.device.findUnique({ where: { id: deviceId } });
+        return { deviceId, exists: !!device, device };
+    });
+
     // Remote-launch a new session on a paired Mac. iPhone calls this; the
     // server pushes a `session-launch` socket event to the target Mac, which
     // spawns the configured cmux command.
@@ -127,12 +136,13 @@ export async function sessionRoutes(app: FastifyInstance) {
         const deviceId = request.deviceId!;
 
         // Ensure device record exists before creating session (FK constraint).
-        // This handles JWT devices that may not have been registered yet.
-        await db.device.upsert({
-            where: { id: deviceId },
-            create: { id: deviceId, name: 'Claude Code Sync', kind: 'mac' },
-            update: {},
-        });
+        // Use findFirst + create to avoid upsert unique constraint issues.
+        const existing = await db.device.findFirst({ where: { id: deviceId } });
+        if (!existing) {
+            await db.device.create({
+                data: { id: deviceId, name: 'Claude Code Sync', kind: 'mac', publicKey: deviceId },
+            });
+        }
 
         const session = await db.session.upsert({
             where: { deviceId_tag: { deviceId, tag } },
