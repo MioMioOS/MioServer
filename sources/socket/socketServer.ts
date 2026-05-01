@@ -39,6 +39,8 @@ export function startSocket(server: HttpServer) {
             return;
         }
 
+        console.log(`Socket connection: deviceId=${payload.deviceId}, clientType=${clientType}`);
+
         // ── Subscription check ──────────────────────────────────────────
         let trackedTransactionId: string | null = null;
         if (config.enforceSubscription) {

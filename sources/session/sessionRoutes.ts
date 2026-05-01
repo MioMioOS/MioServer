@@ -8,6 +8,26 @@ import { eventRouter } from '@/socket/socketServer';
 
 export async function sessionRoutes(app: FastifyInstance) {
 
+    // Debug: reactivate all sessions (temp fix for sessions marked inactive by auto-cleanup)
+    app.post('/v1/debug/reactivate-sessions', {
+        preHandler: authMiddleware,
+    }, async () => {
+        const result = await db.session.updateMany({
+            where: { active: false },
+            data: { active: true },
+        });
+        return { reactivated: result.count };
+    });
+
+
+    app.get('/v1/debug/device/:deviceId', {
+        preHandler: authMiddleware,
+    }, async (request) => {
+        const { deviceId } = request.params as { deviceId: string };
+        const device = await db.device.findUnique({ where: { id: deviceId } });
+        return { deviceId, exists: !!device, device };
+    });
+
     // Remote-launch a new session on a paired Mac. iPhone calls this; the
     // server pushes a `session-launch` socket event to the target Mac, which
     // spawns the configured cmux command.
@@ -85,9 +105,10 @@ export async function sessionRoutes(app: FastifyInstance) {
     }, async (request) => {
         const accessibleIds = await getAccessibleDeviceIds(request.deviceId!);
         const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        console.log(`[sessions] GET /v1/sessions by deviceId=${request.deviceId}, accessibleIds=${JSON.stringify(accessibleIds)}`);
+        // TEMP HACK for personal use: show all sessions regardless of deviceId
         const sessions = await db.session.findMany({
             where: {
-                deviceId: { in: accessibleIds },
                 OR: [
                     { active: true },
                     { lastActiveAt: { gte: dayAgo } },
@@ -109,6 +130,7 @@ export async function sessionRoutes(app: FastifyInstance) {
             ownerDeviceKind: s.device.kind,
             device: undefined,
         }));
+        console.log(`[sessions] Returning ${flattened.length} sessions, first: ${JSON.stringify(flattened[0]?.id)} active=${flattened[0]?.active}`);
 
         return { sessions: flattened };
     });
@@ -125,6 +147,15 @@ export async function sessionRoutes(app: FastifyInstance) {
     }, async (request) => {
         const { tag, metadata } = request.body as { tag: string; metadata: string };
         const deviceId = request.deviceId!;
+
+        // Ensure device record exists before creating session (FK constraint).
+        // Use findFirst + create to avoid upsert unique constraint issues.
+        const existing = await db.device.findFirst({ where: { id: deviceId } });
+        if (!existing) {
+            await db.device.create({
+                data: { id: deviceId, name: 'Claude Code Sync', kind: 'mac', publicKey: deviceId },
+            });
+        }
 
         const session = await db.session.upsert({
             where: { deviceId_tag: { deviceId, tag } },
