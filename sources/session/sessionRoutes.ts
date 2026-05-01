@@ -94,9 +94,9 @@ export async function sessionRoutes(app: FastifyInstance) {
     }, async (request) => {
         const accessibleIds = await getAccessibleDeviceIds(request.deviceId!);
         const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        // TEMP HACK for personal use: show all sessions regardless of deviceId
         const sessions = await db.session.findMany({
             where: {
-                deviceId: { in: accessibleIds },
                 OR: [
                     { active: true },
                     { lastActiveAt: { gte: dayAgo } },
