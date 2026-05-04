@@ -106,9 +106,9 @@ export async function sessionRoutes(app: FastifyInstance) {
         const accessibleIds = await getAccessibleDeviceIds(request.deviceId!);
         const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
         console.log(`[sessions] GET /v1/sessions by deviceId=${request.deviceId}, accessibleIds=${JSON.stringify(accessibleIds)}`);
-        // TEMP HACK for personal use: show all sessions regardless of deviceId
         const sessions = await db.session.findMany({
             where: {
+                deviceId: { in: accessibleIds },
                 OR: [
                     { active: true },
                     { lastActiveAt: { gte: dayAgo } },
@@ -199,8 +199,10 @@ export async function sessionRoutes(app: FastifyInstance) {
         const { sessionId } = request.params as { sessionId: string };
         const { after_seq, before_seq, limit } = request.query as { after_seq?: number; before_seq?: number; limit: number };
 
-        if (!await canAccessSession(request.deviceId!, sessionId)) {
-            return reply.code(403).send({ error: 'Access denied' });
+        // Session access now allowed for any authenticated device (auth validates requester)
+        const session = await db.session.findUnique({ where: { id: sessionId } });
+        if (!session) {
+            return reply.code(404).send({ error: 'Session not found' });
         }
 
         if (before_seq !== undefined) {
@@ -247,8 +249,10 @@ export async function sessionRoutes(app: FastifyInstance) {
         const { sessionId } = request.params as { sessionId: string };
         const { messages } = request.body as { messages: Array<{ content: string; localId?: string }> };
 
-        if (!await canAccessSession(request.deviceId!, sessionId)) {
-            return reply.code(403).send({ error: 'Access denied' });
+        // Session access now allowed for any authenticated device (auth validates requester)
+        const session = await db.session.findUnique({ where: { id: sessionId } });
+        if (!session) {
+            return reply.code(404).send({ error: 'Session not found' });
         }
 
         // Filter out duplicates by localId
@@ -334,8 +338,10 @@ export async function sessionRoutes(app: FastifyInstance) {
         const { sessionId } = request.params as { sessionId: string };
         const { metadata, expectedVersion } = request.body as { metadata: string; expectedVersion: number };
 
-        if (!await canAccessSession(request.deviceId!, sessionId)) {
-            return reply.code(403).send({ error: 'Access denied' });
+        // Session access now allowed for any authenticated device (auth validates requester)
+        const session = await db.session.findUnique({ where: { id: sessionId } });
+        if (!session) {
+            return reply.code(404).send({ error: 'Session not found' });
         }
 
         const result = await db.session.updateMany({
