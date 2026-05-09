@@ -2,10 +2,65 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '@/storage/db';
 import { authMiddleware } from '@/auth/middleware';
-import { linkDevices } from '@/auth/deviceAccess';
+import { linkDevices, invalidateAccessCache } from '@/auth/deviceAccess';
 import { eventRouter } from '@/socket/socketServer';
-import { startTrial } from '@/subscription/subscriptionService';
-import { config } from '@/config';
+import { checkAccess } from '@/subscription/subscriptionService';
+
+// In-memory rate limiter for Mac /v1/pairing/redeem-code. 10 fails/hour/device.
+// Separate keyspace from /v1/subscription/redeem (iPhone-side, soon deprecated)
+// so a Mac brute-forcing can't be diluted by also having tried the iPhone path.
+const macRedeemFailures = new Map<string, { count: number; resetAt: number }>();
+
+function macIsRateLimited(deviceId: string): boolean {
+    const now = Date.now();
+    const entry = macRedeemFailures.get(deviceId);
+    if (!entry || entry.resetAt < now) return false;
+    return entry.count >= 10;
+}
+
+function macRecordFailure(deviceId: string): void {
+    const now = Date.now();
+    const entry = macRedeemFailures.get(deviceId);
+    if (!entry || entry.resetAt < now) {
+        macRedeemFailures.set(deviceId, { count: 1, resetAt: now + 60 * 60 * 1000 });
+    } else {
+        entry.count++;
+    }
+}
+
+function macClearFailures(deviceId: string): void {
+    macRedeemFailures.delete(deviceId);
+}
+
+// Propagate a Mac's active trial to a freshly-paired iPhone.
+// Idempotent + safe: only acts when the source is a Mac with a non-expired
+// trialExpiresAt and the target is an iOS device. Lets pairing-after-redeem
+// hand off the entitlement automatically; the iPhone never had to ask.
+async function propagateMacSubscriptionToPhone(macId: string, phoneId: string): Promise<void> {
+    const mac = await db.device.findUnique({
+        where: { id: macId },
+        select: { kind: true, subscriptionStatus: true, trialExpiresAt: true },
+    });
+    if (!mac || mac.kind !== 'mac') return;
+    if (mac.subscriptionStatus !== 'active') return;
+    if (!mac.trialExpiresAt || mac.trialExpiresAt < new Date()) return;
+
+    const result = await db.device.updateMany({
+        where: { id: phoneId, kind: 'ios' },
+        data: {
+            subscriptionStatus: 'active',
+            trialExpiresAt: mac.trialExpiresAt,
+        },
+    });
+    if (result.count === 0) return;
+
+    const daysLeft = Math.max(
+        0,
+        Math.ceil((mac.trialExpiresAt.getTime() - Date.now()) / (24 * 60 * 60 * 1000))
+    );
+    eventRouter.emitToDevice(phoneId, 'subscription-updated', { status: 'active', daysLeft });
+    console.log(`[pairing-inherit] Phone ${phoneId} inherited trial from Mac ${macId} (until ${mac.trialExpiresAt.toISOString()})`);
+}
 
 export async function pairingRoutes(app: FastifyInstance) {
 
@@ -81,6 +136,11 @@ export async function pairingRoutes(app: FastifyInstance) {
         if (initiatorDeviceId && initiatorDeviceId !== responderDeviceId) {
             await linkDevices(initiatorDeviceId, responderDeviceId);
             console.log(`[pairing] Linked devices: ${initiatorDeviceId} <-> ${responderDeviceId}`);
+
+            // If either side is a Mac with an active trial, hand the trial to
+            // the other side. Function is a no-op when neither side qualifies.
+            await propagateMacSubscriptionToPhone(initiatorDeviceId, responderDeviceId);
+            await propagateMacSubscriptionToPhone(responderDeviceId, initiatorDeviceId);
         }
 
         // Update pairing with response
@@ -171,23 +231,10 @@ export async function pairingRoutes(app: FastifyInstance) {
 
         await linkDevices(macDevice.id, iosDeviceId);
 
-        // Auto-start trial for iOS device on first pairing
-        if (config.enforceSubscription) {
-            try {
-                const iosDevice = await db.device.findUnique({
-                    where: { id: iosDeviceId },
-                    select: { kind: true, subscriptionStatus: true },
-                });
-                if (iosDevice?.kind === 'ios' && iosDevice.subscriptionStatus === 'none') {
-                    await startTrial(iosDeviceId);
-                }
-            } catch (err) {
-                console.error(`[pairing] Failed to auto-start trial for ${iosDeviceId}:`, err);
-                // 配对成功但试用启动失败，不阻断配对流程
-            }
-        }
-
         console.log(`[pairing] Code-redeemed link: ${macDevice.id} <-> ${iosDeviceId}`);
+
+        // Inherit Mac trial if active.
+        await propagateMacSubscriptionToPhone(macDevice.id, iosDeviceId);
 
         return {
             macDeviceId: macDevice.id,
@@ -260,6 +307,9 @@ export async function pairingRoutes(app: FastifyInstance) {
             return reply.code(404).send({ error: 'Link not found' });
         }
 
+        // Drop cached access decisions so the unlinked device loses access immediately.
+        invalidateAccessCache();
+
         // Cascade push-token cleanup for any device that just became unlinked.
         for (const id of [myDeviceId, targetDeviceId]) {
             const remaining = await db.deviceLink.count({
@@ -283,7 +333,262 @@ export async function pairingRoutes(app: FastifyInstance) {
             sourceDeviceId: myDeviceId,
         });
 
+        // If either side is a Mac whose inherited-trial banner depended on
+        // this link, push a fresh subscription-updated so the Mac re-evaluates
+        // (it may now drop back to "未激活" or pick up a different linked
+        // iPhone's trial).
+        for (const id of [myDeviceId, targetDeviceId]) {
+            const peer = await db.device.findUnique({
+                where: { id },
+                select: { kind: true },
+            });
+            if (peer?.kind === 'mac') {
+                const access = await checkAccess(id);
+                const source =
+                    access.reason === 'inherited_from_phone'
+                        ? 'inherited'
+                        : access.reason === 'mac_redeemed'
+                          ? 'redeem_code'
+                          : null;
+                eventRouter.emitToDevice(id, 'subscription-updated', {
+                    status: access.status,
+                    expiresAt: access.expiresAt ?? null,
+                    source,
+                    daysLeft: access.daysLeft ?? null,
+                });
+            }
+        }
+
         console.log(`[pairing] Unlinked ${myDeviceId} <-> ${targetDeviceId}`);
         return { ok: true };
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Mac-side trial redemption (replaces App-side /v1/subscription/redeem
+    // which Apple flagged as Guideline 3.1.1 violation — paid-feature unlock
+    // outside IAP). Mac inputs a FREE-XXXXXXXX code, Mac gets the trial,
+    // any iPhone paired to this Mac inherits the entitlement automatically.
+    //
+    // Error envelope is stable: { error: <machine-readable-key>, message: <human> }.
+    // Clients should switch on `error`, not on HTTP status.
+    // ─────────────────────────────────────────────────────────────────────
+    app.post('/v1/pairing/redeem-code', {
+        preHandler: authMiddleware,
+        schema: {
+            body: z.object({ code: z.string().min(1).max(50) }),
+        },
+    }, async (request, reply) => {
+        const macDeviceId = request.deviceId!;
+        const { code } = request.body as { code: string };
+        const normalized = code.trim().toUpperCase();
+
+        try {
+
+        if (macIsRateLimited(macDeviceId)) {
+            return reply.code(429).send({
+                error: 'rate_limited',
+                message: 'Too many failed attempts. Try again in an hour.',
+            });
+        }
+
+        // Confirm the caller is a Mac. Phones can't redeem (Apple rule).
+        // Also fetch existing trialExpiresAt so we can stack new duration on
+        // top of any unexpired remaining trial (additive, not replacing).
+        const device = await db.device.findUnique({
+            where: { id: macDeviceId },
+            select: { kind: true, trialExpiresAt: true, subscriptionStatus: true },
+        });
+        if (!device) {
+            return reply.code(401).send({ error: 'unauthorized', message: 'Device not found' });
+        }
+        if (device.kind !== 'mac') {
+            return reply.code(403).send({
+                error: 'not_a_mac',
+                message: 'Only Mac devices can redeem trial codes',
+            });
+        }
+
+        const redeemCode = await db.redeemCode.findUnique({ where: { code: normalized } });
+        if (!redeemCode) {
+            macRecordFailure(macDeviceId);
+            return reply.code(404).send({ error: 'invalid_code', message: 'Invalid redeem code' });
+        }
+
+        if (redeemCode.expiresAt && redeemCode.expiresAt < new Date()) {
+            return reply.code(410).send({ error: 'code_expired', message: 'This code has expired' });
+        }
+
+        // Admin-revoked codes carry maxUses=0.
+        if (redeemCode.maxUses === 0) {
+            return reply.code(410).send({ error: 'code_revoked', message: 'This code has been revoked' });
+        }
+
+        // Same Mac can't redeem the same code twice.
+        const existingUsage = await db.redeemCodeUsage.findUnique({
+            where: {
+                redeemCodeId_deviceId: {
+                    redeemCodeId: redeemCode.id,
+                    deviceId: macDeviceId,
+                },
+            },
+        });
+        if (existingUsage) {
+            return reply.code(409).send({
+                error: 'already_redeemed',
+                message: 'This Mac has already used this code',
+            });
+        }
+
+        // Stacking semantics: new duration is added ON TOP of the EFFECTIVE
+        // remaining trial — which for a Mac includes any trial inherited from
+        // linked iPhones (`getLongestLinkedPhoneTrial` inside checkAccess).
+        //
+        // Why effective and not just self trial:
+        //   User's mental model is "I see N days, I redeem M days, I should
+        //   see N+M days." If a Mac shows 14 days inherited from a paired
+        //   iPhone and you redeem a 3-day code, the user expects 17 days, not
+        //   3 (which is what a self-only check would give since the Mac's own
+        //   trialExpiresAt is empty/expired). Honoring the inheritance source
+        //   makes the redeem button behave consistently with the displayed
+        //   remaining time, regardless of where that time came from.
+        //
+        // checkAccess for a Mac returns max(self trial, longest linked iPhone
+        // trial), so this single call gives the correct baseTime for all
+        // four edge cases:
+        //   - self only           → baseTime = self expiry
+        //   - inherited only      → baseTime = longest iPhone expiry
+        //   - both (self < inh)   → baseTime = inherited (longer wins)
+        //   - both (self > inh)   → baseTime = self
+        //   - neither (or expired)→ baseTime = now
+        const access = await checkAccess(macDeviceId);
+        const effectiveExpiresAt = access.expiresAt
+            ? new Date(access.expiresAt)
+            : null;
+        const now = Date.now();
+        const baseTime =
+            effectiveExpiresAt && effectiveExpiresAt.getTime() > now
+                ? effectiveExpiresAt.getTime()
+                : now;
+        const grantedUntil = new Date(baseTime + redeemCode.durationDays * 24 * 60 * 60 * 1000);
+
+        // Atomic exhausted-check + bump + write inside a transaction so
+        // concurrent redeems can't oversell a maxUses=N code.
+        try {
+            await db.$transaction(async (tx) => {
+                const fresh = await tx.redeemCode.findUnique({
+                    where: { id: redeemCode.id },
+                    select: { usedCount: true, maxUses: true },
+                });
+                if (!fresh || fresh.usedCount >= fresh.maxUses) {
+                    throw Object.assign(new Error('exhausted'), { code: 'code_exhausted' });
+                }
+
+                await tx.redeemCodeUsage.create({
+                    data: { redeemCodeId: redeemCode.id, deviceId: macDeviceId, grantedUntil },
+                });
+                await tx.redeemCode.update({
+                    where: { id: redeemCode.id },
+                    data: { usedCount: { increment: 1 } },
+                });
+                await tx.device.update({
+                    where: { id: macDeviceId },
+                    data: {
+                        subscriptionStatus: 'active',
+                        trialExpiresAt: grantedUntil,
+                    },
+                });
+            });
+        } catch (err: any) {
+            if (err?.code === 'code_exhausted') {
+                return reply.code(410).send({
+                    error: 'code_exhausted',
+                    message: 'This code has been fully redeemed',
+                });
+            }
+            throw err;
+        }
+
+        macClearFailures(macDeviceId);
+
+        // Propagate to every iPhone already paired to this Mac, both as
+        // persistent device state (so a later reconnect sees active) and
+        // as a live socket event (so an in-app screen updates immediately).
+        const links = await db.deviceLink.findMany({
+            where: {
+                OR: [
+                    { sourceDeviceId: macDeviceId },
+                    { targetDeviceId: macDeviceId },
+                ],
+            },
+            select: { sourceDeviceId: true, targetDeviceId: true },
+        });
+
+        const daysLeft = Math.max(
+            0,
+            Math.ceil((grantedUntil.getTime() - Date.now()) / (24 * 60 * 60 * 1000))
+        );
+
+        // Build the canonical socket payload. Same payload shape goes to the
+        // Mac itself (so its banner refreshes live) and to every linked iPhone
+        // (so AppState picks it up — iPhone reads daysLeft already, ignores
+        // expiresAt/source extras).
+        const expiresAtISO = grantedUntil.toISOString();
+        const socketPayload = {
+            status: 'trial',
+            expiresAt: expiresAtISO,
+            source: 'redeem_code',
+            daysLeft,
+        };
+
+        // Self-broadcast so the Mac's own UI reflects the new state without
+        // having to re-fetch /v1/subscription/status.
+        eventRouter.emitToDevice(macDeviceId, 'subscription-updated', socketPayload);
+
+        let propagated = 0;
+        for (const l of links) {
+            const peerId = l.sourceDeviceId === macDeviceId ? l.targetDeviceId : l.sourceDeviceId;
+            // Stack on the iPhone side too: never shrink a longer existing
+            // trial. updateMany with conditional WHERE ensures the iPhone's
+            // trialExpiresAt only moves forward, never backward.
+            const updated = await db.device.updateMany({
+                where: {
+                    id: peerId,
+                    kind: 'ios',
+                    OR: [
+                        { trialExpiresAt: null },
+                        { trialExpiresAt: { lt: grantedUntil } },
+                    ],
+                },
+                data: { subscriptionStatus: 'active', trialExpiresAt: grantedUntil },
+            });
+            if (updated.count > 0) {
+                propagated++;
+                eventRouter.emitToDevice(peerId, 'subscription-updated', socketPayload);
+            }
+        }
+
+        console.log(
+            `[pairing-redeem] Mac ${macDeviceId} redeemed ${normalized}, ` +
+            `granted ${redeemCode.durationDays}d, propagated to ${propagated} iPhone(s)`
+        );
+
+        return {
+            success: true,
+            durationDays: redeemCode.durationDays,
+            expiresAt: expiresAtISO,
+        };
+
+        } catch (err: any) {
+            // Stable envelope for any unexpected failure (DB down, prisma
+            // engine crash, etc.). Client switches on `error`, so giving them
+            // server_error here keeps them on the same code path as for known
+            // errors and prevents falling back to Fastify's default 500 body
+            // which has a different shape.
+            console.error(`[pairing-redeem] Unexpected error for Mac ${macDeviceId}:`, err);
+            return reply.code(500).send({
+                error: 'server_error',
+                message: err?.message || 'Internal server error',
+            });
+        }
     });
 }

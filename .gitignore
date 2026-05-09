@@ -1,8 +1,11 @@
 node_modules/
 dist/
 .pgdata/
+
+# Secrets — never commit. Use .env.example for templates only.
 .env
-blobs/
-*.log
-.DS_Store
-apns-key.p8
+.env.*
+!.env.example
+*.p8
+*.pem
+*.key
