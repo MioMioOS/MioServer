@@ -54,24 +54,31 @@ export class EventRouter {
         filter: RecipientFilter,
         skipSocket?: Socket
     ) {
-        // Only send to devices that are linked to the sender (including the sender itself).
-        const allowedIds = new Set(await getAccessibleDeviceIds(senderDeviceId));
-        let sent = 0;
-        let skipped = 0;
-        for (const [devId, conns] of this.connections.entries()) {
-            if (!allowedIds.has(devId)) { skipped += conns.size; continue; }
-            for (const conn of conns) {
-                if (conn.socket === skipSocket) { skipped++; continue; }
-                if (this.shouldSend(conn, filter)) {
-                    conn.socket.emit(event, payload);
-                    sent++;
-                } else {
-                    skipped++;
+        // Wrap entire body: an unhandled rejection (e.g. Prisma pool timeout bubbling
+        // from getAccessibleDeviceIds) crashes the Node process and tears down every
+        // active socket. Better to drop one broadcast than restart the whole server.
+        try {
+            const allowedIds = new Set(await getAccessibleDeviceIds(senderDeviceId));
+            let sent = 0;
+            let skipped = 0;
+            for (const [devId, conns] of this.connections.entries()) {
+                if (!allowedIds.has(devId)) { skipped += conns.size; continue; }
+                for (const conn of conns) {
+                    if (conn.socket === skipSocket) { skipped++; continue; }
+                    if (this.shouldSend(conn, filter)) {
+                        conn.socket.emit(event, payload);
+                        sent++;
+                    } else {
+                        skipped++;
+                    }
                 }
             }
+            const type = (payload as any)?.type || event;
+            console.log(`[EventRouter] ${type}: sent=${sent} skipped=${skipped} allowed=${allowedIds.size} totalDevices=${this.connections.size}`);
+        } catch (err) {
+            const type = (payload as any)?.type || event;
+            console.error(`[EventRouter] emitUpdate(${type}) failed, dropping this broadcast:`, (err as Error)?.message);
         }
-        const type = (payload as any)?.type || event;
-        console.log(`[EventRouter] ${type}: sent=${sent} skipped=${skipped} allowed=${allowedIds.size} totalDevices=${this.connections.size}`);
     }
 
     async emitEphemeral(senderDeviceId: string, event: string, payload: unknown) {

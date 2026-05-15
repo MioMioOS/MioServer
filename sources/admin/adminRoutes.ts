@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { db } from '@/storage/db';
 import { config } from '@/config';
 import { eventRouter } from '@/socket/socketServer';
+import { invalidateAccessCache } from '@/auth/deviceAccess';
 
 /** Admin endpoints — protected by MASTER_SECRET bearer token. */
 export async function adminRoutes(app: FastifyInstance) {
@@ -128,6 +129,9 @@ export async function adminRoutes(app: FastifyInstance) {
         await db.pushToken.deleteMany({ where: { deviceId } });
         await db.liveActivityToken.deleteMany({ where: { deviceId } });
         await db.device.delete({ where: { id: deviceId } }).catch(() => {});
+
+        // Drop cached pairing decisions so other devices stop seeing the deleted one.
+        invalidateAccessCache();
 
         return { ok: true, deletedSessions: sessionIds.length };
     });
