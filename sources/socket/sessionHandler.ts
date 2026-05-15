@@ -6,6 +6,7 @@ import { canAccessSession, getAccessibleDeviceIds } from '@/auth/deviceAccess';
 import { sendPushToDevice, sendLiveActivityUpdate } from '@/push/apns';
 import { deleteBlob } from '@/blob/blobStore';
 import { config } from '@/config';
+import { extractLatestQAndA, extractMessageSummary, extractPhaseSummary } from './chatContent';
 
 /// How long after a device's last successful auth we keep pushing alerts
 /// to it. We use the JWT TTL plus a 1-day grace so brief downtime doesn't
@@ -56,27 +57,8 @@ async function fetchLatestQAndA(sessionId: string): Promise<{ userText: string; 
         select: { content: true },
     });
 
-    let userText = '';
-    let assistantText = '';
-
-    for (const m of recent) {
-        if (userText && assistantText) break;
-        try {
-            const parsed = JSON.parse(m.content);
-            if (parsed?.type === 'user' && !userText) {
-                userText = (parsed.text || '').toString();
-            } else if (parsed?.type === 'assistant' && !assistantText) {
-                assistantText = (parsed.text || '').toString();
-            }
-        } catch {
-            // Plain-text bodies (the phone path) are user messages.
-            if (!userText) {
-                userText = m.content;
-            }
-        }
-    }
-
-    return { userText, assistantText };
+    // `recent` is DESC by seq; extractLatestQAndA expects chronological (oldest→newest).
+    return extractLatestQAndA([...recent].reverse().map((m) => m.content));
 }
 
 /// Strip excessive whitespace and trim a body of text to a hard limit. iOS
@@ -259,10 +241,11 @@ export function registerSessionHandler(
 
             // Handle phase messages: push Live Activity update via APNs
             try {
-                const parsed = JSON.parse(data.message);
+                const summary = extractMessageSummary(data.message);
+                const phaseSummary = extractPhaseSummary(data.message);
 
-                if (parsed.type === 'phase') {
-                    console.log(`[Phase] session=${data.sid.substring(0,10)} phase=${parsed.phase} tool=${parsed.toolName || '-'}`);
+                if (phaseSummary) {
+                    console.log(`[Phase] session=${data.sid.substring(0,10)} phase=${phaseSummary.phase} tool=${phaseSummary.toolName || '-'}`);
 
                     // Find GLOBAL Live Activity tokens — only for iPhones linked to this Mac.
                     const linkedIds = await getAccessibleDeviceIds(deviceId);
@@ -287,10 +270,10 @@ export function registerSessionHandler(
                             activeSessionId: data.sid,
                             projectName,
                             projectPath,
-                            phase: parsed.phase || 'idle',
-                            toolName: parsed.toolName || null,
-                            lastUserMessage: parsed.lastUserMessage || null,
-                            lastAssistantSummary: parsed.lastAssistantSummary || null,
+                            phase: phaseSummary.phase || 'idle',
+                            toolName: phaseSummary.toolName || null,
+                            lastUserMessage: phaseSummary.lastUserMessage || null,
+                            lastAssistantSummary: phaseSummary.lastAssistantSummary || null,
                             totalSessions,
                             activeSessions,
                             startedAt: Date.now() / 1000,
@@ -314,7 +297,7 @@ export function registerSessionHandler(
                     // Detect phase transitions we notify on: non-ended → ended
                     // (completion) and anything → waiting_approval. We DO NOT
                     // fire on every ended heartbeat, only the first.
-                    const newPhase = parsed.phase || 'idle';
+                    const newPhase = phaseSummary.phase || 'idle';
                     const prevPhase = lastPhaseBySession.get(data.sid);
                     lastPhaseBySession.set(data.sid, newPhase);
                     console.log(`[transition] ${data.sid.substring(0,10)} ${prevPhase ?? '(first)'} → ${newPhase}`);
@@ -342,7 +325,7 @@ export function registerSessionHandler(
                                 sessionId: data.sid,
                             }).catch(() => {});
                         } else if (newPhase === 'waiting_approval') {
-                            const tool = (parsed.toolName || 'a tool').toString();
+                            const tool = (phaseSummary.toolName || 'a tool').toString();
                             const { userText } = await fetchLatestQAndA(data.sid);
                             notifyLinkedIPhones({
                                 macDeviceId: sessionInfo.deviceId,
@@ -357,14 +340,14 @@ export function registerSessionHandler(
                 }
 
                 // Tool error → respect per-device notifyOnError
-                if (parsed.type === 'tool' && parsed.toolStatus === 'error') {
+                if (summary.type === 'tool' && summary.toolStatus === 'error') {
                     if (sessionInfo) {
                         const projectName = resolveStableProjectName(sessionInfo.metadata).name;
                         notifyLinkedIPhones({
                             macDeviceId: sessionInfo.deviceId,
                             kind: 'error',
                             title: projectName,
-                            body: `${parsed.toolName || 'Tool'} failed`,
+                            body: `${summary.toolName || 'Tool'} failed`,
                             sessionId: data.sid,
                         }).catch(() => {});
                     }
