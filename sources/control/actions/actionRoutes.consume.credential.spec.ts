@@ -4,25 +4,31 @@
  * Tests the full 5D credential resolution logic in POST /actions/:id/token/consume:
  *   CAS consume → ACTION_KIND_REQUIRES_CREDENTIAL check → scope validation → CredentialStore.resolve
  *
- * 3 failure categories (security invariant):
- *   auth/policy denial  → 403 CREDENTIAL_DENIED           + action=failed   (terminal)
- *   store_unavailable   → 403/503 CREDENTIAL_STORE_UNAVAILABLE + action=needs_human
- *   config_error        → 403 CREDENTIAL_CONFIGURATION_INVALID + action=needs_human
+ * External HTTP contract (anti-enumeration):
+ *   ALL credential failures → 403 TOKEN_NOT_CONSUMABLE (unified, same as CAS rejection)
+ *   Subprocess/daemon only learns "consume failed", not which specific reason.
+ *   Internal reason: action.status (failed | needs_human) + access_log.reason_code
  *
  * Coverage (13 tests — route-level with mocked DB + FixtureCredentialStore):
  *   1.  No credential required (kind not in set) → 200, empty bundle, no DB access for cred
- *   2.  Required (publish_ios), no alias → 403 CREDENTIAL_DENIED, action transitioned to failed
- *   3.  Required, alias, credential not found in DB → 403 CREDENTIAL_DENIED, action failed
- *   4.  Workroom not in scope (workroom mode) → 403 CREDENTIAL_DENIED, action failed
- *   5.  Action kind not in allowed_action_kinds → 403 CREDENTIAL_DENIED, action failed
- *   6.  Credential revoked → 403 CREDENTIAL_DENIED, action failed
- *   7.  Credential expired → 403 CREDENTIAL_DENIED, action failed
- *   8.  store_unavailable → 403 CREDENTIAL_STORE_UNAVAILABLE, action needs_human
- *   9.  credential_not_found in store → 403 CREDENTIAL_CONFIGURATION_INVALID, action needs_human
- *  10.  No credential store configured (credentialStore=undefined) → 503, action needs_human
- *  11.  Full success → 200, bundle item has key/value/kind; access log created; lastUsedAt updated
+ *   2.  Required (publish_ios), no alias → 403 TOKEN_NOT_CONSUMABLE, action=failed
+ *   3.  Required, alias, credential not found in DB → 403 TOKEN_NOT_CONSUMABLE, action=needs_human
+ *   4.  Workroom not in scope (workroom mode) → 403 TOKEN_NOT_CONSUMABLE, action=failed
+ *   5.  Action kind not in allowed_action_kinds → 403 TOKEN_NOT_CONSUMABLE, action=failed
+ *   6.  Credential revoked → 403 TOKEN_NOT_CONSUMABLE, action=failed
+ *   7.  Credential expired → 403 TOKEN_NOT_CONSUMABLE, action=failed
+ *   8.  store_unavailable → 403 TOKEN_NOT_CONSUMABLE, action=needs_human
+ *   9.  credential_not_found in store → 403 TOKEN_NOT_CONSUMABLE, action=needs_human
+ *  10.  No credential store configured → 403 TOKEN_NOT_CONSUMABLE, action=needs_human
+ *  11.  Full success → 200, bundle item: key=alias, value=secret, kind=inject-kind (env_var)
  *  12.  No-leak: event payloads on failure do NOT contain the secret value (controlled enum only)
  *  13.  Org-scoped credential (scopeMode='org') bypasses workroom check → success
+ *
+ * SEMANTIC INVARIANT (product contract):
+ *   `failed`      = policy/auth denial — retrying won't help even if config is fixed
+ *                   (workroom scope, action kind, revoked, expired, no alias on action)
+ *   `needs_human` = configuration/transient error — operator can fix and human reviews
+ *                   (alias not registered, store_unavailable, config_invalid)
  *
  * SECURITY INVARIANTS UNDER TEST:
  *   - reason_code in event payloads is a controlled enum, NOT a secret value
@@ -42,13 +48,13 @@ const mockPublishControlEvent = vi.fn();
 const mockBroadcast = vi.fn();
 
 // DB mocks
-const mockTokenUpdateMany = vi.fn();     // CAS consume
-const mockTokenFindFirst = vi.fn();      // tokenRecord fetch
-const mockActionFindUnique = vi.fn();    // action fetch (kind + credentialAliasRef + workroom.orgId)
-const mockActionUpdate = vi.fn();        // status transition on credential failure
-const mockCredentialFindUnique = vi.fn();  // credential lookup
-const mockAccessLogCreate = vi.fn();       // audit log write
-const mockCredentialUpdate = vi.fn();      // lastUsedAt update
+const mockTokenUpdateMany = vi.fn();      // CAS consume
+const mockTokenFindFirst = vi.fn();       // tokenRecord fetch
+const mockActionFindUnique = vi.fn();     // action fetch (kind + credentialAliasRef + workroom.orgId)
+const mockActionUpdateMany = vi.fn();     // status transition on credential failure (safe CAS updateMany)
+const mockCredentialFindUnique = vi.fn(); // credential lookup
+const mockAccessLogCreate = vi.fn();      // audit log write
+const mockCredentialUpdate = vi.fn();     // lastUsedAt update
 
 vi.mock('@/machines/machineRoutes', () => ({
   verifyMachineToken: (...a: unknown[]) => mockVerifyMachineToken(...a),
@@ -78,8 +84,9 @@ vi.mock('@/storage/db', () => ({
       // Used by fire, cancel, etc. — non-consume routes; provide stubs
       create: vi.fn(),
       findUnique: (...a: unknown[]) => mockActionFindUnique(...a),
-      updateMany: vi.fn().mockResolvedValue({ count: 0 }),
-      update: (...a: unknown[]) => mockActionUpdate(...a),
+      // updateMany: used for the credential failAction safe CAS AND by other routes
+      updateMany: (...a: unknown[]) => mockActionUpdateMany(...a),
+      update: vi.fn(),  // not used in consume credential path
     },
     controlApproval: {
       findUnique: vi.fn(),
@@ -184,7 +191,7 @@ function setupCasSuccess() {
   });
   mockCredentialUpdate.mockResolvedValue({});
   mockAccessLogCreate.mockResolvedValue({ id: 'log-1' });
-  mockActionUpdate.mockResolvedValue({});
+  mockActionUpdateMany.mockResolvedValue({ count: 1 });
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -234,7 +241,7 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
 
   // ── 2. Required, no alias ─────────────────────────────────────────────────
 
-  it('2. publish_ios with no credential_alias_ref → 403 CREDENTIAL_DENIED, action=failed', async () => {
+  it('2. publish_ios with no credential_alias_ref → 403 TOKEN_NOT_CONSUMABLE, action=failed', async () => {
     mockActionFindUnique.mockResolvedValue({
       kind: 'publish_ios',
       credentialAliasRef: null,    // ← no alias
@@ -246,11 +253,11 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
 
     expect(res.statusCode).toBe(403);
     const body = JSON.parse(res.body);
-    expect(body.error.code).toBe('CREDENTIAL_DENIED');
+    expect(body.error.code).toBe('TOKEN_NOT_CONSUMABLE');
 
     // Action must be transitioned to 'failed'
-    expect(mockActionUpdate).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { status: 'failed' } }),
+    expect(mockActionUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: 'failed' }) }),
     );
     // Event topic must be action.failed
     expect(mockPublishControlEvent).toHaveBeenCalledWith(
@@ -263,18 +270,24 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
   });
 
   // ── 3. Credential not found in DB ─────────────────────────────────────────
+  // Alias not registered = operator configuration error → needs_human (not failed).
+  // Operator can register the credential; action needs human review.
 
-  it('3. alias not registered for org → 403 CREDENTIAL_DENIED, action=failed', async () => {
+  it('3. alias not registered for org → 403 TOKEN_NOT_CONSUMABLE, action=needs_human', async () => {
     mockActionFindUnique.mockResolvedValue(FIRED_ACTION_WITH_CRED);
     mockCredentialFindUnique.mockResolvedValue(null);  // not found
 
     const res = await consumeRequest(app);
 
     expect(res.statusCode).toBe(403);
-    expect(JSON.parse(res.body).error.code).toBe('CREDENTIAL_DENIED');
+    expect(JSON.parse(res.body).error.code).toBe('TOKEN_NOT_CONSUMABLE');
 
-    expect(mockActionUpdate).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { status: 'failed' } }),
+    // needs_human (not failed) — config error, operator can fix
+    expect(mockActionUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: 'needs_human' }) }),
+    );
+    expect(mockPublishControlEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ topic: 'action.needs_human' }),
     );
     // No access log when credential not found (no credentialId to reference)
     expect(mockAccessLogCreate).not.toHaveBeenCalled();
@@ -282,7 +295,7 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
 
   // ── 4. Workroom not in scope ──────────────────────────────────────────────
 
-  it('4. workroom not in scope_workroom_ids → 403 CREDENTIAL_DENIED, action=failed', async () => {
+  it('4. workroom not in scope_workroom_ids → 403 TOKEN_NOT_CONSUMABLE, action=failed', async () => {
     mockActionFindUnique.mockResolvedValue(FIRED_ACTION_WITH_CRED);
     mockCredentialFindUnique.mockResolvedValue({
       ...VALID_CREDENTIAL,
@@ -293,10 +306,10 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
     const res = await consumeRequest(app);
 
     expect(res.statusCode).toBe(403);
-    expect(JSON.parse(res.body).error.code).toBe('CREDENTIAL_DENIED');
+    expect(JSON.parse(res.body).error.code).toBe('TOKEN_NOT_CONSUMABLE');
 
-    expect(mockActionUpdate).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { status: 'failed' } }),
+    expect(mockActionUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: 'failed' }) }),
     );
     // Access log written with success=false
     expect(mockAccessLogCreate).toHaveBeenCalledWith(
@@ -308,7 +321,7 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
 
   // ── 5. Action kind not in allowed_action_kinds ────────────────────────────
 
-  it('5. action kind not in allowed_action_kinds → 403 CREDENTIAL_DENIED, action=failed', async () => {
+  it('5. action kind not in allowed_action_kinds → 403 TOKEN_NOT_CONSUMABLE, action=failed', async () => {
     mockActionFindUnique.mockResolvedValue(FIRED_ACTION_WITH_CRED);
     mockCredentialFindUnique.mockResolvedValue({
       ...VALID_CREDENTIAL,
@@ -318,16 +331,16 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
     const res = await consumeRequest(app);
 
     expect(res.statusCode).toBe(403);
-    expect(JSON.parse(res.body).error.code).toBe('CREDENTIAL_DENIED');
+    expect(JSON.parse(res.body).error.code).toBe('TOKEN_NOT_CONSUMABLE');
 
-    expect(mockActionUpdate).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { status: 'failed' } }),
+    expect(mockActionUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: 'failed' }) }),
     );
   });
 
   // ── 6. Credential revoked ─────────────────────────────────────────────────
 
-  it('6. revoked=true → 403 CREDENTIAL_DENIED, action=failed', async () => {
+  it('6. revoked=true → 403 TOKEN_NOT_CONSUMABLE, action=failed', async () => {
     mockActionFindUnique.mockResolvedValue(FIRED_ACTION_WITH_CRED);
     mockCredentialFindUnique.mockResolvedValue({
       ...VALID_CREDENTIAL,
@@ -337,16 +350,16 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
     const res = await consumeRequest(app);
 
     expect(res.statusCode).toBe(403);
-    expect(JSON.parse(res.body).error.code).toBe('CREDENTIAL_DENIED');
+    expect(JSON.parse(res.body).error.code).toBe('TOKEN_NOT_CONSUMABLE');
 
-    expect(mockActionUpdate).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { status: 'failed' } }),
+    expect(mockActionUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: 'failed' }) }),
     );
   });
 
   // ── 7. Credential expired ─────────────────────────────────────────────────
 
-  it('7. expiresAt in the past → 403 CREDENTIAL_DENIED, action=failed', async () => {
+  it('7. expiresAt in the past → 403 TOKEN_NOT_CONSUMABLE, action=failed', async () => {
     mockActionFindUnique.mockResolvedValue(FIRED_ACTION_WITH_CRED);
     mockCredentialFindUnique.mockResolvedValue({
       ...VALID_CREDENTIAL,
@@ -356,16 +369,16 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
     const res = await consumeRequest(app);
 
     expect(res.statusCode).toBe(403);
-    expect(JSON.parse(res.body).error.code).toBe('CREDENTIAL_DENIED');
+    expect(JSON.parse(res.body).error.code).toBe('TOKEN_NOT_CONSUMABLE');
 
-    expect(mockActionUpdate).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { status: 'failed' } }),
+    expect(mockActionUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: 'failed' }) }),
     );
   });
 
   // ── 8. store_unavailable ──────────────────────────────────────────────────
 
-  it('8. CredentialStore throws store_unavailable → 403 CREDENTIAL_STORE_UNAVAILABLE, action=needs_human', async () => {
+  it('8. CredentialStore throws store_unavailable → 403 TOKEN_NOT_CONSUMABLE, action=needs_human', async () => {
     // Override store to throw store_unavailable
     const failingStore = new FixtureCredentialStore();
     // resolve will throw credential_not_found normally; override to store_unavailable
@@ -383,11 +396,11 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
 
       expect(res.statusCode).toBe(403);
       const body = JSON.parse(res.body);
-      expect(body.error.code).toBe('CREDENTIAL_STORE_UNAVAILABLE');
+      expect(body.error.code).toBe('TOKEN_NOT_CONSUMABLE');
 
       // Action transitions to needs_human (recoverable, not terminal)
-      expect(mockActionUpdate).toHaveBeenCalledWith(
-        expect.objectContaining({ data: { status: 'needs_human' } }),
+      expect(mockActionUpdateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ status: 'needs_human' }) }),
       );
       expect(mockPublishControlEvent).toHaveBeenCalledWith(
         expect.objectContaining({ topic: 'action.needs_human' }),
@@ -408,7 +421,7 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
 
   // ── 9. credential_not_found in store ─────────────────────────────────────
 
-  it('9. CredentialStore throws credential_not_found → 403 CREDENTIAL_CONFIGURATION_INVALID, needs_human', async () => {
+  it('9. CredentialStore throws credential_not_found → 403 TOKEN_NOT_CONSUMABLE, needs_human', async () => {
     const failingStore = new FixtureCredentialStore();  // empty — will throw not_found
     vi.spyOn(failingStore, 'resolve').mockRejectedValue(
       new CredentialStoreError('credential_not_found', 'Test: ref not in store'),
@@ -423,10 +436,10 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
       const res = await consumeRequest(testApp);
 
       expect(res.statusCode).toBe(403);
-      expect(JSON.parse(res.body).error.code).toBe('CREDENTIAL_CONFIGURATION_INVALID');
+      expect(JSON.parse(res.body).error.code).toBe('TOKEN_NOT_CONSUMABLE');
 
-      expect(mockActionUpdate).toHaveBeenCalledWith(
-        expect.objectContaining({ data: { status: 'needs_human' } }),
+      expect(mockActionUpdateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ status: 'needs_human' }) }),
       );
       expect(mockAccessLogCreate).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -443,7 +456,7 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
 
   // ── 10. No credential store configured ───────────────────────────────────
 
-  it('10. no credentialStore configured → 503 CREDENTIAL_STORE_UNAVAILABLE, needs_human', async () => {
+  it('10. no credentialStore configured → 403 TOKEN_NOT_CONSUMABLE, needs_human', async () => {
     // Build app WITHOUT a credentialStore
     const noStoreApp = await buildApp(undefined);
     setupCasSuccess();
@@ -453,12 +466,12 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
     try {
       const res = await consumeRequest(noStoreApp);
 
-      expect(res.statusCode).toBe(503);
-      expect(JSON.parse(res.body).error.code).toBe('CREDENTIAL_STORE_UNAVAILABLE');
+      expect(res.statusCode).toBe(403);
+      expect(JSON.parse(res.body).error.code).toBe('TOKEN_NOT_CONSUMABLE');
 
       // Should transition to needs_human (recoverable — operator must wire a store)
-      expect(mockActionUpdate).toHaveBeenCalledWith(
-        expect.objectContaining({ data: { status: 'needs_human' } }),
+      expect(mockActionUpdateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ status: 'needs_human' }) }),
       );
     } finally {
       await noStoreApp.close();
@@ -486,7 +499,8 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
     const item = body.secret_bundle.items[0];
     expect(item.key).toBe('asc-key');          // credential.alias
     expect(item.value).toBe(SECRET_VALUE);     // resolved plaintext
-    expect(item.kind).toBe('asc_api_key');     // credential.kind
+    // inject kind: asc_api_key → 'env_var' (API key injected as environment variable)
+    expect(item.kind).toBe('env_var');         // credentialInjectKind(credential.kind)
 
     // Access log: success=true, no reasonCode
     expect(mockAccessLogCreate).toHaveBeenCalledWith(

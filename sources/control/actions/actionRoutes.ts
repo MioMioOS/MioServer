@@ -94,6 +94,25 @@ function generateActionToken(): { rawToken: string; tokenHash: string } {
   return { rawToken, tokenHash };
 }
 
+/**
+ * Maps ControlCredential.kind (what it is) to secret_bundle item.kind (how to inject).
+ * Subprocess uses item.kind to decide: 'env_var' → setenv; 'file' → write 0600 temp file.
+ *
+ * NOTE: This mapping is the server side of the #18/#19 inject contract.
+ *       mio-agent consumeSubprocess MUST handle both values.
+ *       Default: 'env_var' (API keys, tokens — the primary v1 use cases).
+ *
+ * v1 scope: publish_ios uses asc_api_key → env_var; deploy_web uses vercel_token → env_var.
+ */
+const CREDENTIAL_KIND_TO_INJECT: Readonly<Record<string, 'env_var' | 'file'>> = {
+  cert:    'file',
+  ssh_key: 'file',
+};
+
+function credentialInjectKind(kind: string): 'env_var' | 'file' {
+  return CREDENTIAL_KIND_TO_INJECT[kind] ?? 'env_var';
+}
+
 interface ActionRoutesOptions {
   /**
    * Pluggable credential store for Phase 5D secret resolution.
@@ -692,12 +711,16 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
     //        store_unavailable   → 403 CREDENTIAL_STORE_UNAVAILABLE + action=needs_human
     //        config_error        → 403 CREDENTIAL_CONFIGURATION_INVALID + action=needs_human
     //
-    // Flow:
+    // Flow — failure semantics (product invariant):
     //   kind not in required set              → fast path: empty bundle
-    //   kind required + no alias              → failed (credential_denied)
-    //   alias lookup fails / scope invalid    → failed (credential_denied)
-    //   CredentialStore.resolve throws        → needs_human (recoverable)
+    //   kind required + no alias on action    → failed   (policy: action submitted without required field)
+    //   alias not registered in org           → needs_human (config: operator must register credential)
+    //   scope validation fails                → failed   (policy/auth: workroom/kind/revoked/expired)
+    //   CredentialStore.resolve throws        → needs_human (recoverable config/transient error)
     //   resolve success                       → write access log, update lastUsedAt, return bundle
+    //
+    // Rule: `failed` = policy/auth denial — retrying won't help even if config is fixed.
+    //       `needs_human` = configuration error — operator can fix and a human can assess.
 
     const action = await db.controlAction.findUnique({
       where: { id: actionId },
@@ -728,9 +751,15 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
 
     // ── Helper: transition action status + emit event on credential failure ────
     // PAYLOAD CONTRACT: locator IDs + status enum + reason_code only. NO secrets.
+    //
+    // SAFE CAS: updateMany WHERE status NOT IN HARD_TERMINAL_STATUSES.
+    // Protects against concurrent reconcile or other paths having already advanced the action
+    // to a hard terminal state (canceled, failed, succeeded, transmission_complete).
+    // If the action is already terminal, the update is a no-op (count=0) — we still return the
+    // 403/503 to the daemon; the daemon doesn't need to know the CAS was skipped.
     const failAction = async (status: 'failed' | 'needs_human', reasonCode: string): Promise<void> => {
-      await db.controlAction.update({
-        where: { id: actionId },
+      await db.controlAction.updateMany({
+        where: { id: actionId, status: { notIn: [...HARD_TERMINAL_STATUSES] } },
         data: { status },
       });
       const topic = status === 'failed' ? 'action.failed' : 'action.needs_human';
@@ -751,11 +780,10 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
     // Credential required but no alias configured on this action
     if (!credentialAliasRef) {
       await failAction('failed', 'credential_denied');
+      // Unified TOKEN_NOT_CONSUMABLE — external callers (subprocess) do not need the internal reason.
+      // Reason lives in action.status=failed + access_log.reason_code only.
       return reply.code(403).send({
-        error: {
-          code: 'CREDENTIAL_DENIED',
-          message: 'Action kind requires a credential but credential_alias_ref is not set',
-        },
+        error: { code: 'TOKEN_NOT_CONSUMABLE', message: 'Token not consumable' },
       });
     }
 
@@ -763,10 +791,7 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
     if (!workroomOrgId) {
       await failAction('needs_human', 'credential_configuration_invalid');
       return reply.code(403).send({
-        error: {
-          code: 'CREDENTIAL_CONFIGURATION_INVALID',
-          message: 'Cannot determine org for credential lookup',
-        },
+        error: { code: 'TOKEN_NOT_CONSUMABLE', message: 'Token not consumable' },
       });
     }
 
@@ -787,10 +812,12 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
     });
 
     if (!credential) {
-      // Alias not registered in this org — permanent failure
-      await failAction('failed', 'credential_denied');
+      // Alias not registered in this org — operator configuration error (not policy denial).
+      // Operator can register the credential; human review required. → needs_human.
+      // (Compare: scope/revoked/expired failures are policy denials → failed.)
+      await failAction('needs_human', 'credential_configuration_invalid');
       return reply.code(403).send({
-        error: { code: 'CREDENTIAL_DENIED', message: 'Credential not found for this org/alias' },
+        error: { code: 'TOKEN_NOT_CONSUMABLE', message: 'Token not consumable' },
       });
     }
 
@@ -823,20 +850,18 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
       await writeAccessLog(false, 'credential_denied');
       await failAction('failed', 'credential_denied');
       return reply.code(403).send({
-        error: { code: 'CREDENTIAL_DENIED', message: 'Credential scope validation failed' },
+        error: { code: 'TOKEN_NOT_CONSUMABLE', message: 'Token not consumable' },
       });
     }
 
     // ── CredentialStore.resolve ───────────────────────────────────────────────
     if (!credentialStore) {
-      // No store configured — fail-safe to needs_human (store_unavailable)
+      // No store configured — fail-safe to needs_human (store_unavailable).
+      // Return unified TOKEN_NOT_CONSUMABLE; internal reason in access_log + action.status.
       await writeAccessLog(false, 'credential_store_unavailable');
       await failAction('needs_human', 'credential_store_unavailable');
-      return reply.code(503).send({
-        error: {
-          code: 'CREDENTIAL_STORE_UNAVAILABLE',
-          message: 'No credential store configured on this server',
-        },
+      return reply.code(403).send({
+        error: { code: 'TOKEN_NOT_CONSUMABLE', message: 'Token not consumable' },
       });
     }
 
@@ -852,30 +877,21 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
           await writeAccessLog(false, 'credential_store_unavailable');
           await failAction('needs_human', 'credential_store_unavailable');
           return reply.code(403).send({
-            error: {
-              code: 'CREDENTIAL_STORE_UNAVAILABLE',
-              message: 'Credential store temporarily unavailable',
-            },
+            error: { code: 'TOKEN_NOT_CONSUMABLE', message: 'Token not consumable' },
           });
         }
-        // credential_not_found | credential_config_invalid — both map to config_error
+        // credential_not_found | credential_config_invalid — both map to config_error → needs_human
         await writeAccessLog(false, 'credential_configuration_invalid');
         await failAction('needs_human', 'credential_configuration_invalid');
         return reply.code(403).send({
-          error: {
-            code: 'CREDENTIAL_CONFIGURATION_INVALID',
-            message: 'Credential configuration error (not found or format invalid)',
-          },
+          error: { code: 'TOKEN_NOT_CONSUMABLE', message: 'Token not consumable' },
         });
       }
-      // Unexpected non-CredentialStoreError — treat as transient store_unavailable
+      // Unexpected non-CredentialStoreError — treat as transient store_unavailable → needs_human
       await writeAccessLog(false, 'credential_store_unavailable');
       await failAction('needs_human', 'credential_store_unavailable');
-      return reply.code(503).send({
-        error: {
-          code: 'CREDENTIAL_STORE_UNAVAILABLE',
-          message: 'Unexpected error while resolving credential',
-        },
+      return reply.code(403).send({
+        error: { code: 'TOKEN_NOT_CONSUMABLE', message: 'Token not consumable' },
       });
     }
 
@@ -900,7 +916,9 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
           {
             key: credential.alias,
             value: secretValue,
-            kind: credential.kind,
+            // inject kind: how subprocess consumes this item (env_var | file).
+            // See CREDENTIAL_KIND_TO_INJECT mapping above.
+            kind: credentialInjectKind(credential.kind),
           },
         ],
       },
