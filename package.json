@@ -8,6 +8,8 @@
         "dev": "tsx --env-file=.env.dev ./sources/main.ts",
         "start": "tsx ./sources/main.ts",
         "test": "vitest run",
+        "test:db:setup": "bash scripts/setup-test-db.sh",
+        "test:integration": "vitest run --config vitest.config.integration.ts",
         "migrate": "dotenv -e .env.dev -- prisma migrate dev",
         "generate": "prisma generate",
         "postinstall": "prisma generate",
