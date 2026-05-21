@@ -38,7 +38,7 @@ function tokenExpiresAt(days = TOKEN_EXPIRY_DAYS): Date {
  * Verify a Bearer machine_token from Authorization header.
  * Returns the machine record if valid, or null if invalid/expired.
  */
-async function verifyMachineToken(authHeader: string | undefined) {
+export async function verifyMachineToken(authHeader: string | undefined) {
   if (!authHeader?.startsWith('Bearer ')) return null;
   const token = authHeader.slice(7);
   const hash = hashToken(token);

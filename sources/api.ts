@@ -15,6 +15,11 @@ import { capabilityRoutes } from '@/capabilities/capabilityRoutes';
 import { subscriptionRoutes } from '@/subscription/subscriptionRoutes';
 import { redeemRoutes } from '@/subscription/redeemRoutes';
 import { pagesRoutes } from '@/pages/pagesRoutes';
+// Control plane — machine registration + workroom/task/action APIs
+import { machineRoutes } from '@/machines/machineRoutes';
+import { workroomRoutes } from '@/control/workrooms/workroomRoutes';
+import { taskRoutes } from '@/control/tasks/taskRoutes';
+import { actionRoutes } from '@/control/actions/actionRoutes';
 import { config } from '@/config';
 
 export async function startApi() {
@@ -47,6 +52,11 @@ export async function startApi() {
     await app.register(subscriptionRoutes);
     await app.register(redeemRoutes);
     await app.register(pagesRoutes);
+    // Control plane routes
+    await app.register(machineRoutes);
+    await app.register(workroomRoutes);
+    await app.register(taskRoutes);
+    await app.register(actionRoutes);
 
     await app.listen({ port: config.port, host: '0.0.0.0' });
     console.log(`CodeLight Server listening on port ${config.port}`);
