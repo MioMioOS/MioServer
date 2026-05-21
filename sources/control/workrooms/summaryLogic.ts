@@ -152,7 +152,7 @@ export function deriveArtifactLabel(a: ArtifactMilestones): string {
  *   2. Any approval pending → waiting_approval
  *   3. Any artifact in pending_human_ack → waiting_review
  *   4. Any artifact in pending_external → waiting_external
- *   5. Any action in fired/transmission_complete/reconciling → executing
+ *   5. Any action in fired/reconciling → executing
  *   6. Any task in_progress → in_progress
  *   7. All active tasks done → complete (only if artifacts all accepted)
  *   8. No tasks → planning
