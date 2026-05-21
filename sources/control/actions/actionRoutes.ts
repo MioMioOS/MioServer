@@ -35,9 +35,28 @@
 
 import { FastifyInstance } from 'fastify';
 import { Prisma } from '@prisma/client';
+import { randomUUID } from 'crypto';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
+import { publishControlEvent, type ControlEventResult } from '@/control/events/publishControlEvent';
+import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
+
+/** Publish an event to DB + broadcast to WS subscribers (write-before-broadcast). */
+async function publishAndBroadcast(input: Parameters<typeof publishControlEvent>[0]): Promise<ControlEventResult> {
+  const event = await publishControlEvent(input);
+  if (!event.idempotent) {
+    workroomBroadcaster.broadcast(input.workroomId, {
+      event_id: event.eventId,
+      workroom_id: event.workroomId,
+      seq: event.seq.toString(),
+      topic: event.topic,
+      payload: event.payloadJson as Record<string, unknown>,
+      created_at: event.createdAt.toISOString(),
+    });
+  }
+  return event;
+}
 
 const IRREVERSIBLE_NO_ABORT = 'irreversible_no_abort';
 const FIREABLE_STATUSES = ['proposed', 'approved'];
@@ -118,6 +137,23 @@ export async function actionRoutes(app: FastifyInstance) {
       }
       throw err;
     }
+
+    // Emit action.created — locator + controlled enum only; ActionGate must re-query for authority.
+    // PAYLOAD CONTRACT: only locator IDs + status enums. No free text, no paths, no credentials.
+    await publishAndBroadcast({
+      workroomId,
+      eventId: randomUUID(),
+      topic: 'action.created',
+      payload: {
+        workroom_id: workroomId,
+        action_id: action.id,
+        session_id: action.sessionId,
+        actor_agent_id: action.actorAgentId,
+        reversibility: action.reversibility,          // controlled enum
+        requires_approval: action.requiresApproval,
+        status: action.status,                        // controlled enum
+      },
+    });
 
     return reply.code(201).send({
       action_id: action.id,
@@ -261,6 +297,20 @@ export async function actionRoutes(app: FastifyInstance) {
           },
         });
       }
+
+      // Emit action.status_changed — locator + status enum only. No free text, no credentials.
+      await publishAndBroadcast({
+        workroomId: action.workroomId,
+        eventId: randomUUID(),
+        topic: 'action.status_changed',
+        payload: {
+          workroom_id: action.workroomId,
+          action_id: actionId,
+          session_id: action.sessionId,
+          status: 'fired',                            // controlled enum
+        },
+      });
+
       return { action_id: actionId, fired: true, fired_at: now.toISOString() };
     }
 
@@ -344,6 +394,21 @@ export async function actionRoutes(app: FastifyInstance) {
         return fired;
       });
 
+      // Emit action.status_changed for irreversible_no_abort fire — after transaction commit.
+      // Locator + status enum only. No free text, no credentials, no approval details in payload.
+      await publishAndBroadcast({
+        workroomId: action.workroomId,
+        eventId: randomUUID(),
+        topic: 'action.status_changed',
+        payload: {
+          workroom_id: action.workroomId,
+          action_id: firedAction.id,
+          session_id: firedAction.sessionId,
+          status: 'fired',                            // controlled enum
+          approval_id,                                // locator only — daemon re-queries for details
+        },
+      });
+
       return {
         action_id: firedAction.id,
         fired: true,
@@ -413,6 +478,19 @@ export async function actionRoutes(app: FastifyInstance) {
     await db.controlAction.update({
       where: { id: actionId },
       data: { status: 'canceled' },
+    });
+
+    // Locator + status enum only. No free text, no credentials.
+    await publishAndBroadcast({
+      workroomId: action.workroomId,
+      eventId: randomUUID(),
+      topic: 'action.status_changed',
+      payload: {
+        workroom_id: action.workroomId,
+        action_id: actionId,
+        session_id: action.sessionId,
+        status: 'canceled',                           // controlled enum
+      },
     });
 
     return { action_id: actionId, canceled: true };
@@ -569,6 +647,21 @@ export async function actionRoutes(app: FastifyInstance) {
         expiresAt: body.decision === 'snoozed' && body.new_expires_at
           ? new Date(body.new_expires_at)
           : undefined,
+      },
+    });
+
+    // Emit approval.decided — locator + decision enum only; daemon re-queries before acting.
+    // PAYLOAD CONTRACT: no free text, no reviewer identity, no risk details in broadcast.
+    await publishAndBroadcast({
+      workroomId: approval.workroomId,
+      eventId: randomUUID(),
+      topic: 'approval.decided',
+      payload: {
+        workroom_id: approval.workroomId,
+        approval_id: updated.id,
+        action_id: updated.actionId,                  // locator
+        decision: updated.status,                     // controlled enum: 'approved' | 'rejected' | 'snoozed'
+        decided_at: updated.decidedAt?.toISOString() ?? null,
       },
     });
 
