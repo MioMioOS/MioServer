@@ -58,22 +58,52 @@ function simulatePublish(
 
 const MAX_CATCH_UP_EVENTS = 500;
 
+interface CatchUpExpired {
+  seq_expired: true;
+  reason: 'too_many_behind' | 'prune_gap';
+  current_max_seq: number;
+  min_retained_seq: number | null;
+  events_behind: number;
+}
+interface CatchUpDelta {
+  seq_expired: false;
+  events: SimEvent[];
+  events_behind: number;
+  min_retained_seq: number | null;
+}
+
 function simulateCatchUp(
   store: EventStore,
   workroomId: string,
   afterSeq: number,
   limit: number = MAX_CATCH_UP_EVENTS,
-): { seq_expired: boolean; events: SimEvent[]; events_behind: number } | { seq_expired: true; current_max_seq: number; events_behind: number } {
+): CatchUpExpired | CatchUpDelta {
   const events = store.get(workroomId) ?? [];
+
+  const minRetained = events.length > 0 ? Math.min(...events.map((e) => e.seq)) : null;
+  const maxSeq = events.length > 0 ? Math.max(...events.map((e) => e.seq)) : 0;
   const delta = events.filter((e) => e.seq > afterSeq);
 
-  if (delta.length > MAX_CATCH_UP_EVENTS) {
-    const maxSeq = events.reduce((m, e) => Math.max(m, e.seq), 0);
-    return { seq_expired: true, current_max_seq: maxSeq, events_behind: delta.length };
+  // Condition (a): too many events behind (volume)
+  const tooManyBehind = delta.length > MAX_CATCH_UP_EVENTS;
+
+  // Condition (b): prune gap — after_seq + 1 < min_retained_seq
+  // Client's next expected seq (afterSeq + 1) is before the earliest we have.
+  // Pruned events in the gap [afterSeq+1 .. minRetained-1] are lost.
+  const prunedGap = afterSeq > 0 && minRetained !== null && (afterSeq + 1 < minRetained);
+
+  if (tooManyBehind || prunedGap) {
+    return {
+      seq_expired: true,
+      reason: prunedGap ? 'prune_gap' : 'too_many_behind',
+      current_max_seq: maxSeq,
+      min_retained_seq: minRetained,
+      events_behind: delta.length,
+    };
   }
 
   const slice = delta.slice(0, limit).sort((a, b) => a.seq - b.seq);
-  return { seq_expired: false, events: slice, events_behind: delta.length };
+  return { seq_expired: false, events: slice, events_behind: delta.length, min_retained_seq: minRetained };
 }
 
 // ── ClientCursor monotonicity simulator ───────────────────────────────────────
@@ -185,9 +215,10 @@ describe('Catch-up protocol — after_seq delta', () => {
     // Client claims it saw seq=0 (has missed all 501)
     const result = simulateCatchUp(store, 'wr-cu3', 0);
     expect(result.seq_expired).toBe(true);
-    if ('current_max_seq' in result) {
+    if (result.seq_expired) {
       expect(result.events_behind).toBe(501);
       expect(result.current_max_seq).toBe(501);
+      expect(result.reason).toBe('too_many_behind');
     }
   });
 
@@ -199,6 +230,83 @@ describe('Catch-up protocol — after_seq delta', () => {
     const result = simulateCatchUp(store, 'wr-cu4', 0);
     expect(result.seq_expired).toBe(false);
     if (!result.seq_expired) expect(result.events.length).toBe(500);
+  });
+});
+
+describe('Catch-up — prune gap (seq_expired condition b)', () => {
+  /**
+   * Simulates a store where events 1-50 have been pruned.
+   * Only events 51-100 are retained (min_retained = 51).
+   */
+  function makePrunedStore(workroomId: string): EventStore {
+    const store: EventStore = new Map();
+    // Publish 100 events, then simulate pruning by removing 1-50
+    for (let i = 1; i <= 100; i++) {
+      simulatePublish(store, workroomId, `e${i}`, 't', { seq: i });
+    }
+    // Simulate pruning: remove events 1-50
+    const all = store.get(workroomId)!;
+    store.set(workroomId, all.filter((e) => e.seq > 50));
+    return store;
+  }
+
+  it('returns seq_expired=true with reason=prune_gap when after_seq is in pruned range', () => {
+    const store = makePrunedStore('wr-prune');
+    // Client last saw seq=10, but events 11-50 were pruned → gap!
+    const result = simulateCatchUp(store, 'wr-prune', 10);
+    expect(result.seq_expired).toBe(true);
+    if (result.seq_expired) {
+      expect(result.reason).toBe('prune_gap');
+      expect(result.min_retained_seq).toBe(51);
+      expect(result.current_max_seq).toBe(100);
+    }
+  });
+
+  it('returns seq_expired=true even when events_behind <= 500 (pure prune gap)', () => {
+    const store = makePrunedStore('wr-prune2');
+    // Only 50 events retained (51-100), events_behind = 50 which is ≤ 500
+    // But after_seq=10 is before min_retained=51 → still must expire
+    const result = simulateCatchUp(store, 'wr-prune2', 10);
+    expect(result.seq_expired).toBe(true);
+    // This test is the Coinbyte-like "silent data loss" scenario the old code missed
+  });
+
+  it('returns delta (not expired) when after_seq == min_retained_seq - 1 (exact boundary)', () => {
+    const store = makePrunedStore('wr-prune3');
+    // after_seq = 50, min_retained = 51: client next expects 51, which exists → no gap
+    const result = simulateCatchUp(store, 'wr-prune3', 50);
+    expect(result.seq_expired).toBe(false);
+    if (!result.seq_expired) {
+      expect(result.events.length).toBe(50);  // events 51-100
+      expect(result.events[0].seq).toBe(51);
+    }
+  });
+
+  it('returns delta (not expired) when after_seq = 0 (fresh client, no history expected)', () => {
+    const store = makePrunedStore('wr-prune4');
+    // Client is new (after_seq=0): gets whatever is retained, no prune gap expectation
+    const result = simulateCatchUp(store, 'wr-prune4', 0);
+    expect(result.seq_expired).toBe(false);
+    if (!result.seq_expired) expect(result.events.length).toBe(50);
+  });
+
+  it('returns seq_expired=true when after_seq is one before the gap boundary', () => {
+    const store = makePrunedStore('wr-prune5');
+    // after_seq = 49: next expected = 50, but min_retained = 51 → gap at seq=50
+    const result = simulateCatchUp(store, 'wr-prune5', 49);
+    expect(result.seq_expired).toBe(true);
+    if (result.seq_expired) expect(result.reason).toBe('prune_gap');
+  });
+
+  it('reports min_retained_seq in seq_expired response for client to use as new baseline', () => {
+    const store = makePrunedStore('wr-prune6');
+    const result = simulateCatchUp(store, 'wr-prune6', 1);
+    expect(result.seq_expired).toBe(true);
+    if (result.seq_expired) {
+      // Client uses current_max_seq as new baseline after reloading snapshot
+      expect(result.current_max_seq).toBe(100);
+      expect(result.min_retained_seq).toBe(51);
+    }
   });
 });
 

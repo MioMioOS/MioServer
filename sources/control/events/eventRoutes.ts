@@ -29,9 +29,9 @@
  */
 
 import { FastifyInstance } from 'fastify';
-import { Prisma } from '@prisma/client';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
+import { publishControlEvent } from './publishControlEvent';
 
 /** Max events to return in a single catch-up response before issuing seq_expired. */
 const MAX_CATCH_UP_EVENTS = 500;
@@ -78,70 +78,28 @@ export async function eventRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: { code: 'MISSING_FIELDS', message: 'event_id, topic, payload are required' } });
     }
 
-    try {
-      const event = await db.$transaction(async (tx) => {
-        // ── Step 1: Lock workroom row to serialize seq allocation ──
-        // FOR UPDATE prevents concurrent transactions from computing the same next_seq.
-        // Any concurrent publish to the same workroom waits until this transaction commits.
-        await tx.$queryRaw`
-          SELECT id FROM control_workrooms
-          WHERE id = ${workroomId}::uuid
-          FOR UPDATE
-        `;
+    // Delegate to the single enforced publish path (FOR UPDATE + seq alloc + INSERT).
+    // All event writes in the codebase MUST go through publishControlEvent().
+    // Direct db.controlEventLog.create() calls break the seq guarantee.
+    const event = await publishControlEvent({
+      workroomId,
+      eventId: body.event_id,
+      topic: body.topic,
+      payload: body.payload,
+    });
 
-        // ── Step 2: Compute next seq (per-workroom monotonic counter) ──
-        const seqResult = await tx.$queryRaw<[{ next_seq: bigint }]>`
-          SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
-          FROM control_event_logs
-          WHERE workroom_id = ${workroomId}::uuid
-        `;
-        const nextSeq = seqResult[0].next_seq;
+    // TODO: WS fanout — broadcast to all workroom subscribers after commit.
+    // Write-before-broadcast contract is satisfied (event is in DB before we reach here).
+    // Implementation: call broadcastEvent(event) when WS gateway is ready.
 
-        // ── Step 3: INSERT event — persisted before any WS fanout ──
-        const created = await tx.controlEventLog.create({
-          data: {
-            workroomId,
-            seq: nextSeq,
-            eventId: body.event_id,
-            topic: body.topic,
-            payloadJson: body.payload as Prisma.InputJsonObject,
-          },
-        });
-
-        return created;
-      });
-
-      // TODO: WS fanout — broadcast to all workroom subscribers after commit.
-      // Write-before-broadcast contract is already satisfied above.
-      // Implementation: call broadcastEvent(event) here when WS gateway is ready.
-
-      return reply.code(201).send({
-        event_id: event.eventId,
-        workroom_id: event.workroomId,
-        seq: event.seq.toString(),   // BigInt → string (JSON safe)
-        topic: event.topic,
-        created_at: event.createdAt.toISOString(),
-      });
-
-    } catch (err) {
-      // Idempotency: same event_id already published → return existing event
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-        const existing = await db.controlEventLog.findFirst({
-          where: { eventId: body.event_id },
-        });
-        if (existing) {
-          return reply.code(200).send({
-            event_id: existing.eventId,
-            workroom_id: existing.workroomId,
-            seq: existing.seq.toString(),
-            topic: existing.topic,
-            created_at: existing.createdAt.toISOString(),
-            idempotent: true,
-          });
-        }
-      }
-      throw err;
-    }
+    return reply.code(event.idempotent ? 200 : 201).send({
+      event_id: event.eventId,
+      workroom_id: event.workroomId,
+      seq: event.seq,
+      topic: event.topic,
+      created_at: event.createdAt.toISOString(),
+      ...(event.idempotent ? { idempotent: true } : {}),
+    });
   });
 
   /**
@@ -156,8 +114,16 @@ export async function eventRoutes(app: FastifyInstance) {
    *   → { seq_expired: true, current_max_seq: N }
    *   → Client must reload a full snapshot (workroom summary + current pointers)
    *
+   * seq_expired is true when:
+   *   (a) events_behind > MAX_CATCH_UP_EVENTS (too many missed — volume), OR
+   *   (b) after_seq + 1 < min_retained_seq (prune gap — events between after_seq and
+   *       min_retained_seq were deleted by the retention policy, causing a silent hole)
+   *
+   * Both conditions must be checked. Condition (a) alone allows silent data loss when
+   * after_seq is in a pruned range but events_behind happens to be ≤ 500.
+   *
    * Query params:
-   *   after_seq  — exclusive lower bound (last seq client has applied)
+   *   after_seq  — exclusive lower bound (last seq client has applied). 0 = start of time.
    *   limit      — max events to return (capped at MAX_CATCH_UP_EVENTS)
    *   topic      — optional filter by topic prefix
    */
@@ -174,36 +140,57 @@ export async function eventRoutes(app: FastifyInstance) {
       topic?: string;
     };
 
-    const afterSeq = query.after_seq ? BigInt(query.after_seq) : 0n;
+    // Safe BigInt parsing — reject non-integer strings before BigInt() throws
+    const afterSeqRaw = query.after_seq ?? '0';
+    if (!/^\d+$/.test(afterSeqRaw)) {
+      return reply.code(400).send({ error: { code: 'INVALID_AFTER_SEQ', message: 'after_seq must be a non-negative integer' } });
+    }
+    const afterSeq = BigInt(afterSeqRaw);
     const requestedLimit = query.limit ? Math.min(parseInt(query.limit, 10), MAX_CATCH_UP_EVENTS) : MAX_CATCH_UP_EVENTS;
 
-    // Check how many events are behind BEFORE fetching content.
-    // This avoids loading thousands of events just to tell the client to reload.
-    const [{ events_behind }] = await db.$queryRaw<[{ events_behind: bigint }]>`
-      SELECT COUNT(*) AS events_behind
+    // Fetch min_retained_seq, max_seq, and events_behind in one query.
+    // This avoids loading event bodies just to decide whether to expire.
+    const [bounds] = await db.$queryRaw<[{
+      min_seq: bigint | null;
+      max_seq: bigint | null;
+      events_behind: bigint;
+    }]>`
+      SELECT
+        MIN(seq)                                        AS min_seq,
+        MAX(seq)                                        AS max_seq,
+        COUNT(*) FILTER (WHERE seq > ${afterSeq})       AS events_behind
       FROM control_event_logs
       WHERE workroom_id = ${workroomId}::uuid
-        AND seq > ${afterSeq}
     `;
 
-    const eventsBehind = Number(events_behind);
+    const minRetained = bounds.min_seq;
+    const maxSeq = bounds.max_seq;
+    const eventsBehind = Number(bounds.events_behind);
 
-    if (eventsBehind > MAX_CATCH_UP_EVENTS) {
-      // Too far behind — client must reload full snapshot
-      const [{ current_max_seq }] = await db.$queryRaw<[{ current_max_seq: bigint | null }]>`
-        SELECT MAX(seq) AS current_max_seq
-        FROM control_event_logs
-        WHERE workroom_id = ${workroomId}::uuid
-      `;
+    // ── seq_expired condition (a): too many events behind (volume) ──
+    const tooManyBehind = eventsBehind > MAX_CATCH_UP_EVENTS;
+
+    // ── seq_expired condition (b): prune gap ──
+    // If after_seq + 1 < min_retained_seq, there are pruned events between the
+    // client's position and the earliest event we still have. The client would
+    // silently miss those events if we returned a delta from min_retained onward.
+    // after_seq = 0: client has seen nothing → no prune gap expectation.
+    const prunedGap = afterSeq > 0n && minRetained !== null && (afterSeq + 1n < minRetained);
+
+    if (tooManyBehind || prunedGap) {
       return reply.code(200).send({
         seq_expired: true,
         events_behind: eventsBehind,
-        current_max_seq: current_max_seq?.toString() ?? '0',
-        message: `Too many events missed (${eventsBehind} > ${MAX_CATCH_UP_EVENTS}). Reload snapshot and reconnect from current_max_seq.`,
+        current_max_seq: maxSeq?.toString() ?? '0',
+        min_retained_seq: minRetained?.toString() ?? null,
+        reason: prunedGap ? 'prune_gap' : 'too_many_behind',
+        message: prunedGap
+          ? `Prune gap detected: after_seq=${afterSeq} is before min_retained_seq=${minRetained}. Reload snapshot.`
+          : `Too many events missed (${eventsBehind} > ${MAX_CATCH_UP_EVENTS}). Reload snapshot.`,
       });
     }
 
-    // Fetch delta events
+    // Safe: no prune gap, events_behind ≤ 500 → return delta
     const events = await db.controlEventLog.findMany({
       where: {
         workroomId,
@@ -217,6 +204,7 @@ export async function eventRoutes(app: FastifyInstance) {
     return {
       seq_expired: false,
       events_behind: eventsBehind,
+      min_retained_seq: minRetained?.toString() ?? null,
       events: events.map((e) => ({
         event_id: e.eventId,
         workroom_id: e.workroomId,
@@ -225,7 +213,6 @@ export async function eventRoutes(app: FastifyInstance) {
         payload: e.payloadJson,
         created_at: e.createdAt.toISOString(),
       })),
-      // Hint for client: update apply_seq to the last seq in this batch
       last_seq: events.length > 0 ? events[events.length - 1].seq.toString() : afterSeq.toString(),
     };
   });
@@ -282,6 +269,14 @@ export async function eventRoutes(app: FastifyInstance) {
     }
 
     const topicGroup = body.topic_group ?? 'all';
+
+    // Safe BigInt parsing — reject non-integer strings
+    if (body.apply_seq !== undefined && !/^\d+$/.test(body.apply_seq)) {
+      return reply.code(400).send({ error: { code: 'INVALID_SEQ', message: 'apply_seq must be a non-negative integer' } });
+    }
+    if (body.read_seq !== undefined && !/^\d+$/.test(body.read_seq)) {
+      return reply.code(400).send({ error: { code: 'INVALID_SEQ', message: 'read_seq must be a non-negative integer' } });
+    }
     const newApplySeq = body.apply_seq !== undefined ? BigInt(body.apply_seq) : undefined;
     const newReadSeq = body.read_seq !== undefined ? BigInt(body.read_seq) : undefined;
 

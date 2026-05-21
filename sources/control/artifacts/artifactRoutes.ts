@@ -391,6 +391,132 @@ export async function artifactRoutes(app: FastifyInstance) {
   });
 
   /**
+   * POST /api/v1/artifacts/:id/supersede
+   *
+   * Mark an artifact as superseded by a newer version.
+   * The `accepted` milestone (human_acked_at) is preserved as historical fact —
+   * supersede does NOT undo the ack; it changes the artifact's role going forward.
+   *
+   * Key invariant: disposal/supersede is a SEPARATE decision path from ack.
+   * ack → accepted = "we accepted this artifact as correct at that moment"
+   * supersede → superseded = "a newer artifact replaced this one"
+   * Both can be simultaneously true and are independently auditable.
+   *
+   * Body: { superseded_by_artifact_id: string, reason?: string }
+   */
+  app.post('/api/v1/artifacts/:id/supersede', async (request, reply) => {
+    const machine = await verifyMachineToken(request.headers.authorization);
+    if (!machine) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired machine token' } });
+    }
+
+    const { id: artifactId } = request.params as { id: string };
+    const body = request.body as { superseded_by_artifact_id: string; reason?: string };
+
+    if (!body.superseded_by_artifact_id) {
+      return reply.code(400).send({ error: { code: 'MISSING_FIELDS', message: 'superseded_by_artifact_id is required' } });
+    }
+
+    const artifact = await db.controlArtifact.findUnique({ where: { id: artifactId } });
+    if (!artifact) {
+      return reply.code(404).send({ error: { code: 'ARTIFACT_NOT_FOUND', message: 'Artifact not found' } });
+    }
+    if (artifact.status === 'superseded' || artifact.status === 'disposed') {
+      return reply.code(409).send({
+        error: { code: 'ARTIFACT_ALREADY_TERMINAL', message: `Artifact is already ${artifact.status}` },
+      });
+    }
+
+    // Verify the superseding artifact exists
+    const successor = await db.controlArtifact.findUnique({ where: { id: body.superseded_by_artifact_id } });
+    if (!successor) {
+      return reply.code(404).send({ error: { code: 'SUCCESSOR_NOT_FOUND', message: 'Superseding artifact not found' } });
+    }
+
+    const updated = await db.controlArtifact.update({
+      where: { id: artifactId },
+      data: {
+        status: 'superseded',
+        disposalStatus: 'rolled_forward',
+        // DO NOT touch verifiedAt / externalConfirmedAt / humanAckedAt —
+        // milestones are historical facts and must not be altered by supersede.
+      },
+    });
+
+    return {
+      artifact_id: artifactId,
+      status: updated.status,
+      disposal_status: updated.disposalStatus,
+      superseded_by: body.superseded_by_artifact_id,
+      // Milestone timestamps preserved (not cleared)
+      milestones_preserved: {
+        verified_at: updated.verifiedAt?.toISOString() ?? null,
+        external_confirmed_at: updated.externalConfirmedAt?.toISOString() ?? null,
+        human_acked_at: updated.humanAckedAt?.toISOString() ?? null,
+      },
+    };
+  });
+
+  /**
+   * POST /api/v1/artifacts/:id/dispose
+   *
+   * Mark an artifact as disposed with a specific disposal reason.
+   * Used for: expiry, ignored, remediation_created.
+   *
+   * Like supersede, preserves all milestone timestamps as historical record.
+   * Status transitions to 'disposed'; disposalStatus records the reason.
+   *
+   * Body: { disposal_reason: 'expired' | 'ignored' | 'remediation_created', note?: string }
+   */
+  app.post('/api/v1/artifacts/:id/dispose', async (request, reply) => {
+    const machine = await verifyMachineToken(request.headers.authorization);
+    if (!machine) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired machine token' } });
+    }
+
+    const { id: artifactId } = request.params as { id: string };
+    const body = request.body as {
+      disposal_reason: 'expired' | 'ignored' | 'remediation_created';
+      note?: string;
+    };
+
+    const validReasons = ['expired', 'ignored', 'remediation_created'];
+    if (!body.disposal_reason || !validReasons.includes(body.disposal_reason)) {
+      return reply.code(400).send({ error: { code: 'INVALID_DISPOSAL_REASON', message: `disposal_reason must be one of: ${validReasons.join(' | ')}` } });
+    }
+
+    const artifact = await db.controlArtifact.findUnique({ where: { id: artifactId } });
+    if (!artifact) {
+      return reply.code(404).send({ error: { code: 'ARTIFACT_NOT_FOUND', message: 'Artifact not found' } });
+    }
+    if (artifact.status === 'disposed' || artifact.status === 'superseded') {
+      return reply.code(409).send({
+        error: { code: 'ARTIFACT_ALREADY_TERMINAL', message: `Artifact is already ${artifact.status}` },
+      });
+    }
+
+    const updated = await db.controlArtifact.update({
+      where: { id: artifactId },
+      data: {
+        status: 'disposed',
+        disposalStatus: body.disposal_reason,
+        // DO NOT touch milestone timestamps — they remain as historical record.
+      },
+    });
+
+    return {
+      artifact_id: artifactId,
+      status: updated.status,
+      disposal_status: updated.disposalStatus,
+      milestones_preserved: {
+        verified_at: updated.verifiedAt?.toISOString() ?? null,
+        external_confirmed_at: updated.externalConfirmedAt?.toISOString() ?? null,
+        human_acked_at: updated.humanAckedAt?.toISOString() ?? null,
+      },
+    };
+  });
+
+  /**
    * POST /api/v1/artifacts/:id/set-pointer
    * Upsert a workroom-scoped artifact pointer.
    * UNIQUE(workroom_id, key) — only one "current_deployment" per workroom.
