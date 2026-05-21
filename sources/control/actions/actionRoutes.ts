@@ -285,6 +285,69 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
   });
 
   /**
+   * GET /api/v1/workrooms/:workroomId/actions  (#32, Option A)
+   * List actions in a workroom (read-only). Dual-auth: machine_token OR dev_control_token.
+   * CodeLight fetchActions(workroomId) targets this contract. Same read-only permission
+   * surface as the other control-plane GETs; response carries no token/secret values.
+   */
+  app.get('/api/v1/workrooms/:workroomId/actions', async (request, reply) => {
+    const auth = await authorizeControlRead(request);
+    if (!auth.ok) {
+      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
+    }
+
+    const { workroomId } = request.params as { workroomId: string };
+
+    // machine mode: enforce org/workroom access. dev mode: path workroomId already
+    // matched against token.workroomId in authorizeControlRead.
+    if (auth.mode === 'machine') {
+      const access = await requireMachineAccessToWorkroom(auth.machine, workroomId);
+      if (!access.ok) return reply.code(access.status).send({ error: access.error });
+    }
+
+    const query = request.query as { status?: string; limit?: string };
+    const limit = Math.min(Math.max(Number.parseInt(query.limit ?? '100', 10) || 100, 1), 200);
+
+    const where: Prisma.ControlActionWhereInput = { workroomId };
+    if (query.status) where.status = query.status;
+
+    const [rows, total] = await Promise.all([
+      db.controlAction.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        include: { approvalConsumption: true },
+      }),
+      db.controlAction.count({ where }),
+    ]);
+
+    return {
+      items: rows.map((action) => ({
+        action_id: action.id,
+        workroom_id: action.workroomId,
+        session_id: action.sessionId,
+        task_id: action.taskId,
+        actor_agent_id: action.actorAgentId,
+        kind: action.kind,
+        summary: action.summary,
+        reversibility: action.reversibility,
+        risk_level: action.riskLevel,
+        status: action.status,
+        requires_approval: action.requiresApproval,
+        approval_id: action.approvalId,
+        approved_at_snapshot: action.approvedAtSnapshot?.toISOString() ?? null,
+        fired_at: action.firedAt?.toISOString() ?? null,
+        transmission_completed_at: action.transmissionCompletedAt?.toISOString() ?? null,
+        external_confirmed_at: action.externalConfirmedAt?.toISOString() ?? null,
+        credential_alias_ref: action.credentialAliasRef,
+        approval_consumed: !!action.approvalConsumption,
+        created_at: action.createdAt.toISOString(),
+      })),
+      total,
+    };
+  });
+
+  /**
    * POST /api/v1/actions/:id/fire
    *
    * *** HARD POINT: ACTION FIRE TRANSACTION ***
