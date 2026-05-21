@@ -32,6 +32,7 @@ import { FastifyInstance } from 'fastify';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
 import { publishControlEvent } from './publishControlEvent';
+import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
 
 /** Max events to return in a single catch-up response before issuing seq_expired. */
 const MAX_CATCH_UP_EVENTS = 500;
@@ -88,9 +89,19 @@ export async function eventRoutes(app: FastifyInstance) {
       payload: body.payload,
     });
 
-    // TODO: WS fanout — broadcast to all workroom subscribers after commit.
-    // Write-before-broadcast contract is satisfied (event is in DB before we reach here).
-    // Implementation: call broadcastEvent(event) when WS gateway is ready.
+    // WS fanout — broadcast to all workroom subscribers AFTER DB commit.
+    // Write-before-broadcast contract: event is already in DB before we reach here.
+    // Fanout failure is non-fatal (logged, not thrown). Clients catch up via GET /events?after_seq=N.
+    if (!event.idempotent) {
+      workroomBroadcaster.broadcast(workroomId, {
+        event_id: event.eventId,
+        workroom_id: event.workroomId,
+        seq: event.seq.toString(),
+        topic: event.topic,
+        payload: event.payloadJson as Record<string, unknown>,
+        created_at: event.createdAt.toISOString(),
+      });
+    }
 
     return reply.code(event.idempotent ? 200 : 201).send({
       event_id: event.eventId,
