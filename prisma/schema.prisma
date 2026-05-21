@@ -255,18 +255,48 @@ model ControlOrg {
 
 /// Credential/secret alias. Content lives in secure vault, never in DB.
 model ControlCredential {
-  id         String    @id @default(uuid())
-  orgId      String    @map("org_id")
-  org        ControlOrg @relation(fields: [orgId], references: [id])
-  alias      String
-  kind       String    // asc_api_key | vercel_token | ssh_key | cert | env_group | other
-  scope      String?   // which workrooms/agents may use
-  storageRef String    @map("storage_ref") // pointer to vault; never plain secret
-  createdBy  String    @map("created_by")
-  createdAt  DateTime  @default(now()) @map("created_at")
-  lastUsedAt DateTime? @map("last_used_at")
+  id                  String    @id @default(uuid())
+  orgId               String    @map("org_id")
+  org                 ControlOrg @relation(fields: [orgId], references: [id])
+  alias               String
+  kind                String    // asc_api_key | vercel_token | ssh_key | cert | env_group | other
+  storageRef          String    @map("storage_ref")  // pointer to vault; never plain secret
+  scopeMode           String    @default("workroom") @map("scope_mode")
+                                // 'workroom': scope_workroom_ids ≥1 required
+                                // 'org':      org-wide (admin-only, enforced in API layer)
+  scopeWorkroomIds    String[]  @default([]) @map("scope_workroom_ids")
+                                // UUID strings; app-layer validates org membership
+  allowedActionKinds  String[]  @default([]) @map("allowed_action_kinds")
+                                // empty = no restriction
+  // allowedRuntimeKinds: deferred to post-v1 (no server-authoritative runtime source yet)
+  revoked             Boolean   @default(false)
+  revokedAt           DateTime? @map("revoked_at")
+  expiresAt           DateTime? @map("expires_at")
+  createdBy           String    @map("created_by")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  lastUsedAt          DateTime? @map("last_used_at")
 
+  accessLogs          ControlCredentialAccessLog[]
+
+  @@unique([orgId, alias])
   @@map("control_credentials")
+}
+
+/// Audit log for credential resolution events. NEVER contains secret values.
+model ControlCredentialAccessLog {
+  id           String    @id @default(uuid())
+  credentialId String    @map("credential_id")
+  credential   ControlCredential @relation(fields: [credentialId], references: [id])
+  actionId     String    @map("action_id")
+  action       ControlAction @relation(fields: [actionId], references: [id])
+  machineId    String    @map("machine_id")
+  success      Boolean
+  reasonCode   String?   @map("reason_code")  // controlled enum on failure; NEVER secret values
+  accessedAt   DateTime  @default(now()) @map("accessed_at")
+
+  @@index([credentialId])
+  @@index([actionId])
+  @@map("control_credential_access_logs")
 }
 
 /// Machine registered by mio-agent daemon. machine_token stored in Keychain, not here.
@@ -529,6 +559,7 @@ model ControlAction {
   reconciliations       ControlActionReconciliation[]
   artifacts             ControlArtifact[]
   approvals             ControlApproval[]
+  credentialAccessLogs  ControlCredentialAccessLog[]
 
   @@index([workroomId, status])
   @@index([sessionId])

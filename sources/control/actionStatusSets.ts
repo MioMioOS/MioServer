@@ -99,3 +99,21 @@ export const SUMMARY_TERMINAL_STATUSES = new Set([
  *   - summaryLogic.ts (deriveCurrentPhase, deriveHeadline): executing phase detection.
  */
 export const SUMMARY_EXECUTING_STATUSES = ['fired', 'reconciling'] as const;
+
+/**
+ * Action kinds that require a credential to be resolved at consume time.
+ * Server-authoritative — daemon MUST NOT influence this check via request body.
+ *
+ * When a ControlAction.kind is in this set:
+ *   - action.credential_alias_ref MUST be non-null at consume time
+ *   - CredentialStore.resolve() MUST succeed for the consume to complete
+ *   - Missing alias or failed resolve → fail-closed (403 TOKEN_NOT_CONSUMABLE)
+ *
+ * When not in this set: empty bundle returned, no credential resolution attempted.
+ */
+export const ACTION_KIND_REQUIRES_CREDENTIAL = new Set([
+  'publish_ios',
+  'deploy_web',
+  // Add more action kinds here as credential-requiring actions are defined.
+  // This is the ONLY place where "requires credential" is determined.
+]);
