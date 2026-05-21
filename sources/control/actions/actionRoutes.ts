@@ -48,7 +48,8 @@ import { verifyMachineToken } from '@/machines/machineRoutes';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { publishControlEvent, type ControlEventResult } from '@/control/events/publishControlEvent';
 import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
-import { FIRE_GUARD_STATUSES, HARD_TERMINAL_STATUSES } from '@/control/actionStatusSets';
+import { FIRE_GUARD_STATUSES, HARD_TERMINAL_STATUSES, ACTION_KIND_REQUIRES_CREDENTIAL } from '@/control/actionStatusSets';
+import { type CredentialStore, CredentialStoreError } from '@/control/credentials/credentialStore';
 
 /** Publish an event to DB + broadcast to WS subscribers (write-before-broadcast). */
 async function publishAndBroadcast(input: Parameters<typeof publishControlEvent>[0]): Promise<ControlEventResult> {
@@ -93,7 +94,21 @@ function generateActionToken(): { rawToken: string; tokenHash: string } {
   return { rawToken, tokenHash };
 }
 
-export async function actionRoutes(app: FastifyInstance) {
+interface ActionRoutesOptions {
+  /**
+   * Pluggable credential store for Phase 5D secret resolution.
+   * If not provided, credential-requiring actions will transition to 'needs_human'
+   * (fail-safe: no production credential store configured).
+   *
+   * PROD GUARD: FixtureCredentialStore / AesFileCredentialStore are forbidden in production.
+   * Wire a production-grade KMS/Vault/Keychain adapter here.
+   */
+  credentialStore?: CredentialStore;
+}
+
+export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOptions = {}) {
+  const { credentialStore } = options;
+
   /**
    * POST /api/v1/workrooms/:workroomId/actions
    * Propose a new action. Server enforces the approval invariant:
@@ -654,21 +669,241 @@ export async function actionRoutes(app: FastifyInstance) {
       });
     }
 
-    // Fetch token record for response payload (scope fields bound at issuance).
+    // Fetch token record — includes machineId for Phase 5D audit log.
     // Safe to read after CAS: consumed_at is now set, no race risk.
     const tokenRecord = await db.controlActionToken.findFirst({
       where: { tokenHash, actionId },
-      select: { sessionId: true, workroomId: true },
+      select: { sessionId: true, workroomId: true, machineId: true },
     });
 
-    // v1: empty fixture bundle. Real credential resolution in 5C+.
-    // TODO (5C): resolve action.credentialAliasRef → actual secret bundle items.
+    const sessionId = tokenRecord?.sessionId ?? null;
+    const consumeWorkroomId = tokenRecord?.workroomId ?? null;
+    const machineId = tokenRecord?.machineId ?? null;
+
+    // ── Phase 5D: Credential resolution ───────────────────────────────────────
+    //
+    // SECURITY INVARIANTS:
+    //   1. ACTION_KIND_REQUIRES_CREDENTIAL is the ONLY server-authoritative gate.
+    //      Daemon body fields MUST NOT influence this check.
+    //   2. secretValue appears ONLY in the HTTP response body (TLS only).
+    //      MUST NOT appear in logs, EventLog payloads, or WS fanout.
+    //   3. 3 failure categories:
+    //        auth/policy denial  → 403 CREDENTIAL_DENIED  + action=failed   (terminal)
+    //        store_unavailable   → 403 CREDENTIAL_STORE_UNAVAILABLE + action=needs_human
+    //        config_error        → 403 CREDENTIAL_CONFIGURATION_INVALID + action=needs_human
+    //
+    // Flow:
+    //   kind not in required set              → fast path: empty bundle
+    //   kind required + no alias              → failed (credential_denied)
+    //   alias lookup fails / scope invalid    → failed (credential_denied)
+    //   CredentialStore.resolve throws        → needs_human (recoverable)
+    //   resolve success                       → write access log, update lastUsedAt, return bundle
+
+    const action = await db.controlAction.findUnique({
+      where: { id: actionId },
+      select: {
+        kind: true,
+        credentialAliasRef: true,
+        workroomId: true,
+        workroom: { select: { orgId: true } },
+      },
+    });
+
+    const actionKind = action?.kind ?? '';
+    const credentialAliasRef = action?.credentialAliasRef ?? null;
+    const workroomOrgId = action?.workroom?.orgId ?? null;
+
+    const needsCredential = ACTION_KIND_REQUIRES_CREDENTIAL.has(actionKind);
+
+    // Fast path: kind not in required set → return empty bundle regardless of alias
+    if (!needsCredential) {
+      return reply.code(200).send({
+        consumed: true,
+        action_id: actionId,
+        session_id: sessionId,
+        workroom_id: consumeWorkroomId,
+        secret_bundle: { version: 1, items: [] },
+      });
+    }
+
+    // ── Helper: transition action status + emit event on credential failure ────
+    // PAYLOAD CONTRACT: locator IDs + status enum + reason_code only. NO secrets.
+    const failAction = async (status: 'failed' | 'needs_human', reasonCode: string): Promise<void> => {
+      await db.controlAction.update({
+        where: { id: actionId },
+        data: { status },
+      });
+      const topic = status === 'failed' ? 'action.failed' : 'action.needs_human';
+      await publishAndBroadcast({
+        workroomId: consumeWorkroomId ?? '',
+        eventId: randomUUID(),
+        topic,
+        payload: {
+          workroom_id: consumeWorkroomId,
+          action_id: actionId,
+          session_id: sessionId,
+          status,
+          reason_code: reasonCode,       // controlled enum — NOT secret value
+        },
+      }).catch(() => { /* broadcast failure is non-fatal */ });
+    };
+
+    // Credential required but no alias configured on this action
+    if (!credentialAliasRef) {
+      await failAction('failed', 'credential_denied');
+      return reply.code(403).send({
+        error: {
+          code: 'CREDENTIAL_DENIED',
+          message: 'Action kind requires a credential but credential_alias_ref is not set',
+        },
+      });
+    }
+
+    // Anomaly: action has no workroom/org (should not happen; fail-safe)
+    if (!workroomOrgId) {
+      await failAction('needs_human', 'credential_configuration_invalid');
+      return reply.code(403).send({
+        error: {
+          code: 'CREDENTIAL_CONFIGURATION_INVALID',
+          message: 'Cannot determine org for credential lookup',
+        },
+      });
+    }
+
+    // Fetch ControlCredential by (orgId, alias) — org match guaranteed by lookup key
+    const credential = await db.controlCredential.findUnique({
+      where: { orgId_alias: { orgId: workroomOrgId, alias: credentialAliasRef } },
+      select: {
+        id: true,
+        kind: true,
+        alias: true,
+        storageRef: true,
+        scopeMode: true,
+        scopeWorkroomIds: true,
+        allowedActionKinds: true,
+        revoked: true,
+        expiresAt: true,
+      },
+    });
+
+    if (!credential) {
+      // Alias not registered in this org — permanent failure
+      await failAction('failed', 'credential_denied');
+      return reply.code(403).send({
+        error: { code: 'CREDENTIAL_DENIED', message: 'Credential not found for this org/alias' },
+      });
+    }
+
+    // ── Helper: write ControlCredentialAccessLog ──────────────────────────────
+    // SECURITY: reasonCode is a controlled enum. MUST NOT contain secret values.
+    const writeAccessLog = async (success: boolean, reasonCode: string | null): Promise<void> => {
+      if (!machineId) return;  // no machineId bound at token issuance — skip log
+      await db.controlCredentialAccessLog.create({
+        data: {
+          credentialId: credential.id,
+          actionId,
+          machineId,
+          success,
+          reasonCode,
+        },
+      }).catch(() => { /* access log failure is non-fatal — do not block response */ });
+    };
+
+    // ── Scope validation (4 checks) ───────────────────────────────────────────
+    const workroomInScope =
+      credential.scopeMode === 'org' ||
+      (consumeWorkroomId !== null && credential.scopeWorkroomIds.includes(consumeWorkroomId));
+    const actionKindAllowed =
+      credential.allowedActionKinds.length === 0 ||
+      credential.allowedActionKinds.includes(actionKind);
+    const notRevoked = !credential.revoked;
+    const notExpired = !credential.expiresAt || credential.expiresAt > now;
+
+    if (!workroomInScope || !actionKindAllowed || !notRevoked || !notExpired) {
+      await writeAccessLog(false, 'credential_denied');
+      await failAction('failed', 'credential_denied');
+      return reply.code(403).send({
+        error: { code: 'CREDENTIAL_DENIED', message: 'Credential scope validation failed' },
+      });
+    }
+
+    // ── CredentialStore.resolve ───────────────────────────────────────────────
+    if (!credentialStore) {
+      // No store configured — fail-safe to needs_human (store_unavailable)
+      await writeAccessLog(false, 'credential_store_unavailable');
+      await failAction('needs_human', 'credential_store_unavailable');
+      return reply.code(503).send({
+        error: {
+          code: 'CREDENTIAL_STORE_UNAVAILABLE',
+          message: 'No credential store configured on this server',
+        },
+      });
+    }
+
+    let secretValue: string;
+    try {
+      secretValue = await credentialStore.resolve(credential.storageRef, {
+        credentialId: credential.id,
+        orgId: workroomOrgId,
+      });
+    } catch (err) {
+      if (err instanceof CredentialStoreError) {
+        if (err.reason === 'store_unavailable') {
+          await writeAccessLog(false, 'credential_store_unavailable');
+          await failAction('needs_human', 'credential_store_unavailable');
+          return reply.code(403).send({
+            error: {
+              code: 'CREDENTIAL_STORE_UNAVAILABLE',
+              message: 'Credential store temporarily unavailable',
+            },
+          });
+        }
+        // credential_not_found | credential_config_invalid — both map to config_error
+        await writeAccessLog(false, 'credential_configuration_invalid');
+        await failAction('needs_human', 'credential_configuration_invalid');
+        return reply.code(403).send({
+          error: {
+            code: 'CREDENTIAL_CONFIGURATION_INVALID',
+            message: 'Credential configuration error (not found or format invalid)',
+          },
+        });
+      }
+      // Unexpected non-CredentialStoreError — treat as transient store_unavailable
+      await writeAccessLog(false, 'credential_store_unavailable');
+      await failAction('needs_human', 'credential_store_unavailable');
+      return reply.code(503).send({
+        error: {
+          code: 'CREDENTIAL_STORE_UNAVAILABLE',
+          message: 'Unexpected error while resolving credential',
+        },
+      });
+    }
+
+    // ── Success: write audit log, update lastUsedAt, return bundle ────────────
+    await writeAccessLog(true, null);
+    // Update lastUsedAt — non-fatal if it fails (audit convenience, not security gate)
+    await db.controlCredential.update({
+      where: { id: credential.id },
+      data: { lastUsedAt: now },
+    }).catch(() => { /* non-fatal */ });
+
+    // SECURITY: secretValue appears ONLY here in the HTTP response body (TLS).
+    //           MUST NOT be written to logs, EventLog payloads, or WS fanout.
     return reply.code(200).send({
       consumed: true,
       action_id: actionId,
-      session_id: tokenRecord?.sessionId ?? null,
-      workroom_id: tokenRecord?.workroomId ?? null,
-      secret_bundle: { version: 1, items: [] },
+      session_id: sessionId,
+      workroom_id: consumeWorkroomId,
+      secret_bundle: {
+        version: 1,
+        items: [
+          {
+            key: credential.alias,
+            value: secretValue,
+            kind: credential.kind,
+          },
+        ],
+      },
     });
   });
 
