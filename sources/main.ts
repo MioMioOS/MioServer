@@ -1,6 +1,7 @@
 import { db } from '@/storage/db';
 import { startApi } from '@/api';
 import { startSocket } from '@/socket/socketServer';
+import { attachControlPlaneWs } from '@/control/ws/wsGateway';
 import { initBlobStore } from '@/blob/blobStore';
 import { config } from '@/config';
 import { expireStaleTrials, findExpiringTrials } from '@/subscription/subscriptionService';
@@ -21,6 +22,9 @@ async function main() {
 
     startSocket(app.server);
     console.log('Socket.io ready on /v1/updates');
+
+    attachControlPlaneWs(app.server);
+    console.log('Control plane WebSocket ready on /api/v1/ws/control');
 
     // Auto-cleanup stale sessions every hour (inactive for >4 hours)
     setInterval(async () => {

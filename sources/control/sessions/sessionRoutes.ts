@@ -144,6 +144,9 @@ export async function sessionRoutes(app: FastifyInstance) {
   /**
    * GET /api/v1/workrooms/:workroomId/sessions
    * List sessions in a workroom. Optional ?status= filter (comma-separated).
+   *
+   * Org guard applied: session topology (machineId / displayName / runtime / status) is
+   * org-scoped data — listing must be restricted to the machine's org.
    */
   app.get('/api/v1/workrooms/:workroomId/sessions', async (request, reply) => {
     const machine = await verifyMachineToken(request.headers.authorization);
@@ -152,6 +155,10 @@ export async function sessionRoutes(app: FastifyInstance) {
     }
 
     const { workroomId } = request.params as { workroomId: string };
+
+    const access = await requireMachineAccessToWorkroom(machine, workroomId);
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+
     const query = request.query as { status?: string; limit?: string };
 
     const statusFilter = query.status
@@ -174,6 +181,8 @@ export async function sessionRoutes(app: FastifyInstance) {
   /**
    * GET /api/v1/sessions/:id
    * Get a single session by ID.
+   *
+   * Org guard: session.orgId must match machine.orgId (derived from workroom at creation time).
    */
   app.get('/api/v1/sessions/:id', async (request, reply) => {
     const machine = await verifyMachineToken(request.headers.authorization);
@@ -187,6 +196,11 @@ export async function sessionRoutes(app: FastifyInstance) {
       return reply.code(404).send({ error: { code: 'SESSION_NOT_FOUND', message: 'Session not found' } });
     }
 
+    // Verify machine is authorized for this session's workroom.
+    // session.orgId === workroom.orgId by construction (set at creation); use as override to skip extra DB query.
+    const access = await requireMachineAccessToWorkroom(machine, session.workroomId, { orgId: session.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+
     return formatSession(session);
   });
 
@@ -199,6 +213,10 @@ export async function sessionRoutes(app: FastifyInstance) {
    * - Emits session.status_changed event (write-before-broadcast)
    *
    * Body: { status, current_task_id? }
+   *
+   * Org guard: session.orgId must match machine.orgId. Without this guard, any valid
+   * machine token can flip another org's session to completed/failed and inject
+   * session.status_changed events into their workroom event stream.
    */
   app.patch('/api/v1/sessions/:id/status', async (request, reply) => {
     const machine = await verifyMachineToken(request.headers.authorization);
@@ -217,6 +235,10 @@ export async function sessionRoutes(app: FastifyInstance) {
     if (!current) {
       return reply.code(404).send({ error: { code: 'SESSION_NOT_FOUND', message: 'Session not found' } });
     }
+
+    // Verify machine is authorized for this session's workroom before applying any state change.
+    const access = await requireMachineAccessToWorkroom(machine, current.workroomId, { orgId: current.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     const validationError = validateStatusTransition(current.status, body.status);
     if (validationError) {
@@ -252,6 +274,9 @@ export async function sessionRoutes(app: FastifyInstance) {
    * POST /api/v1/sessions/:id/heartbeat
    * Update lastActivityAt — used by daemon to signal the session is still alive.
    * No status change, no event emitted (heartbeats are high-frequency, not domain events).
+   *
+   * Guard order: findUnique → org guard → terminal check → update.
+   * Guard before terminal check prevents cross-org probing of terminal state via 409 vs 403.
    */
   app.post('/api/v1/sessions/:id/heartbeat', async (request, reply) => {
     const machine = await verifyMachineToken(request.headers.authorization);
@@ -265,6 +290,11 @@ export async function sessionRoutes(app: FastifyInstance) {
     if (!session) {
       return reply.code(404).send({ error: { code: 'SESSION_NOT_FOUND', message: 'Session not found' } });
     }
+
+    // Org guard BEFORE terminal check: cross-org requests must get 403, not 409.
+    // Checking terminal first would leak whether the target session is terminal.
+    const access = await requireMachineAccessToWorkroom(machine, session.workroomId, { orgId: session.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     if (TERMINAL_STATUSES.has(session.status)) {
       return reply.code(409).send({ error: { code: 'SESSION_TERMINAL', message: `Cannot heartbeat a ${session.status} session` } });
