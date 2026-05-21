@@ -22,6 +22,7 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { randomUUID } from 'crypto';
+import { HARD_TERMINAL_STATUSES as _HARD_TERMINAL, PRE_FIRE_STATUSES as _PRE_FIRE } from '@/control/actionStatusSets';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -36,8 +37,9 @@ const VALID_REASON_CODES = new Set([
 
 const FORBIDDEN_BODY_FIELDS = ['action_token', 'token_hash', 'secret', 'stdout', 'stack'];
 
-const HARD_TERMINAL_STATUSES = new Set<ActionStatus>(['canceled', 'failed', 'succeeded', 'transmission_complete']);
-const PRE_FIRE_STATUSES = new Set<ActionStatus>(['proposed', 'approved']);
+// Cast imported sets to typed versions for use in simulation (spec uses ActionStatus type)
+const HARD_TERMINAL_STATUSES = _HARD_TERMINAL as Set<ActionStatus>;
+const PRE_FIRE_STATUSES = _PRE_FIRE as Set<ActionStatus>;
 
 interface SimAction {
   id: string;

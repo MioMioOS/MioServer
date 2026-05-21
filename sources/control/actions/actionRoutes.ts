@@ -48,6 +48,7 @@ import { verifyMachineToken } from '@/machines/machineRoutes';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { publishControlEvent, type ControlEventResult } from '@/control/events/publishControlEvent';
 import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
+import { FIRE_GUARD_STATUSES, HARD_TERMINAL_STATUSES } from '@/control/actionStatusSets';
 
 /** Publish an event to DB + broadcast to WS subscribers (write-before-broadcast). */
 async function publishAndBroadcast(input: Parameters<typeof publishControlEvent>[0]): Promise<ControlEventResult> {
@@ -67,10 +68,9 @@ async function publishAndBroadcast(input: Parameters<typeof publishControlEvent>
 
 const IRREVERSIBLE_NO_ABORT = 'irreversible_no_abort';
 const FIREABLE_STATUSES = ['proposed', 'approved'];
-// NOTE: needs_human is included here for cancel/pre-check purposes only.
-// It is NOT a product completion state — it means "outcome unknown, human review needed."
-// Do NOT count needs_human as done/complete anywhere.
-const TERMINAL_STATUSES = ['fired', 'canceled', 'failed', 'succeeded', 'transmission_complete', 'needs_human'];
+// FIRE_GUARD_STATUSES and HARD_TERMINAL_STATUSES imported from actionStatusSets.ts.
+// Local alias for backward-compatible array usage in notIn query:
+const TERMINAL_STATUSES = [...FIRE_GUARD_STATUSES];
 
 /**
  * TTL for action tokens: 5 minutes.
@@ -766,8 +766,7 @@ export async function actionRoutes(app: FastifyInstance) {
     }
 
     // ── 6. Pre-check: hard terminal states ──
-    const HARD_TERMINAL = new Set(['canceled', 'failed', 'succeeded', 'transmission_complete']);
-    if (HARD_TERMINAL.has(action.status)) {
+    if (HARD_TERMINAL_STATUSES.has(action.status)) {
       return reply.code(409).send({
         error: { code: 'RECONCILE_TERMINAL_CONFLICT', message: `Action is already in terminal state: ${action.status}` },
       });

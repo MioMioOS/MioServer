@@ -18,6 +18,7 @@ import { Prisma } from '@prisma/client';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
+import { SUMMARY_TERMINAL_STATUSES } from '@/control/actionStatusSets';
 import { computeWorkroomSummary, SummaryInputs } from './summaryLogic';
 
 export async function summaryRoutes(app: FastifyInstance) {
@@ -72,9 +73,10 @@ export async function summaryRoutes(app: FastifyInstance) {
     }
 
     // ── 4. Active actions (not terminal) ─────────────────────────────────────
-    const TERMINAL_ACTION_STATUSES = ['succeeded', 'failed', 'canceled', 'rejected'];
+    // Uses centralized SUMMARY_TERMINAL_STATUSES from actionStatusSets.ts.
+    // NOTE: transmission_complete is correctly included (action is done; keep in sync with actionStatusSets.ts).
     const activeActions = await db.controlAction.findMany({
-      where: { workroomId, status: { notIn: TERMINAL_ACTION_STATUSES } },
+      where: { workroomId, status: { notIn: [...SUMMARY_TERMINAL_STATUSES] } },
       select: { id: true, kind: true, summary: true, status: true, reversibility: true, actorAgentId: true },
     });
 
@@ -116,7 +118,7 @@ export async function summaryRoutes(app: FastifyInstance) {
     // Action counts per actor (active only)
     const actionActorGroups = await db.controlAction.groupBy({
       by: ['actorAgentId'],
-      where: { workroomId, status: { notIn: TERMINAL_ACTION_STATUSES } },
+      where: { workroomId, status: { notIn: [...SUMMARY_TERMINAL_STATUSES] } },
       _count: { _all: true },
     });
 
