@@ -118,7 +118,10 @@ afterAll(async () => {
 });
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  // vi.resetAllMocks() clears calls AND resets mock implementations.
+  // This prevents mock implementations set in one test (e.g. mockTransaction in the
+  // irreversible fire test) from persisting into subsequent tests (e.g. write-before-broadcast).
+  vi.resetAllMocks();
   callOrder.length = 0;
   mockVerifyMachineToken.mockResolvedValue({ id: 'machine-1', orgId: 'org-A' });
   mockRequireMachineAccessToWorkroom.mockResolvedValue({ ok: true, workroomOrgId: 'org-A' });
@@ -186,12 +189,14 @@ describe('action events — payload contract', () => {
       reversibility: 'irreversible_no_abort', workroom: { orgId: 'org-A' },
     });
     mockApprovalFindUnique.mockResolvedValue({ id: 'appr-1', actionId: 'act-2', status: 'approved', decidedAt: now, expiresAt: null });
-    // The fire transaction: run the callback with a tx that satisfies the 3 steps.
+    // The fire transaction: run the callback with a tx that satisfies all 4 steps.
+    // Step 4 (Phase 5B): tx.controlActionToken.create must be present.
     mockTransaction.mockImplementation(async (cb: (tx: unknown) => Promise<unknown>) => {
       const tx = {
         controlApproval: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
         controlActionApprovalConsumption: { create: vi.fn().mockResolvedValue({}) },
         controlAction: { update: vi.fn().mockResolvedValue({ id: 'act-2', sessionId: 'sess-1', workroomId: 'wroom-A', firedAt: now, approvedAtSnapshot: now }) },
+        controlActionToken: { create: vi.fn().mockResolvedValue({}) },
       };
       return cb(tx);
     });

@@ -23,9 +23,13 @@
  *
  * Endpoints:
  *   POST   /api/v1/workrooms/:workroomId/actions  → create action proposal
- *   GET    /api/v1/actions/:id                    → get action
+ *   GET    /api/v1/actions/:id                    → get action (NO action_token in response)
  *   PATCH  /api/v1/actions/:id                    → update non-terminal action
  *   POST   /api/v1/actions/:id/fire               → *** FIRE TRANSACTION (hard point) ***
+ *                                                    Returns action_token once; raw token unrecoverable after
+ *   POST   /api/v1/actions/:id/token/consume      → *** CONSUME TOKEN (Phase 5B) ***
+ *                                                    Auth: action_token bearer (NOT machine_token)
+ *                                                    CAS atomic; returns secret_bundle v1=empty fixture
  *   POST   /api/v1/actions/:id/cancel             → cancel action
  *
  *   POST   /api/v1/workrooms/:workroomId/approvals → create approval request
@@ -35,7 +39,7 @@
 
 import { FastifyInstance } from 'fastify';
 import { Prisma } from '@prisma/client';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomBytes, createHash } from 'crypto';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
@@ -61,6 +65,27 @@ async function publishAndBroadcast(input: Parameters<typeof publishControlEvent>
 const IRREVERSIBLE_NO_ABORT = 'irreversible_no_abort';
 const FIREABLE_STATUSES = ['proposed', 'approved'];
 const TERMINAL_STATUSES = ['fired', 'canceled', 'failed', 'succeeded', 'transmission_complete'];
+
+/**
+ * TTL for action tokens: 5 minutes.
+ * Short enough to limit exposure; long enough for subprocess to complete the consume call.
+ */
+const ACTION_TOKEN_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Generate a one-time action capability token.
+ * Format: `act_tok_<base64url(32 random bytes)>` (256-bit entropy).
+ * Prefix enables log scanning for accidental leakage.
+ *
+ * SECURITY: raw token MUST be returned to caller and NEVER logged or stored.
+ * Only the SHA-256 hash goes into the DB.
+ */
+function generateActionToken(): { rawToken: string; tokenHash: string } {
+  const raw = randomBytes(32).toString('base64url');
+  const rawToken = `act_tok_${raw}`;
+  const tokenHash = createHash('sha256').update(rawToken).digest('hex');
+  return { rawToken, tokenHash };
+}
 
 export async function actionRoutes(app: FastifyInstance) {
   /**
@@ -280,25 +305,62 @@ export async function actionRoutes(app: FastifyInstance) {
     // CAS on action status: only fire if still in a fireable state.
     // Prevents double-fire from concurrent retries or duplicate requests.
     if (action.reversibility !== IRREVERSIBLE_NO_ABORT) {
-      const result = await db.controlAction.updateMany({
-        where: {
-          id: actionId,
-          status: { notIn: TERMINAL_STATUSES },  // CAS: reject if already terminal
-        },
-        data: { status: 'fired', firedAt: now },
-      });
-      if (result.count === 0) {
-        // Action transitioned to terminal between the earlier check and this update.
-        const current = await db.controlAction.findUnique({ where: { id: actionId } });
-        return reply.code(409).send({
-          error: {
-            code: 'ACTION_ALREADY_TERMINAL',
-            message: `Action is already in terminal state: ${current?.status ?? 'unknown'}`,
-          },
+      // Generate action token BEFORE the status update so we can store it atomically.
+      // Raw token returned in response ONCE — never logged, never stored in DB.
+      const { rawToken, tokenHash } = generateActionToken();
+      const tokenExpiresAt = new Date(now.getTime() + ACTION_TOKEN_TTL_MS);
+
+      // Interactive transaction: CAS status update + token issuance atomically.
+      let fireCount = 0;
+      try {
+        await db.$transaction(async (tx) => {
+          const result = await tx.controlAction.updateMany({
+            where: {
+              id: actionId,
+              status: { notIn: TERMINAL_STATUSES },  // CAS: reject if already terminal
+            },
+            data: { status: 'fired', firedAt: now },
+          });
+          fireCount = result.count;
+          if (result.count === 0) {
+            // Throw to abort the transaction.
+            throw new FireConflictError('ACTION_ALREADY_TERMINAL', 'Action already in terminal state');
+          }
+          // INSERT token record inside the same transaction.
+          // UNIQUE(action_id) + UNIQUE(token_hash): if a prior fire already issued a token,
+          // this INSERT fails — same protection as approval double-consume backstop.
+          await tx.controlActionToken.create({
+            data: {
+              actionId,
+              tokenHash,
+              sessionId: action.sessionId,
+              workroomId: action.workroomId,
+              machineId: machine.id,
+              expiresAt: tokenExpiresAt,
+            },
+          });
         });
+      } catch (err) {
+        if (err instanceof FireConflictError) {
+          const current = await db.controlAction.findUnique({ where: { id: actionId } });
+          return reply.code(409).send({
+            error: {
+              code: 'ACTION_ALREADY_TERMINAL',
+              message: `Action is already in terminal state: ${current?.status ?? 'unknown'}`,
+            },
+          });
+        }
+        // P2002 unique violation on token: concurrent double-fire slipped through CAS
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+          return reply.code(409).send({
+            error: { code: 'FIRE_RACE_CONFLICT', message: 'Concurrent fire detected — token already issued' },
+          });
+        }
+        throw err;
       }
 
       // Emit action.status_changed — locator + status enum only. No free text, no credentials.
+      // SECURITY: action_token MUST NOT appear in event payloads, logs, or WS broadcasts.
       await publishAndBroadcast({
         workroomId: action.workroomId,
         eventId: randomUUID(),
@@ -311,7 +373,9 @@ export async function actionRoutes(app: FastifyInstance) {
         },
       });
 
-      return { action_id: actionId, fired: true, fired_at: now.toISOString() };
+      // Return raw token ONCE. After this point, the raw token is unrecoverable.
+      // SECURITY: rawToken MUST NOT be logged anywhere (not here, not by Fastify request logger).
+      return { action_id: actionId, fired: true, fired_at: now.toISOString(), action_token: rawToken };
     }
 
     // ── irreversible_no_abort: APPROVAL CONSUMPTION TRANSACTION ──
@@ -335,6 +399,10 @@ export async function actionRoutes(app: FastifyInstance) {
         error: { code: 'APPROVAL_MISMATCH', message: 'Approval does not belong to this action' },
       });
     }
+
+    // Generate action token BEFORE the transaction so we can store it atomically.
+    const { rawToken: irreversibleRawToken, tokenHash: irreversibleTokenHash } = generateActionToken();
+    const irreversibleTokenExpiresAt = new Date(now.getTime() + ACTION_TOKEN_TTL_MS);
 
     try {
       const firedAction = await db.$transaction(async (tx) => {
@@ -391,11 +459,26 @@ export async function actionRoutes(app: FastifyInstance) {
           },
         });
 
+        // ── Step 4: INSERT action token (UNIQUE(action_id) + UNIQUE(token_hash) backstop) ──
+        // Raw token NEVER stored — only the SHA-256 hash.
+        // SECURITY: irreversibleRawToken MUST NOT be logged anywhere.
+        await tx.controlActionToken.create({
+          data: {
+            actionId,
+            tokenHash: irreversibleTokenHash,
+            sessionId: action.sessionId,
+            workroomId: action.workroomId,
+            machineId: machine.id,
+            expiresAt: irreversibleTokenExpiresAt,
+          },
+        });
+
         return fired;
       });
 
       // Emit action.status_changed for irreversible_no_abort fire — after transaction commit.
       // Locator + status enum only. No free text, no credentials, no approval details in payload.
+      // SECURITY: action_token MUST NOT appear in event payloads, logs, or WS broadcasts.
       await publishAndBroadcast({
         workroomId: action.workroomId,
         eventId: randomUUID(),
@@ -409,12 +492,15 @@ export async function actionRoutes(app: FastifyInstance) {
         },
       });
 
+      // Return raw token ONCE. After this point, the raw token is unrecoverable.
+      // SECURITY: irreversibleRawToken MUST NOT be logged anywhere (not here, not by Fastify).
       return {
         action_id: firedAction.id,
         fired: true,
         fired_at: firedAction.firedAt?.toISOString(),
         approval_id,
         approved_at_snapshot: firedAction.approvedAtSnapshot?.toISOString() ?? null,
+        action_token: irreversibleRawToken,
       };
     } catch (err) {
       if (err instanceof FireConflictError) {
@@ -494,6 +580,90 @@ export async function actionRoutes(app: FastifyInstance) {
     });
 
     return { action_id: actionId, canceled: true };
+  });
+
+  // ── ACTION TOKEN CONSUME ENDPOINT ───────────────────────────────────────────
+
+  /**
+   * POST /api/v1/actions/:id/token/consume
+   *
+   * Exchange a one-time action_token for scope confirmation + secret bundle.
+   *
+   * *** AUTHENTICATION: action_token bearer — NOT machine_token ***
+   *   Authorization: Bearer act_tok_<...>
+   *   The action_token itself is the bearer credential. verifyMachineToken() MUST NOT be called here.
+   *   machine_id is bound at issuance time (fire) and is stored in control_action_tokens.
+   *   It is NOT re-verified at consume time (subprocess never holds machine_token).
+   *
+   * *** ATOMIC CAS CONSUME ***
+   *   Single-statement updateMany with all conditions in WHERE:
+   *     token_hash + action_id + expires_at > now + consumed_at IS NULL
+   *   rowcount=1 → success; rowcount=0 → unified 403 TOKEN_NOT_CONSUMABLE
+   *   DO NOT read-then-write (concurrent double-consume race condition).
+   *
+   * v1: secret_bundle = { version: 1, items: [] }
+   *   Fixture only. Real credential resolution in Phase 5C+.
+   *   TODO (5C): resolve credential_alias_ref → actual secret bundle items.
+   */
+  app.post('/api/v1/actions/:id/token/consume', async (request, reply) => {
+    // Extract action_token from Authorization header.
+    // SECURITY: MUST NOT use verifyMachineToken() — consume uses action_token bearer.
+    const authHeader = request.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ')) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Bearer action_token required' } });
+    }
+    const rawToken = authHeader.slice(7);
+
+    // Validate token prefix to catch accidental machine_token or malformed bearer usage.
+    if (!rawToken.startsWith('act_tok_')) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid token format' } });
+    }
+
+    const { id: actionId } = request.params as { id: string };
+
+    // Hash the presented token to look up the DB record.
+    // Raw token is NEVER stored — only the hash.
+    const tokenHash = createHash('sha256').update(rawToken).digest('hex');
+    const now = new Date();
+
+    // ── Atomic CAS consume ──
+    // Single updateMany with all reject conditions in WHERE.
+    // Unified rejection: rowcount=0 maps to TOKEN_NOT_CONSUMABLE regardless of which condition failed.
+    // This prevents enumeration attacks (expired vs consumed vs wrong action vs scope mismatch
+    // are all indistinguishable to the caller).
+    const cas = await db.controlActionToken.updateMany({
+      where: {
+        tokenHash,
+        actionId,                    // scope binding: token scoped to this exact action
+        expiresAt: { gt: now },      // not expired
+        consumedAt: null,            // not yet consumed
+      },
+      data: { consumedAt: now },
+    });
+
+    if (cas.count === 0) {
+      // Unified rejection — do NOT reveal which condition failed.
+      return reply.code(403).send({
+        error: { code: 'TOKEN_NOT_CONSUMABLE', message: 'Token not consumable' },
+      });
+    }
+
+    // Fetch token record for response payload (scope fields bound at issuance).
+    // Safe to read after CAS: consumed_at is now set, no race risk.
+    const tokenRecord = await db.controlActionToken.findFirst({
+      where: { tokenHash, actionId },
+      select: { sessionId: true, workroomId: true },
+    });
+
+    // v1: empty fixture bundle. Real credential resolution in 5C+.
+    // TODO (5C): resolve action.credentialAliasRef → actual secret bundle items.
+    return reply.code(200).send({
+      consumed: true,
+      action_id: actionId,
+      session_id: tokenRecord?.sessionId ?? null,
+      workroom_id: tokenRecord?.workroomId ?? null,
+      secret_bundle: { version: 1, items: [] },
+    });
   });
 
   // ── APPROVAL ENDPOINTS ──────────────────────────────────────────────────────
