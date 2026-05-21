@@ -30,11 +30,13 @@ import { actionRoutes } from './actionRoutes';
 
 // ── Shared seed graph (one org/agent/workroom/session for all tests) ────────────
 
-const ORG_ID = `org-int-${randomUUID()}`;
-const AGENT_ID = `agent-int-${randomUUID()}`;
-const WORKROOM_ID = `wroom-int-${randomUUID()}`;
-const SESSION_ID = `sess-int-${randomUUID()}`;
-const MACHINE_ID = `machine-int-${randomUUID()}`;
+// All entity ids must be valid UUIDs (control plane PK/FK columns are native uuid;
+// raw queries also cast ::uuid). Non-UUID ids fail against the migration schema.
+const ORG_ID = randomUUID();
+const AGENT_ID = randomUUID();
+const WORKROOM_ID = randomUUID();
+const SESSION_ID = randomUUID();
+const MACHINE_ID = randomUUID();
 
 let app: FastifyInstance;
 
@@ -51,7 +53,7 @@ async function seedActionWithToken(opts: {
     expiresAt: Date;
     consumedAt?: Date | null;
 }): Promise<{ actionId: string; rawToken: string }> {
-    const actionId = `act-int-${randomUUID()}`;
+    const actionId = randomUUID();
     const rawToken = `act_tok_${randomUUID().replace(/-/g, '')}`;
 
     await db.controlAction.create({
@@ -64,6 +66,7 @@ async function seedActionWithToken(opts: {
             summary: 'integration consume test action',
             reversibility: 'irreversible_no_abort',
             riskLevel: 'high',
+            requiresApproval: true, // DB CHECK: irreversible_no_abort requires approval
             status: 'fired',
             clientIdempotencyKey: `idem-${randomUUID()}`,
         },
@@ -71,7 +74,7 @@ async function seedActionWithToken(opts: {
 
     await db.controlActionToken.create({
         data: {
-            id: `tok-int-${randomUUID()}`,
+            id: randomUUID(),
             actionId,
             tokenHash: hashToken(rawToken),
             sessionId: SESSION_ID,
@@ -102,13 +105,13 @@ beforeAll(async () => {
 
     // Seed the shared FK graph: org -> agent / workroom -> session.
     await db.controlOrg.create({
-        data: { id: ORG_ID, name: 'Integration Org', slug: `int-${randomUUID()}`, ownerUserId: 'owner-int' },
+        data: { id: ORG_ID, name: 'Integration Org', slug: `int-${randomUUID()}`, ownerUserId: randomUUID() },
     });
     await db.controlAgent.create({
         data: { id: AGENT_ID, orgId: ORG_ID, name: 'int-agent', displayName: 'Int Agent', role: 'ops' },
     });
     await db.controlWorkroom.create({
-        data: { id: WORKROOM_ID, orgId: ORG_ID, name: 'Integration Workroom', createdBy: 'owner-int' },
+        data: { id: WORKROOM_ID, orgId: ORG_ID, name: 'Integration Workroom', createdBy: randomUUID() },
     });
     await db.controlSession.create({
         data: {

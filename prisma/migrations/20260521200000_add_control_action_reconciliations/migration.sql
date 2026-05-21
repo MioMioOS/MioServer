@@ -5,13 +5,18 @@
 -- Status semantics: action status is advanced to 'needs_human' on first reconcile;
 --   subsequent reconcile calls only add evidence records (idempotent, no duplicate events).
 
+-- NOTE: id / action_id / machine_id are UUID to match the control plane convention
+-- (control_actions.id is UUID; the 5B control_action_tokens table uses UUID for the
+-- same columns). action_id MUST be UUID so the FK to control_actions(id) is type-
+-- compatible — a TEXT action_id makes the FK fail to apply ("text = uuid") on a fresh
+-- database. evidence_id/reason_code stay TEXT (daemon-generated id + controlled enum).
 CREATE TABLE "control_action_reconciliations" (
-  "id"           TEXT        NOT NULL,
-  "action_id"    TEXT        NOT NULL,
-  "evidence_id"  TEXT        NOT NULL,
-  "reason_code"  TEXT        NOT NULL,
-  "machine_id"   TEXT        NOT NULL,
-  "created_at"   TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "id"           UUID         NOT NULL DEFAULT gen_random_uuid(),
+  "action_id"    UUID         NOT NULL,
+  "evidence_id"  TEXT         NOT NULL,
+  "reason_code"  TEXT         NOT NULL,
+  "machine_id"   UUID         NOT NULL,
+  "created_at"   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 
   CONSTRAINT "control_action_reconciliations_pkey" PRIMARY KEY ("id")
 );

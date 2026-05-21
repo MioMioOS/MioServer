@@ -12,9 +12,17 @@
 #
 # Requirements: a running local Postgres and the `psql` + `prisma` CLIs.
 #
-# NOTE: db push is used (not `migrate deploy`) because the app's migration history
-# is not cleanly applicable to a fresh DB; db push syncs the full schema in one shot,
-# which is the appropriate tool for an ephemeral test database.
+# NOTE on schema source (important for fidelity):
+#   We apply the CONTROL-PLANE migration SQL directly (psql -f), NOT `prisma db push`.
+#   Reason: the Prisma schema declares ids as `String`, which `db push` materializes as
+#   Postgres `text` columns. The production migrations declare them as native `UUID`.
+#   Raw queries in the codebase cast parameters to ::uuid (e.g. publishControlEvent's
+#   FOR UPDATE on control_workrooms), which require real `uuid` columns — a `text`
+#   column makes `text = uuid` fail. Applying the migration SQL reproduces the real
+#   uuid column types so integration tests exercise the production schema faithfully.
+#   We apply only the self-contained control-plane migrations (they have no FK to the
+#   app's Device/user tables), avoiding the app migration chain that is not cleanly
+#   replayable on a fresh DB.
 
 set -euo pipefail
 
@@ -37,8 +45,16 @@ echo "==> Dropping and recreating database '${TEST_DB}' on ${PGHOST}:${PGPORT}"
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -c "DROP DATABASE IF EXISTS \"${TEST_DB}\";"
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -c "CREATE DATABASE \"${TEST_DB}\";"
 
-echo "==> Syncing Prisma schema into '${TEST_DB}' (prisma db push)"
-DATABASE_URL="$DATABASE_URL" npx prisma db push --skip-generate --accept-data-loss
+# Apply the control-plane migrations in order (real UUID column types).
+CONTROL_PLANE_MIGRATIONS=(
+  "prisma/migrations/20260521000000_add_control_plane/migration.sql"
+  "prisma/migrations/20260521100000_add_control_action_tokens/migration.sql"
+  "prisma/migrations/20260521200000_add_control_action_reconciliations/migration.sql"
+)
+for migration in "${CONTROL_PLANE_MIGRATIONS[@]}"; do
+  echo "==> Applying ${migration}"
+  psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$TEST_DB" -v ON_ERROR_STOP=1 -f "$migration"
+done
 
 echo "==> Test DB ready."
 echo "    DATABASE_URL=${DATABASE_URL}"
