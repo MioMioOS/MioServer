@@ -28,6 +28,7 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
+import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 
 const CLAIMABLE_STATUSES = ['todo', 'in_progress', 'waiting_approval', 'in_review'];
 const NON_CLAIMABLE_STATUSES = ['done', 'canceled'];
@@ -57,6 +58,9 @@ export async function taskRoutes(app: FastifyInstance) {
     if (!workroom) {
       return reply.code(404).send({ error: { code: 'WORKROOM_NOT_FOUND', message: 'Workroom not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, workroomId, { orgId: workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     const task = await db.controlTask.create({
       data: {
@@ -91,6 +95,10 @@ export async function taskRoutes(app: FastifyInstance) {
     }
 
     const { workroomId } = request.params as { workroomId: string };
+
+    const access = await requireMachineAccessToWorkroom(machine, workroomId);
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+
     const query = request.query as { status?: string; owner_instance_id?: string };
 
     const tasks = await db.controlTask.findMany({
@@ -127,10 +135,16 @@ export async function taskRoutes(app: FastifyInstance) {
     }
 
     const { id } = request.params as { id: string };
-    const task = await db.controlTask.findUnique({ where: { id } });
+    const task = await db.controlTask.findUnique({
+      where: { id },
+      include: { workroom: { select: { orgId: true } } },
+    });
     if (!task) {
       return reply.code(404).send({ error: { code: 'TASK_NOT_FOUND', message: 'Task not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, task.workroomId, { orgId: task.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     return {
       task_id: task.id,
@@ -167,10 +181,17 @@ export async function taskRoutes(app: FastifyInstance) {
       description?: string;
     };
 
-    const task = await db.controlTask.findUnique({ where: { id } });
+    const task = await db.controlTask.findUnique({
+      where: { id },
+      include: { workroom: { select: { orgId: true } } },
+    });
     if (!task) {
       return reply.code(404).send({ error: { code: 'TASK_NOT_FOUND', message: 'Task not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, task.workroomId, { orgId: task.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+
     if (task.status === 'done' || task.status === 'canceled') {
       return reply.code(422).send({ error: { code: 'TASK_TERMINAL', message: 'Cannot update a done or canceled task' } });
     }
@@ -224,6 +245,17 @@ export async function taskRoutes(app: FastifyInstance) {
     if (!agent) {
       return reply.code(404).send({ error: { code: 'AGENT_NOT_FOUND', message: 'Agent not found' } });
     }
+
+    // Org access guard: fetch task to get workroom context
+    const taskForAuth = await db.controlTask.findUnique({
+      where: { id: taskId },
+      include: { workroom: { select: { orgId: true } } },
+    });
+    if (!taskForAuth) {
+      return reply.code(404).send({ error: { code: 'TASK_NOT_FOUND', message: 'Task not found' } });
+    }
+    const access = await requireMachineAccessToWorkroom(machine, taskForAuth.workroomId, { orgId: taskForAuth.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     // *** CAS CLAIM — single atomic DB statement ***
     // WHERE owner_instance_id IS NULL ensures only one winner.
@@ -288,6 +320,17 @@ export async function taskRoutes(app: FastifyInstance) {
 
     const { id: taskId } = request.params as { id: string };
     const { agent_instance_id } = request.body as { agent_instance_id: string };
+
+    // Org access guard: fetch task to get workroom context
+    const taskForAuth = await db.controlTask.findUnique({
+      where: { id: taskId },
+      include: { workroom: { select: { orgId: true } } },
+    });
+    if (!taskForAuth) {
+      return reply.code(404).send({ error: { code: 'TASK_NOT_FOUND', message: 'Task not found' } });
+    }
+    const access = await requireMachineAccessToWorkroom(machine, taskForAuth.workroomId, { orgId: taskForAuth.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     // CAS: only release if current owner matches
     const result = await db.controlTask.updateMany({

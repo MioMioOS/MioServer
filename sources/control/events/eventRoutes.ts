@@ -31,7 +31,7 @@
 import { FastifyInstance } from 'fastify';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
-import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
+import { requireMachineAccessToWorkroom, resolveCursorScopeAccess } from '@/control/auth/machineAccess';
 import { publishControlEvent } from './publishControlEvent';
 import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
 
@@ -270,6 +270,13 @@ export async function eventRoutes(app: FastifyInstance) {
    * Upsert a client cursor — update apply_seq and/or read_seq.
    * Enforces monotonicity: apply_seq and read_seq can only move forward.
    * One row per (user_id, device_id, scope_type, scope_id, topic_group).
+   *
+   * SECURITY:
+   * - user_id is ALWAYS forced to machine.id — clients cannot set an arbitrary user_id.
+   *   This binds cursor rows to the authenticated machine identity at write time.
+   * - scope access is verified via resolveCursorScopeAccess():
+   *   workroom → org guard; thread/session → resolve workroom → org guard.
+   *   Cross-org scope_ids are rejected with 403/404 before any DB write.
    */
   app.patch('/api/v1/cursors', async (request, reply) => {
     const machine = await verifyMachineToken(request.headers.authorization);
@@ -278,18 +285,25 @@ export async function eventRoutes(app: FastifyInstance) {
     }
 
     const body = request.body as {
-      user_id: string;
       device_id: string;
       scope_type: string;
       scope_id: string;
       topic_group?: string;
       apply_seq?: string;  // BigInt as string (JSON safe)
       read_seq?: string;
+      // user_id intentionally omitted — always forced to machine.id below.
     };
 
-    if (!body.user_id || !body.device_id || !body.scope_type || !body.scope_id) {
-      return reply.code(400).send({ error: { code: 'MISSING_FIELDS', message: 'user_id, device_id, scope_type, scope_id required' } });
+    if (!body.device_id || !body.scope_type || !body.scope_id) {
+      return reply.code(400).send({ error: { code: 'MISSING_FIELDS', message: 'device_id, scope_type, scope_id required' } });
     }
+
+    // Force cursor ownership to the authenticated machine — no client-supplied user_id.
+    const userId = machine.id;
+
+    // Verify scope access: resolves the owning workroom and checks org membership.
+    const scopeAccess = await resolveCursorScopeAccess(machine, body.scope_type, body.scope_id);
+    if (!scopeAccess.ok) return reply.code(scopeAccess.status).send({ error: scopeAccess.error });
 
     const topicGroup = body.topic_group ?? 'all';
 
@@ -311,7 +325,7 @@ export async function eventRoutes(app: FastifyInstance) {
         INSERT INTO control_client_cursors
           (id, user_id, device_id, scope_type, scope_id, topic_group, apply_seq, read_seq, updated_at)
         VALUES
-          (gen_random_uuid(), ${body.user_id}, ${body.device_id}, ${body.scope_type}, ${body.scope_id},
+          (gen_random_uuid(), ${userId}, ${body.device_id}, ${body.scope_type}, ${body.scope_id},
            ${topicGroup},
            ${newApplySeq ?? 0n},
            ${newReadSeq ?? 0n},
@@ -327,7 +341,7 @@ export async function eventRoutes(app: FastifyInstance) {
     const cursor = await db.controlClientCursor.findUnique({
       where: {
         userId_deviceId_scopeType_scopeId_topicGroup: {
-          userId: body.user_id,
+          userId,
           deviceId: body.device_id,
           scopeType: body.scope_type,
           scopeId: body.scope_id,
@@ -337,7 +351,7 @@ export async function eventRoutes(app: FastifyInstance) {
     });
 
     return {
-      user_id: body.user_id,
+      user_id: userId,
       device_id: body.device_id,
       scope_type: body.scope_type,
       scope_id: body.scope_id,
@@ -351,6 +365,10 @@ export async function eventRoutes(app: FastifyInstance) {
   /**
    * GET /api/v1/cursors
    * Fetch a client cursor state.
+   *
+   * SECURITY:
+   * - user_id is ALWAYS forced to machine.id — clients cannot read another machine's cursor.
+   * - scope access is verified via resolveCursorScopeAccess() before DB read.
    */
   app.get('/api/v1/cursors', async (request, reply) => {
     const machine = await verifyMachineToken(request.headers.authorization);
@@ -359,21 +377,28 @@ export async function eventRoutes(app: FastifyInstance) {
     }
 
     const query = request.query as {
-      user_id: string;
       device_id: string;
       scope_type: string;
       scope_id: string;
       topic_group?: string;
+      // user_id intentionally omitted — always forced to machine.id below.
     };
 
-    if (!query.user_id || !query.device_id || !query.scope_type || !query.scope_id) {
-      return reply.code(400).send({ error: { code: 'MISSING_FIELDS', message: 'user_id, device_id, scope_type, scope_id required' } });
+    if (!query.device_id || !query.scope_type || !query.scope_id) {
+      return reply.code(400).send({ error: { code: 'MISSING_FIELDS', message: 'device_id, scope_type, scope_id required' } });
     }
+
+    // Force cursor lookup to the authenticated machine's scope.
+    const userId = machine.id;
+
+    // Verify scope access before reading cursor data.
+    const scopeAccess = await resolveCursorScopeAccess(machine, query.scope_type, query.scope_id);
+    if (!scopeAccess.ok) return reply.code(scopeAccess.status).send({ error: scopeAccess.error });
 
     const cursor = await db.controlClientCursor.findUnique({
       where: {
         userId_deviceId_scopeType_scopeId_topicGroup: {
-          userId: query.user_id,
+          userId,
           deviceId: query.device_id,
           scopeType: query.scope_type,
           scopeId: query.scope_id,

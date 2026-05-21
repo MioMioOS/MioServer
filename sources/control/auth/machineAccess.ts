@@ -19,6 +19,11 @@
  *
  * DO NOT write inline orgId checks in route handlers.
  * Use this helper so authorization logic stays in one place.
+ *
+ * For cursor scope authorization, use resolveCursorScopeAccess() which resolves
+ * the owning workroom from a scope (workroom | thread | session) and then delegates
+ * to requireMachineAccessToWorkroom(). Cursor endpoints MUST also force
+ * user_id = machine.id so cursor rows are machine-scoped at write time.
  */
 
 import { db } from '@/storage/db';
@@ -30,7 +35,7 @@ interface MachineAccessOk {
 
 interface MachineAccessDenied {
   ok: false;
-  status: 403 | 404;
+  status: 400 | 403 | 404;
   error: { code: string; message: string };
 }
 
@@ -47,9 +52,12 @@ interface MachineRecord {
  * Returns { ok: true, workroomOrgId } on success.
  * Returns { ok: false, status, error } on failure — caller must return the HTTP response.
  *
- * Caches the workroom lookup in the same call to avoid double-queries when the
- * caller also needs the workroom record. For callers that need more workroom fields,
- * pass the workroom data you already have via the optional `workroomOverride` param.
+ * @param workroomOverride  INTERNAL-ONLY optimization. Pass this ONLY when the
+ *   calling route has ALREADY queried the workroom record from DB and has its orgId.
+ *   This skips a redundant DB lookup — it does NOT bypass authorization.
+ *   The authorization check (machine.orgId === override.orgId) still runs.
+ *   NEVER expose this parameter to external request inputs. It must always
+ *   come from server-side DB data, never from client-supplied values.
  */
 export async function requireMachineAccessToWorkroom(
   machine: MachineRecord,
@@ -88,4 +96,72 @@ export async function requireMachineAccessToWorkroom(
   }
 
   return { ok: true, workroomOrgId: orgId };
+}
+
+/**
+ * Resolve the workroom behind a cursor scope and verify the machine is authorized.
+ *
+ * Cursor scope types:
+ *   workroom — scope_id IS the workroom_id. Checks directly.
+ *   thread   — scope_id is a ControlThread.id. Resolves thread.workroomId, then checks.
+ *   session  — scope_id is a ControlSession.id. Resolves session.workroomId + orgId, then checks.
+ *
+ * Returns { ok: true, workroomOrgId } on success.
+ * Returns { ok: false, status, error } on failure — caller must return the HTTP response.
+ *
+ * IMPORTANT: Cursor write endpoints (PATCH /cursors) MUST ALSO force user_id = machine.id
+ * so cursor rows are machine-scoped at write time. This function only handles scope/org access.
+ */
+export async function resolveCursorScopeAccess(
+  machine: MachineRecord,
+  scopeType: string,
+  scopeId: string,
+): Promise<MachineAccessResult> {
+  if (scopeType === 'workroom') {
+    // scope_id is directly the workroom_id — delegate to standard workroom guard.
+    return requireMachineAccessToWorkroom(machine, scopeId);
+  }
+
+  if (scopeType === 'thread') {
+    // Resolve owning workroom via the thread record.
+    const thread = await db.controlThread.findUnique({
+      where: { id: scopeId },
+      select: { workroomId: true },
+    });
+    if (!thread) {
+      return {
+        ok: false,
+        status: 404,
+        error: { code: 'THREAD_NOT_FOUND', message: 'Thread not found for cursor scope' },
+      };
+    }
+    return requireMachineAccessToWorkroom(machine, thread.workroomId);
+  }
+
+  if (scopeType === 'session') {
+    // Resolve owning workroom via the session record (use orgId shortcut to skip extra DB query).
+    const session = await db.controlSession.findUnique({
+      where: { id: scopeId },
+      select: { workroomId: true, orgId: true },
+    });
+    if (!session) {
+      return {
+        ok: false,
+        status: 404,
+        error: { code: 'SESSION_NOT_FOUND', message: 'Session not found for cursor scope' },
+      };
+    }
+    // Pass session.orgId as workroomOverride to avoid a redundant DB lookup.
+    // Authorization (machine.orgId === session.orgId) still runs inside requireMachineAccessToWorkroom.
+    return requireMachineAccessToWorkroom(machine, session.workroomId, { orgId: session.orgId });
+  }
+
+  return {
+    ok: false,
+    status: 400,
+    error: {
+      code: 'INVALID_SCOPE_TYPE',
+      message: `Unsupported cursor scope_type '${scopeType}'. Must be: workroom, thread, session`,
+    },
+  };
 }

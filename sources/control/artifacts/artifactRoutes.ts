@@ -37,6 +37,7 @@ import { FastifyInstance } from 'fastify';
 import { Prisma } from '@prisma/client';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
+import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 
 /** Status transitions based on milestone completion. */
 function deriveArtifactStatus(
@@ -82,6 +83,9 @@ export async function artifactRoutes(app: FastifyInstance) {
     if (!body.org_id || !body.scope_type || !body.type || !body.title || !body.client_idempotency_key) {
       return reply.code(400).send({ error: { code: 'MISSING_FIELDS', message: 'org_id, scope_type, type, title, client_idempotency_key required' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, workroomId);
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     try {
       const artifact = await db.controlArtifact.create({
@@ -153,11 +157,15 @@ export async function artifactRoutes(app: FastifyInstance) {
           orderBy: { createdAt: 'desc' },
           take: 5,
         },
+        workroom: { select: { orgId: true } },
       },
     });
     if (!artifact) {
       return reply.code(404).send({ error: { code: 'ARTIFACT_NOT_FOUND', message: 'Artifact not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, artifact.workroomId, { orgId: artifact.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     return {
       artifact_id: artifact.id,
@@ -232,10 +240,16 @@ export async function artifactRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: { code: 'MISSING_FIELDS', message: 'verifier_agent_id, method, status, client_idempotency_key required' } });
     }
 
-    const artifact = await db.controlArtifact.findUnique({ where: { id: artifactId } });
+    const artifact = await db.controlArtifact.findUnique({
+      where: { id: artifactId },
+      include: { workroom: { select: { orgId: true } } },
+    });
     if (!artifact) {
       return reply.code(404).send({ error: { code: 'ARTIFACT_NOT_FOUND', message: 'Artifact not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, artifact.workroomId, { orgId: artifact.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     const now = new Date();
 
@@ -269,7 +283,8 @@ export async function artifactRoutes(app: FastifyInstance) {
     }
 
     // Update verified_at and status (only if not already set)
-    let updatedArtifact = artifact;
+    // Narrow the type to just the base artifact fields so the update result (no relation) is assignable.
+    let updatedArtifact: { verifiedAt: Date | null; externalConfirmedAt: Date | null; humanAckedAt: Date | null; status: string } = artifact;
     if (!alreadyVerified && body.status === 'passed') {
       updatedArtifact = await db.controlArtifact.update({
         where: { id: artifactId },
@@ -310,10 +325,16 @@ export async function artifactRoutes(app: FastifyInstance) {
       note?: string;
     };
 
-    const artifact = await db.controlArtifact.findUnique({ where: { id: artifactId } });
+    const artifact = await db.controlArtifact.findUnique({
+      where: { id: artifactId },
+      include: { workroom: { select: { orgId: true } } },
+    });
     if (!artifact) {
       return reply.code(404).send({ error: { code: 'ARTIFACT_NOT_FOUND', message: 'Artifact not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, artifact.workroomId, { orgId: artifact.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     // Idempotent: if already confirmed, return 200 with existing timestamp
     if (artifact.externalConfirmedAt !== null) {
@@ -358,10 +379,16 @@ export async function artifactRoutes(app: FastifyInstance) {
 
     const { id: artifactId } = request.params as { id: string };
 
-    const artifact = await db.controlArtifact.findUnique({ where: { id: artifactId } });
+    const artifact = await db.controlArtifact.findUnique({
+      where: { id: artifactId },
+      include: { workroom: { select: { orgId: true } } },
+    });
     if (!artifact) {
       return reply.code(404).send({ error: { code: 'ARTIFACT_NOT_FOUND', message: 'Artifact not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, artifact.workroomId, { orgId: artifact.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     // Idempotent
     if (artifact.humanAckedAt !== null) {
@@ -417,10 +444,17 @@ export async function artifactRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: { code: 'MISSING_FIELDS', message: 'superseded_by_artifact_id is required' } });
     }
 
-    const artifact = await db.controlArtifact.findUnique({ where: { id: artifactId } });
+    const artifact = await db.controlArtifact.findUnique({
+      where: { id: artifactId },
+      include: { workroom: { select: { orgId: true } } },
+    });
     if (!artifact) {
       return reply.code(404).send({ error: { code: 'ARTIFACT_NOT_FOUND', message: 'Artifact not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, artifact.workroomId, { orgId: artifact.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+
     if (artifact.status === 'superseded' || artifact.status === 'disposed') {
       return reply.code(409).send({
         error: { code: 'ARTIFACT_ALREADY_TERMINAL', message: `Artifact is already ${artifact.status}` },
@@ -485,10 +519,17 @@ export async function artifactRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: { code: 'INVALID_DISPOSAL_REASON', message: `disposal_reason must be one of: ${validReasons.join(' | ')}` } });
     }
 
-    const artifact = await db.controlArtifact.findUnique({ where: { id: artifactId } });
+    const artifact = await db.controlArtifact.findUnique({
+      where: { id: artifactId },
+      include: { workroom: { select: { orgId: true } } },
+    });
     if (!artifact) {
       return reply.code(404).send({ error: { code: 'ARTIFACT_NOT_FOUND', message: 'Artifact not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, artifact.workroomId, { orgId: artifact.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+
     if (artifact.status === 'disposed' || artifact.status === 'superseded') {
       return reply.code(409).send({
         error: { code: 'ARTIFACT_ALREADY_TERMINAL', message: `Artifact is already ${artifact.status}` },
@@ -537,10 +578,16 @@ export async function artifactRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: { code: 'MISSING_FIELDS', message: 'key and updated_by required' } });
     }
 
-    const artifact = await db.controlArtifact.findUnique({ where: { id: artifactId } });
+    const artifact = await db.controlArtifact.findUnique({
+      where: { id: artifactId },
+      include: { workroom: { select: { orgId: true } } },
+    });
     if (!artifact) {
       return reply.code(404).send({ error: { code: 'ARTIFACT_NOT_FOUND', message: 'Artifact not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, artifact.workroomId, { orgId: artifact.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     // Upsert pointer — UNIQUE(workroom_id, key)
     await db.controlArtifactPointer.upsert({
@@ -587,6 +634,9 @@ export async function artifactRoutes(app: FastifyInstance) {
     }
 
     const { workroomId } = request.params as { workroomId: string };
+
+    const access = await requireMachineAccessToWorkroom(machine, workroomId);
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     const pointers = await db.controlArtifactPointer.findMany({
       where: { workroomId },

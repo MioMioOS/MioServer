@@ -18,6 +18,7 @@
 import { FastifyInstance } from 'fastify';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
+import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 
 export async function workroomRoutes(app: FastifyInstance) {
   /**
@@ -44,6 +45,10 @@ export async function workroomRoutes(app: FastifyInstance) {
     }
     if (!body.created_by) {
       return reply.code(400).send({ error: { code: 'MISSING_CREATED_BY', message: 'created_by is required' } });
+    }
+
+    if (!machine.orgId || machine.orgId !== orgId) {
+      return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Machine org does not match requested org' } });
     }
 
     const org = await db.controlOrg.findUnique({ where: { id: orgId } });
@@ -83,6 +88,11 @@ export async function workroomRoutes(app: FastifyInstance) {
     }
 
     const { orgId } = request.params as { orgId: string };
+
+    if (!machine.orgId || machine.orgId !== orgId) {
+      return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Machine org does not match requested org' } });
+    }
+
     const query = request.query as { include_archived?: string; visibility?: string };
     const includeArchived = query.include_archived === 'true';
 
@@ -132,6 +142,9 @@ export async function workroomRoutes(app: FastifyInstance) {
       return reply.code(404).send({ error: { code: 'WORKROOM_NOT_FOUND', message: 'Workroom not found' } });
     }
 
+    const access = await requireMachineAccessToWorkroom(machine, id, { orgId: workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+
     return {
       workroom_id: workroom.id,
       org_id: workroom.orgId,
@@ -176,6 +189,10 @@ export async function workroomRoutes(app: FastifyInstance) {
     if (!workroom) {
       return reply.code(404).send({ error: { code: 'WORKROOM_NOT_FOUND', message: 'Workroom not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, id, { orgId: workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+
     if (workroom.archivedAt !== null) {
       return reply.code(409).send({ error: { code: 'WORKROOM_ARCHIVED', message: 'Cannot update an archived workroom' } });
     }

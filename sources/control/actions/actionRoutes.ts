@@ -37,6 +37,7 @@ import { FastifyInstance } from 'fastify';
 import { Prisma } from '@prisma/client';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
+import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 
 const IRREVERSIBLE_NO_ABORT = 'irreversible_no_abort';
 const FIREABLE_STATUSES = ['proposed', 'approved'];
@@ -78,6 +79,9 @@ export async function actionRoutes(app: FastifyInstance) {
     if (!workroom) {
       return reply.code(404).send({ error: { code: 'WORKROOM_NOT_FOUND', message: 'Workroom not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, workroomId, { orgId: workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     let action;
     try {
@@ -140,11 +144,14 @@ export async function actionRoutes(app: FastifyInstance) {
     const { id } = request.params as { id: string };
     const action = await db.controlAction.findUnique({
       where: { id },
-      include: { approvalConsumption: true },
+      include: { approvalConsumption: true, workroom: { select: { orgId: true } } },
     });
     if (!action) {
       return reply.code(404).send({ error: { code: 'ACTION_NOT_FOUND', message: 'Action not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, action.workroomId, { orgId: action.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     return {
       action_id: action.id,
@@ -201,10 +208,16 @@ export async function actionRoutes(app: FastifyInstance) {
     const { approval_id } = (request.body ?? {}) as { approval_id?: string };
 
     // Fetch action
-    const action = await db.controlAction.findUnique({ where: { id: actionId } });
+    const action = await db.controlAction.findUnique({
+      where: { id: actionId },
+      include: { workroom: { select: { orgId: true } } },
+    });
     if (!action) {
       return reply.code(404).send({ error: { code: 'ACTION_NOT_FOUND', message: 'Action not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, action.workroomId, { orgId: action.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     // Reject if already in terminal state
     if (TERMINAL_STATUSES.includes(action.status)) {
@@ -372,10 +385,17 @@ export async function actionRoutes(app: FastifyInstance) {
     }
 
     const { id: actionId } = request.params as { id: string };
-    const action = await db.controlAction.findUnique({ where: { id: actionId } });
+    const action = await db.controlAction.findUnique({
+      where: { id: actionId },
+      include: { workroom: { select: { orgId: true } } },
+    });
     if (!action) {
       return reply.code(404).send({ error: { code: 'ACTION_NOT_FOUND', message: 'Action not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, action.workroomId, { orgId: action.workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+
     if (action.reversibility === IRREVERSIBLE_NO_ABORT && action.status === 'fired') {
       return reply.code(409).send({
         error: {
@@ -426,6 +446,9 @@ export async function actionRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: { code: 'MISSING_KIND', message: 'kind is required' } });
     }
 
+    const accessApproval = await requireMachineAccessToWorkroom(machine, workroomId);
+    if (!accessApproval.ok) return reply.code(accessApproval.status).send({ error: accessApproval.error });
+
     const approval = await db.controlApproval.create({
       data: {
         workroomId,
@@ -464,11 +487,14 @@ export async function actionRoutes(app: FastifyInstance) {
     const { id } = request.params as { id: string };
     const approval = await db.controlApproval.findUnique({
       where: { id },
-      include: { approvalConsumption: true },
+      include: { approvalConsumption: true, workroom: { select: { orgId: true } } },
     });
     if (!approval) {
       return reply.code(404).send({ error: { code: 'APPROVAL_NOT_FOUND', message: 'Approval not found' } });
     }
+
+    const accessApproval = await requireMachineAccessToWorkroom(machine, approval.workroomId, { orgId: approval.workroom.orgId });
+    if (!accessApproval.ok) return reply.code(accessApproval.status).send({ error: accessApproval.error });
 
     return {
       approval_id: approval.id,
@@ -513,10 +539,17 @@ export async function actionRoutes(app: FastifyInstance) {
       });
     }
 
-    const approval = await db.controlApproval.findUnique({ where: { id: approvalId } });
+    const approval = await db.controlApproval.findUnique({
+      where: { id: approvalId },
+      include: { workroom: { select: { orgId: true } } },
+    });
     if (!approval) {
       return reply.code(404).send({ error: { code: 'APPROVAL_NOT_FOUND', message: 'Approval not found' } });
     }
+
+    const accessApproval = await requireMachineAccessToWorkroom(machine, approval.workroomId, { orgId: approval.workroom.orgId });
+    if (!accessApproval.ok) return reply.code(accessApproval.status).send({ error: accessApproval.error });
+
     if (approval.status !== 'pending' && approval.status !== 'snoozed') {
       return reply.code(409).send({
         error: {

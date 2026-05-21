@@ -17,6 +17,7 @@ import { FastifyInstance } from 'fastify';
 import { Prisma } from '@prisma/client';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
+import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { computeWorkroomSummary, SummaryInputs } from './summaryLogic';
 
 export async function summaryRoutes(app: FastifyInstance) {
@@ -41,6 +42,9 @@ export async function summaryRoutes(app: FastifyInstance) {
     if (!workroom) {
       return reply.code(404).send({ error: { code: 'WORKROOM_NOT_FOUND', message: 'Workroom not found' } });
     }
+
+    const access = await requireMachineAccessToWorkroom(machine, workroomId, { orgId: workroom.orgId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     // ── 2. Resolve current goal title (optional) ─────────────────────────────
     let currentGoalTitle: string | undefined;
@@ -193,6 +197,9 @@ export async function summaryRoutes(app: FastifyInstance) {
     }
 
     const { workroomId } = request.params as { workroomId: string };
+
+    const access = await requireMachineAccessToWorkroom(machine, workroomId);
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     const summary = await db.controlWorkroomSummary.findFirst({
       where: { workroomId },
