@@ -66,7 +66,7 @@ export async function startApi() {
     await app.register(summaryRoutes);
     await app.register(controlSessionRoutes);
 
-    await app.listen({ port: config.port, host: '0.0.0.0' });
+    await app.listen({ port: config.port, host: config.host });
     console.log(`CodeLight Server listening on port ${config.port}`);
 
     return app;

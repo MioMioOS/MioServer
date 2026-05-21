@@ -1,5 +1,9 @@
 export const config = {
     port: parseInt(process.env.PORT || '3005', 10),
+    // Bind address. Default '0.0.0.0' (all interfaces) for local dev.
+    // Set HOST=127.0.0.1 in production when behind nginx to avoid direct
+    // public access on the port (defense-in-depth beyond cloud SG rules).
+    host: process.env.HOST ?? '0.0.0.0',
     masterSecret: process.env.MASTER_SECRET || '',
     databaseUrl: process.env.DATABASE_URL || '',
     tokenExpiryDays: parseInt(process.env.TOKEN_EXPIRY_DAYS || '30', 10),
