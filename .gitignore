@@ -9,3 +9,8 @@ dist/
 *.p8
 *.pem
 *.key
+
+# mio-agent headless simulation temp copies (F-22.1 mechanism copies the setup
+# script into this repo at runtime; finally-cleanup removes it, but a hard-killed
+# run can orphan one — keep these out of git regardless). See mio-agent #22/#24.
+.mio-sim-setup-*.ts
