@@ -31,6 +31,9 @@
  *                                                    Auth: action_token bearer (NOT machine_token)
  *                                                    CAS atomic; returns secret_bundle v1=empty fixture
  *   POST   /api/v1/actions/:id/cancel             → cancel action
+ *   POST   /api/v1/actions/:id/reconcile          → *** RECONCILE (Phase 5C) ***
+ *                                                    Auth: machine_token (firing machine only)
+ *                                                    CAS fired→needs_human; idempotent per evidence_id
  *
  *   POST   /api/v1/workrooms/:workroomId/approvals → create approval request
  *   GET    /api/v1/approvals/:id                  → get approval
@@ -64,7 +67,10 @@ async function publishAndBroadcast(input: Parameters<typeof publishControlEvent>
 
 const IRREVERSIBLE_NO_ABORT = 'irreversible_no_abort';
 const FIREABLE_STATUSES = ['proposed', 'approved'];
-const TERMINAL_STATUSES = ['fired', 'canceled', 'failed', 'succeeded', 'transmission_complete'];
+// NOTE: needs_human is included here for cancel/pre-check purposes only.
+// It is NOT a product completion state — it means "outcome unknown, human review needed."
+// Do NOT count needs_human as done/complete anywhere.
+const TERMINAL_STATUSES = ['fired', 'canceled', 'failed', 'succeeded', 'transmission_complete', 'needs_human'];
 
 /**
  * TTL for action tokens: 5 minutes.
@@ -663,6 +669,188 @@ export async function actionRoutes(app: FastifyInstance) {
       session_id: tokenRecord?.sessionId ?? null,
       workroom_id: tokenRecord?.workroomId ?? null,
       secret_bundle: { version: 1, items: [] },
+    });
+  });
+
+  // ── RECONCILE ENDPOINT ─────────────────────────────────────────────────────
+
+  /**
+   * POST /api/v1/actions/:id/reconcile
+   *
+   * Report a daemon-detected unknown outcome for a fired action.
+   * Transitions action to 'needs_human' if currently 'fired'.
+   *
+   * AUTH: machine_token + workroom/org guard + firing-machine binding
+   *   (ControlActionToken[action_id].machine_id == authenticated machine.id)
+   *   If no token row exists for the action: 403 (old data / anomaly — no reconcile allowed).
+   *   machine_id is ALWAYS taken from the token row, NEVER from request body.
+   *
+   * BODY: { reason: enum, evidence_id: string }
+   *   reason: controlled enum — fire_response_lost_token_unrecoverable | drain_deadline_exceeded
+   *   evidence_id: stable daemon-generated file ID (e.g. UUID from evidence filename)
+   *   FORBIDDEN fields: action_token, token_hash, secret, stdout, stack → 400 FORBIDDEN_FIELDS
+   *
+   * IDEMPOTENCY (per-evidence): same (action_id, evidence_id) → P2002 in transaction → 200 idempotent
+   *   Different evidence IDs for same action are allowed (full audit trail).
+   *
+   * CAS: UPDATE control_actions WHERE id=:id AND status='fired' → status='needs_human'
+   *   rowcount=1 → emit action.needs_human (locator + status + reason_code only; no free text)
+   *   rowcount=0 → read current:
+   *     needs_human → 200 idempotent (action already reconciled via different evidence)
+   *     terminal    → 409 RECONCILE_TERMINAL_CONFLICT
+   *
+   * needs_human is NOT a product completion state. It means outcome unknown, human review needed.
+   */
+  app.post('/api/v1/actions/:id/reconcile', async (request, reply) => {
+    // ── 1. Auth: machine_token ──
+    const machine = await verifyMachineToken(request.headers.authorization);
+    if (!machine) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired machine token' } });
+    }
+
+    const { id: actionId } = request.params as { id: string };
+
+    // ── 2. Body validation ──
+    const body = request.body as Record<string, unknown>;
+
+    // Reject forbidden fields: no raw token/secret/stdout in reconcile body (security boundary)
+    const FORBIDDEN_FIELDS = ['action_token', 'token_hash', 'secret', 'stdout', 'stack'];
+    const forbiddenPresent = FORBIDDEN_FIELDS.filter(f => f in body);
+    if (forbiddenPresent.length > 0) {
+      return reply.code(400).send({
+        error: { code: 'FORBIDDEN_FIELDS', message: `Forbidden fields in body: ${forbiddenPresent.join(', ')}` },
+      });
+    }
+
+    const { reason, evidence_id: evidenceId } = body as { reason?: string; evidence_id?: string };
+
+    if (!reason || !evidenceId) {
+      return reply.code(400).send({ error: { code: 'MISSING_FIELDS', message: 'reason and evidence_id are required' } });
+    }
+
+    const VALID_REASON_CODES = new Set([
+      'fire_response_lost_token_unrecoverable',
+      'drain_deadline_exceeded',
+    ]);
+    if (!VALID_REASON_CODES.has(reason)) {
+      return reply.code(400).send({
+        error: { code: 'INVALID_REASON_CODE', message: `reason must be one of: ${[...VALID_REASON_CODES].join(', ')}` },
+      });
+    }
+
+    // ── 3. Fetch action ──
+    const action = await db.controlAction.findUnique({ where: { id: actionId } });
+    if (!action) {
+      return reply.code(404).send({ error: { code: 'ACTION_NOT_FOUND', message: 'Action not found' } });
+    }
+
+    // ── 4. Workroom/org access guard ──
+    const access = await requireMachineAccessToWorkroom(machine, action.workroomId, { orgId: action.workroomId });
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+
+    // ── 5. Firing-machine guard ──
+    // machine_id comes from ControlActionToken (bound at issuance), NEVER from request body.
+    const tokenRecord = await db.controlActionToken.findFirst({ where: { actionId } });
+    if (!tokenRecord) {
+      // No token row: old data or anomaly — reconcile not allowed
+      return reply.code(403).send({
+        error: { code: 'RECONCILE_GUARD_FAILED', message: 'No token record for this action; reconcile not allowed' },
+      });
+    }
+    if (tokenRecord.machineId !== machine.id) {
+      return reply.code(403).send({
+        error: { code: 'RECONCILE_FORBIDDEN', message: 'Machine is not the firing machine for this action' },
+      });
+    }
+
+    // ── 6. Pre-check: hard terminal states ──
+    const HARD_TERMINAL = new Set(['canceled', 'failed', 'succeeded', 'transmission_complete']);
+    if (HARD_TERMINAL.has(action.status)) {
+      return reply.code(409).send({
+        error: { code: 'RECONCILE_TERMINAL_CONFLICT', message: `Action is already in terminal state: ${action.status}` },
+      });
+    }
+    // Action must have been fired to reconcile
+    if (!['fired', 'needs_human'].includes(action.status)) {
+      return reply.code(409).send({
+        error: { code: 'RECONCILE_NOT_FIRED', message: `Action has not been fired (status: ${action.status}); cannot reconcile` },
+      });
+    }
+
+    // ── 7. Transaction: INSERT evidence record + CAS fired→needs_human ──
+    let casCount = 0;
+    try {
+      casCount = await db.$transaction(async (tx) => {
+        // INSERT evidence record (P2002 on duplicate evidence_id = idempotent re-report)
+        await tx.controlActionReconciliation.create({
+          data: {
+            id: randomUUID(),
+            actionId,
+            evidenceId: evidenceId as string,
+            reasonCode: reason,
+            machineId: machine.id,            // bound from firing machine, NOT from body
+          },
+        });
+
+        // CAS: advance status only if currently 'fired' (atomic, prevents overwriting a true terminal)
+        const cas = await tx.controlAction.updateMany({
+          where: { id: actionId, status: 'fired' },
+          data: { status: 'needs_human' },
+        });
+        return cas.count;
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        // Same (action_id, evidence_id) already processed — idempotent 200
+        const current = await db.controlAction.findUnique({ where: { id: actionId }, select: { status: true } });
+        return reply.code(200).send({
+          action_id: actionId,
+          status: current?.status ?? 'unknown',
+          idempotent: true,
+        });
+      }
+      throw err;
+    }
+
+    // ── 8. Post-transaction: emit event if transition happened ──
+    if (casCount === 1) {
+      // Write-before-broadcast invariant: DB already committed above.
+      // Event payload: locator + status + reason_code only. No free text, no credentials.
+      await publishAndBroadcast({
+        workroomId: action.workroomId,
+        eventId: randomUUID(),
+        topic: 'action.needs_human',
+        payload: {
+          workroom_id: action.workroomId,
+          action_id: actionId,
+          session_id: action.sessionId,
+          status: 'needs_human',              // controlled enum
+          reason_code: reason,                 // controlled enum
+        },
+      });
+
+      return reply.code(200).send({
+        action_id: actionId,
+        status: 'needs_human',
+        idempotent: false,
+        reason_code: reason,
+      });
+    }
+
+    // ── 9. CAS count=0: action was not in 'fired' state ──
+    // Read current status to determine response.
+    const current = await db.controlAction.findUnique({ where: { id: actionId }, select: { status: true } });
+    if (current?.status === 'needs_human') {
+      // Already reconciled (via different evidence ID) — idempotent 200
+      return reply.code(200).send({
+        action_id: actionId,
+        status: 'needs_human',
+        idempotent: true,
+      });
+    }
+    // Must be in a terminal state (race: fired→terminal between pre-check and CAS)
+    return reply.code(409).send({
+      error: { code: 'RECONCILE_TERMINAL_CONFLICT', message: `Action status is ${current?.status ?? 'unknown'} — cannot reconcile` },
     });
   });
 

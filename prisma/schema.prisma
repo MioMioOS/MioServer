@@ -526,6 +526,7 @@ model ControlAction {
 
   approvalConsumption   ControlActionApprovalConsumption?
   actionToken           ControlActionToken?
+  reconciliations       ControlActionReconciliation[]
   artifacts             ControlArtifact[]
   approvals             ControlApproval[]
 
@@ -561,6 +562,25 @@ model ControlApproval {
 
   @@index([workroomId, status])
   @@map("control_approvals")
+}
+
+/// Evidence records for daemon-reported reconcile attempts (Phase 5C).
+/// UNIQUE(actionId, evidenceId) — same daemon-generated file = idempotent re-report.
+/// Multiple different evidence records are allowed per action (audit trail).
+/// machine_id: the machine that fired the action (from ControlActionToken; verified at reconcile).
+/// Status semantics: action status is advanced to 'needs_human' on first reconcile;
+///   subsequent reconcile calls only add evidence records (no state change, no duplicate events).
+model ControlActionReconciliation {
+  id          String        @id @default(uuid())
+  actionId    String        @map("action_id")
+  action      ControlAction @relation(fields: [actionId], references: [id])
+  evidenceId  String        @map("evidence_id")       // stable file-based ID from daemon
+  reasonCode  String        @map("reason_code")        // controlled enum: fire_response_lost_token_unrecoverable | drain_deadline_exceeded
+  machineId   String        @map("machine_id")         // bound at issuance (verified, not from body)
+  createdAt   DateTime      @default(now()) @map("created_at")
+
+  @@unique([actionId, evidenceId])
+  @@map("control_action_reconciliations")
 }
 
 /// One-time action capability token. Raw token returned in fire response ONCE.
