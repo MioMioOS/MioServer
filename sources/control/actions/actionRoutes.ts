@@ -745,7 +745,9 @@ export async function actionRoutes(app: FastifyInstance) {
     }
 
     // ── 4. Workroom/org access guard ──
-    const access = await requireMachineAccessToWorkroom(machine, action.workroomId, { orgId: action.workroomId });
+    // No shortcut orgId override here: action has no orgId field, let requireMachineAccessToWorkroom
+    // fetch the workroom from DB to get the authoritative orgId.
+    const access = await requireMachineAccessToWorkroom(machine, action.workroomId);
     if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     // ── 5. Firing-machine guard ──
