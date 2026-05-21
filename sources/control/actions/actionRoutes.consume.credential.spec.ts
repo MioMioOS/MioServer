@@ -499,8 +499,8 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
     const item = body.secret_bundle.items[0];
     expect(item.key).toBe('asc-key');          // credential.alias
     expect(item.value).toBe(SECRET_VALUE);     // resolved plaintext
-    // inject kind: asc_api_key → 'env_var' (API key injected as environment variable)
-    expect(item.kind).toBe('env_var');         // credentialInjectKind(credential.kind)
+    // inject kind: asc_api_key → 'file' (.p8 private key must be written to 0600 temp file)
+    expect(item.kind).toBe('file');            // credentialInjectKind(credential.kind)
 
     // Access log: success=true, no reasonCode
     expect(mockAccessLogCreate).toHaveBeenCalledWith(

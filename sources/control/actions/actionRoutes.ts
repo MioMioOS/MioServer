@@ -102,11 +102,12 @@ function generateActionToken(): { rawToken: string; tokenHash: string } {
  *       mio-agent consumeSubprocess MUST handle both values.
  *       Default: 'env_var' (API keys, tokens — the primary v1 use cases).
  *
- * v1 scope: publish_ios uses asc_api_key → env_var; deploy_web uses vercel_token → env_var.
+ * v1 scope: publish_ios uses asc_api_key → file (.p8); deploy_web uses vercel_token → env_var.
  */
 const CREDENTIAL_KIND_TO_INJECT: Readonly<Record<string, 'env_var' | 'file'>> = {
-  cert:    'file',
-  ssh_key: 'file',
+  asc_api_key: 'file',   // .p8 private key for App Store Connect — MUST be written to 0600 temp file
+  cert:        'file',
+  ssh_key:     'file',
 };
 
 function credentialInjectKind(kind: string): 'env_var' | 'file' {
@@ -706,10 +707,11 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
     //      Daemon body fields MUST NOT influence this check.
     //   2. secretValue appears ONLY in the HTTP response body (TLS only).
     //      MUST NOT appear in logs, EventLog payloads, or WS fanout.
-    //   3. 3 failure categories:
-    //        auth/policy denial  → 403 CREDENTIAL_DENIED  + action=failed   (terminal)
-    //        store_unavailable   → 403 CREDENTIAL_STORE_UNAVAILABLE + action=needs_human
-    //        config_error        → 403 CREDENTIAL_CONFIGURATION_INVALID + action=needs_human
+    //   3. All credential failures → uniform 403 TOKEN_NOT_CONSUMABLE (anti-enumeration).
+    //      Internal reason lives in access_log.reasonCode + action.status only:
+    //        auth/policy denial  → action=failed    (terminal)
+    //        store_unavailable   → action=needs_human
+    //        config_error        → action=needs_human
     //
     // Flow — failure semantics (product invariant):
     //   kind not in required set              → fast path: empty bundle
