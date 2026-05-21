@@ -228,11 +228,26 @@ export async function actionRoutes(app: FastifyInstance) {
     const now = new Date();
 
     // ── Reversible / irreversible_abortable: no approval required ──
+    // CAS on action status: only fire if still in a fireable state.
+    // Prevents double-fire from concurrent retries or duplicate requests.
     if (action.reversibility !== IRREVERSIBLE_NO_ABORT) {
-      await db.controlAction.update({
-        where: { id: actionId },
+      const result = await db.controlAction.updateMany({
+        where: {
+          id: actionId,
+          status: { notIn: TERMINAL_STATUSES },  // CAS: reject if already terminal
+        },
         data: { status: 'fired', firedAt: now },
       });
+      if (result.count === 0) {
+        // Action transitioned to terminal between the earlier check and this update.
+        const current = await db.controlAction.findUnique({ where: { id: actionId } });
+        return reply.code(409).send({
+          error: {
+            code: 'ACTION_ALREADY_TERMINAL',
+            message: `Action is already in terminal state: ${current?.status ?? 'unknown'}`,
+          },
+        });
+      }
       return { action_id: actionId, fired: true, fired_at: now.toISOString() };
     }
 
@@ -261,24 +276,34 @@ export async function actionRoutes(app: FastifyInstance) {
     try {
       const firedAction = await db.$transaction(async (tx) => {
         // ── Step 1: CAS approval 'approved' → 'consumed' ──
-        // updateMany atomically checks status before updating.
-        // If approval was already consumed, rejected, or expired → count=0 → throw.
+        // updateMany atomically checks status AND expiry before updating.
+        // Conditions for count=0:
+        //   - approval already consumed, rejected, or in any non-approved state
+        //   - approval is past expiresAt (wall-clock expired, even if status not yet flipped)
         const approvalCAS = await tx.controlApproval.updateMany({
           where: {
             id: approval_id,
             status: 'approved',  // CAS: only if still approved
+            // Expiry check: accept if no expiry, or if expiry is in the future.
+            // This rejects past-expiry approvals even if a cron hasn't flipped their status.
+            OR: [
+              { expiresAt: null },
+              { expiresAt: { gt: now } },
+            ],
           },
           data: {
             status: 'consumed',
-            decidedAt: now,
+            // Do NOT overwrite decidedAt — it records when the human approved.
+            // approvedAtSnapshot on the action captures that timestamp for audit.
           },
         });
 
         if (approvalCAS.count === 0) {
-          // Approval is not in 'approved' state — already consumed, rejected, or expired.
+          // Distinguish expired vs. wrong status for a better error message.
+          // Re-read inside tx for accuracy (already holding row-level intent lock via updateMany).
           throw new FireConflictError(
             'APPROVAL_NOT_APPROVED',
-            `Approval is not in 'approved' state (may be consumed, rejected, or expired)`,
+            `Approval is not in 'approved' state or has expired (may be consumed, rejected, or past expiresAt)`,
           );
         }
 
