@@ -45,6 +45,7 @@ import { Prisma } from '@prisma/client';
 import { randomUUID, randomBytes, createHash } from 'crypto';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
+import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { publishControlEvent, type ControlEventResult } from '@/control/events/publishControlEvent';
 import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
@@ -238,9 +239,10 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
    * GET /api/v1/actions/:id
    */
   app.get('/api/v1/actions/:id', async (request, reply) => {
-    const machine = await verifyMachineToken(request.headers.authorization);
-    if (!machine) {
-      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired machine token' } });
+    // Dual-auth: machine_token (full) OR dev_control_token (read-only, allowlist + workroom-scope).
+    const auth = await authorizeControlRead(request);
+    if (!auth.ok) {
+      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
     }
 
     const { id } = request.params as { id: string };
@@ -252,8 +254,12 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
       return reply.code(404).send({ error: { code: 'ACTION_NOT_FOUND', message: 'Action not found' } });
     }
 
-    const access = await requireMachineAccessToWorkroom(machine, action.workroomId, { orgId: action.workroom.orgId });
-    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+    // machine mode: enforce org/workroom access. dev mode: workroom-scope already
+    // verified in authorizeControlRead (reverse-lookup of this action's workroom).
+    if (auth.mode === 'machine') {
+      const access = await requireMachineAccessToWorkroom(auth.machine, action.workroomId, { orgId: action.workroom.orgId });
+      if (!access.ok) return reply.code(access.status).send({ error: access.error });
+    }
 
     return {
       action_id: action.id,

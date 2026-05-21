@@ -21,8 +21,10 @@
  * the dev-token restrictions (allowlist + workroom-scope) apply ONLY to the dev-token path.
  */
 
+import type { FastifyRequest } from 'fastify';
 import { createHash } from 'crypto';
 import { db } from '@/storage/db';
+import { verifyMachineToken } from '@/machines/machineRoutes';
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -111,4 +113,46 @@ export async function devTokenInWorkroomScope(
 
   // Path not recognised as a workroom-scoped read → deny.
   return false;
+}
+
+/**
+ * Dual-auth for control-plane READ endpoints.
+ *
+ * Accepts EITHER:
+ *   - a machine_token  → full access (existing behaviour; caller still runs
+ *                        requireMachineAccessToWorkroom for org/workroom authz), or
+ *   - a dev_control_token → read-only, restricted to the GET allowlist + its bound
+ *                        workroom. allowlist + workroom-scope are enforced HERE; any
+ *                        failure returns a UNIFORM 403 (anti-enumeration).
+ *
+ * The machine path is unchanged — this only ADDS the dev-token path, so machine_token
+ * auth does not regress.
+ */
+export type ControlReadAuth =
+  | { ok: true; mode: 'machine'; machine: NonNullable<Awaited<ReturnType<typeof verifyMachineToken>>> }
+  | { ok: true; mode: 'dev'; devToken: DevTokenContext }
+  | { ok: false; status: number; code: string; message: string };
+
+export async function authorizeControlRead(request: FastifyRequest): Promise<ControlReadAuth> {
+  const authHeader = request.headers.authorization;
+
+  // 1. machine_token — unchanged full-access path.
+  const machine = await verifyMachineToken(authHeader);
+  if (machine) return { ok: true, mode: 'machine', machine };
+
+  // 2. dev_control_token — read-only, allowlist + workroom-scope, uniform 403 on any failure.
+  const devToken = await verifyDevControlToken(authHeader);
+  if (devToken) {
+    const path = request.url;
+    if (!isDevTokenAllowedPath(request.method, path)) {
+      return { ok: false, status: 403, code: 'FORBIDDEN', message: 'Forbidden' };
+    }
+    if (!(await devTokenInWorkroomScope(devToken, path))) {
+      return { ok: false, status: 403, code: 'FORBIDDEN', message: 'Forbidden' };
+    }
+    return { ok: true, mode: 'dev', devToken };
+  }
+
+  // 3. neither → 401.
+  return { ok: false, status: 401, code: 'UNAUTHORIZED', message: 'Invalid or expired token' };
 }

@@ -28,6 +28,7 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
+import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 
 const CLAIMABLE_STATUSES = ['todo', 'in_progress', 'waiting_approval', 'in_review'];
@@ -89,15 +90,20 @@ export async function taskRoutes(app: FastifyInstance) {
    * List tasks. Filter by status and/or owner_instance_id.
    */
   app.get('/api/v1/workrooms/:workroomId/tasks', async (request, reply) => {
-    const machine = await verifyMachineToken(request.headers.authorization);
-    if (!machine) {
-      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired machine token' } });
+    // Dual-auth: machine_token (full) OR dev_control_token (read-only, allowlist + workroom-scope).
+    const auth = await authorizeControlRead(request);
+    if (!auth.ok) {
+      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
     }
 
     const { workroomId } = request.params as { workroomId: string };
 
-    const access = await requireMachineAccessToWorkroom(machine, workroomId);
-    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+    // machine mode: enforce org/workroom access. dev mode: path workroomId already
+    // matched against token.workroomId in authorizeControlRead.
+    if (auth.mode === 'machine') {
+      const access = await requireMachineAccessToWorkroom(auth.machine, workroomId);
+      if (!access.ok) return reply.code(access.status).send({ error: access.error });
+    }
 
     const query = request.query as { status?: string; owner_instance_id?: string };
 
