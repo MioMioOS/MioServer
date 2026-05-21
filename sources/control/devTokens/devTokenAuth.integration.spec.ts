@@ -18,7 +18,7 @@ import { createHash, randomUUID } from 'crypto';
 import { db } from '@/storage/db';
 import { actionRoutes } from '../actions/actionRoutes';
 import { taskRoutes } from '../tasks/taskRoutes';
-import { isDevTokenAllowedPath } from './devTokenAuth';
+import { isDevTokenAllowedPath, authorizeControlRead } from './devTokenAuth';
 
 const ORG_ID = randomUUID();
 const AGENT_ID = randomUUID();
@@ -154,6 +154,58 @@ describe('dev_control_token dual-auth — real DB security matrix (#32)', () => 
         expect(isDevTokenAllowedPath('GET', `/api/v1/approvals/${randomUUID()}`)).toBe(false);
         expect(isDevTokenAllowedPath('GET', `/api/v1/workrooms/${WORKROOM_A}`)).toBe(false);
         expect(isDevTokenAllowedPath('GET', '/api/v1/workrooms')).toBe(false);
+    });
+
+    // FUTURE-PROOF SAFETY GUARD (#44): exercise authorizeControlRead's allowlist-403 branch
+    // end-to-end. Current routing never reaches it (the only 3 dual-auth routes are all on the
+    // allowlist), so this drives authorizeControlRead directly with a fake request to lock the
+    // invariant: a VALID dev token presented to a dual-auth handler whose path is NOT on the
+    // allowlist (or uses a non-GET method) must be DENIED with a uniform 403. This protects
+    // against a future GET route being wired into authorizeControlRead without being added to
+    // DEV_TOKEN_GET_ALLOWLIST — it would default-deny rather than silently grant access.
+    const fakeReq = (method: string, url: string, token?: string) =>
+        ({
+            method,
+            url,
+            headers: token ? { authorization: `Bearer ${token}` } : {},
+        }) as unknown as Parameters<typeof authorizeControlRead>[0];
+
+    it('authorizeControlRead: valid dev token + off-allowlist GET path -> uniform 403 deny (default-deny guard)', async () => {
+        // Token is valid (not expired/revoked, scope read_only) but /tasks/:id is off-allowlist.
+        const res = await authorizeControlRead(fakeReq('GET', `/api/v1/tasks/${TASK_A}`, RAW_VALID));
+        expect(res.ok).toBe(false);
+        if (!res.ok) {
+            expect(res.status).toBe(403);
+            expect(res.code).toBe('FORBIDDEN');
+        }
+    });
+
+    it('authorizeControlRead: valid dev token + non-GET method on an allowlisted path -> uniform 403 deny', async () => {
+        // Even on an allowlisted path, a non-GET method is off-allowlist (allowlist is GET-only).
+        const res = await authorizeControlRead(fakeReq('POST', `/api/v1/workrooms/${WORKROOM_A}/tasks`, RAW_VALID));
+        expect(res.ok).toBe(false);
+        if (!res.ok) {
+            expect(res.status).toBe(403);
+            expect(res.code).toBe('FORBIDDEN');
+        }
+    });
+
+    it('authorizeControlRead: valid dev token + allowlisted path but CROSS-workroom -> uniform 403 deny (scope branch)', async () => {
+        // On-allowlist + GET, but the action belongs to WORKROOM_B (not the token's bound room).
+        const res = await authorizeControlRead(fakeReq('GET', `/api/v1/actions/${ACTION_B}`, RAW_VALID));
+        expect(res.ok).toBe(false);
+        if (!res.ok) {
+            expect(res.status).toBe(403);
+            expect(res.code).toBe('FORBIDDEN');
+        }
+    });
+
+    it('authorizeControlRead: valid dev token + on-allowlist + in-scope -> ok dev mode (positive control)', async () => {
+        // Sanity: the direct-call path grants for a correct request (proves the 403s above are
+        // real denials, not the helper failing for unrelated reasons).
+        const res = await authorizeControlRead(fakeReq('GET', `/api/v1/actions/${ACTION_A}`, RAW_VALID));
+        expect(res.ok).toBe(true);
+        if (res.ok) expect(res.mode).toBe('dev');
     });
 
     it('write route via dev token -> 401 (write routes are machine-only)', async () => {
