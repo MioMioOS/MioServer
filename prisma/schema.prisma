@@ -228,3 +228,568 @@ model RedeemCodeUsage {
   @@unique([redeemCodeId, deviceId])
   @@index([deviceId])
 }
+
+// ============================================================
+// CONTROL PLANE — Server Control Plane (feat/server-control-plane)
+// ERD source: erd-api-contract.md v3 (4d5d06e6)
+// All new models use UUID PKs (distinct from legacy CUID models above)
+// ============================================================
+
+/// Top-level org/team boundary.
+model ControlOrg {
+  id          String   @id @default(uuid())
+  name        String
+  slug        String   @unique
+  ownerUserId String   @map("owner_user_id")
+  billingPlan String   @default("free") @map("billing_plan")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  credentials   ControlCredential[]
+  workrooms     ControlWorkroom[]
+  agents        ControlAgent[]
+  artifacts     ControlArtifact[]
+  machines      ControlMachine[]
+
+  @@map("control_orgs")
+}
+
+/// Credential/secret alias. Content lives in secure vault, never in DB.
+model ControlCredential {
+  id         String    @id @default(uuid())
+  orgId      String    @map("org_id")
+  org        ControlOrg @relation(fields: [orgId], references: [id])
+  alias      String
+  kind       String    // asc_api_key | vercel_token | ssh_key | cert | env_group | other
+  scope      String?   // which workrooms/agents may use
+  storageRef String    @map("storage_ref") // pointer to vault; never plain secret
+  createdBy  String    @map("created_by")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  lastUsedAt DateTime? @map("last_used_at")
+
+  @@map("control_credentials")
+}
+
+/// Machine registered by mio-agent daemon. machine_token stored in Keychain, not here.
+model ControlMachine {
+  id               String    @id @default(uuid()) // permanent machine UUID
+  orgId            String?   @map("org_id")
+  org              ControlOrg? @relation(fields: [orgId], references: [id])
+  displayName      String?   @map("display_name")
+  platform         String    @default("darwin") // darwin | linux
+  arch             String    @default("arm64")  // arm64 | x64
+  tokenHash        String    @map("token_hash") // SHA-256 of machine_token; actual token is in Keychain on Mac
+  tokenExpiresAt   DateTime  @map("token_expires_at")
+  boundAt          DateTime? @map("bound_at")   // when bind-org was called
+  lastSeenAt       DateTime? @map("last_seen_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+
+  sessions ControlSession[]
+
+  @@map("control_machines")
+}
+
+/// Workroom / collaborative channel for a project.
+/// current_goal_id is a plain UUID reference (nullable; breaks circular FK).
+model ControlWorkroom {
+  id            String    @id @default(uuid())
+  orgId         String    @map("org_id")
+  org           ControlOrg @relation(fields: [orgId], references: [id])
+  name          String
+  description   String?
+  visibility    String    @default("private") // public | private
+  purpose       String?
+  currentGoalId String?   @map("current_goal_id") // nullable UUID; no Prisma relation (circular)
+  createdBy     String    @map("created_by")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  archivedAt    DateTime? @map("archived_at")
+
+  goals             ControlGoal[]
+  messages          ControlMessage[]
+  sessions          ControlSession[]
+  tasks             ControlTask[]
+  actions           ControlAction[]
+  approvals         ControlApproval[]
+  artifacts         ControlArtifact[]
+  artifactPointers  ControlArtifactPointer[]
+  workingAgreements ControlWorkingAgreement[]
+  handoffs          ControlHandoff[]
+  summaries         ControlWorkroomSummary[]
+  roleInsights      ControlRoleInsight[]
+  routerDecisions   ControlRouterDecision[]
+  eventLogs         ControlEventLog[]
+
+  @@map("control_workrooms")
+}
+
+/// Goal for a workroom.
+model ControlGoal {
+  id                  String   @id @default(uuid())
+  workroomId          String   @map("workroom_id")
+  workroom            ControlWorkroom @relation(fields: [workroomId], references: [id])
+  sourceMessageId     String?  @map("source_message_id")
+  title               String
+  description         String   @default("")
+  successCriteria     String   @default("") @map("success_criteria")
+  status              String   @default("active") // active | paused | in_review | achieved | canceled
+  ownerUserId         String   @map("owner_user_id")
+  currentTaskIds      String[] @map("current_task_ids")
+  acceptedArtifactIds String[] @map("accepted_artifact_ids")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  workroomSummaries ControlWorkroomSummary[]
+
+  @@index([workroomId])
+  @@map("control_goals")
+}
+
+/// Agent (AI agent or human proxy) registered in the system.
+model ControlAgent {
+  id          String   @id @default(uuid())
+  orgId       String   @map("org_id")
+  org         ControlOrg @relation(fields: [orgId], references: [id])
+  name        String
+  displayName String   @map("display_name")
+  role        String   // ops | pm | engineer | designer | researcher | other
+  description String   @default("")
+  capabilities Json    @default("{}")
+  runtime     String?  // claude | codex | opencode | kimi | other
+  machineId   String?  @map("machine_id")
+  status      String   @default("offline") // online | offline | busy | drain
+  permissions Json     @default("{}")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tasks              ControlTask[]       @relation("TaskOwner")
+  actedActions       ControlAction[]     @relation("ActionActor")
+  createdArtifacts   ControlArtifact[]   @relation("ArtifactCreator")
+  verificationLogs   ControlArtifactVerificationLog[]
+  handoffs           ControlHandoff[]    @relation("HandoffTarget")
+  roleInsights       ControlRoleInsight[]
+
+  @@index([orgId, status])
+  @@map("control_agents")
+}
+
+/// Message in a workroom timeline.
+model ControlMessage {
+  id               String    @id @default(uuid())
+  workroomId       String    @map("workroom_id")
+  workroom         ControlWorkroom @relation(fields: [workroomId], references: [id])
+  senderKind       String    @map("sender_kind") // user | agent | system
+  senderId         String    @map("sender_id")
+  content          String
+  mentions         String[]
+  hashRefs         Json      @default("{}") @map("hash_refs")
+  attachmentIds    String[]  @map("attachment_ids")
+  embeddedCardType String?   @map("embedded_card_type")
+  embeddedCardId   String?   @map("embedded_card_id")
+  threadReplyCount Int       @default(0) @map("thread_reply_count")
+  lastThreadReplyAt DateTime? @map("last_thread_reply_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+
+  attachments     ControlAttachment[]
+  thread          ControlThread?
+  workingAgreements ControlWorkingAgreement[] @relation("AgreementSourceMessage")
+  handoffs        ControlHandoff[]            @relation("HandoffSourceMessage")
+  roleInsights    ControlRoleInsight[]
+  routerDecisions ControlRouterDecision[]
+
+  @@index([workroomId, createdAt(sort: Desc)])
+  @@map("control_messages")
+}
+
+/// Attachment on a message or thread reply.
+model ControlAttachment {
+  id                  String   @id @default(uuid())
+  workroomId          String   @map("workroom_id")
+  messageId           String?  @map("message_id")
+  message             ControlMessage? @relation(fields: [messageId], references: [id])
+  threadReplyId       String?  @map("thread_reply_id")
+  uploaderKind        String   @map("uploader_kind") // user | agent | daemon
+  uploaderId          String   @map("uploader_id")
+  filename            String
+  mimeType            String   @map("mime_type")
+  sizeBytes           BigInt   @map("size_bytes")
+  previewMetadata     Json?    @map("preview_metadata")
+  sensitivity         String   @default("normal") // normal | secret
+  classificationSource String  @default("uploader") @map("classification_source")
+  policyResult        String   @default("allowed") @map("policy_result")
+  storageKey          String?  @map("storage_key")
+  credentialAliasRef  String?  @map("credential_alias_ref")
+  permissionScope     String   @default("members") @map("permission_scope")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  @@index([workroomId])
+  @@map("control_attachments")
+}
+
+/// Thread attached to a workroom message.
+model ControlThread {
+  id             String    @id @default(uuid())
+  parentMessageId String   @unique @map("parent_message_id")
+  parentMessage  ControlMessage @relation(fields: [parentMessageId], references: [id])
+  workroomId     String    @map("workroom_id")
+  replyCount     Int       @default(0) @map("reply_count")
+  lastReplyAt    DateTime? @map("last_reply_at")
+
+  tasks ControlTask[]
+
+  @@index([workroomId])
+  @@map("control_threads")
+}
+
+/// AI/runtime session (cmux | daemon | applescript).
+model ControlSession {
+  id             String    @id @default(uuid())
+  orgId          String    @map("org_id")
+  workroomId     String    @map("workroom_id")
+  workroom       ControlWorkroom @relation(fields: [workroomId], references: [id])
+  machineId      String?   @map("machine_id")
+  machine        ControlMachine? @relation(fields: [machineId], references: [id])
+  mode           String    // cmux | daemon | applescript
+  runtime        String    // claude | codex | opencode | kimi | other
+  displayName    String    @map("display_name")
+  status         String    @default("idle")
+  // idle | running | waiting_for_user | blocked | completed | failed | disconnected | reconnecting
+  currentTaskId  String?   @map("current_task_id") // UI cache only; Task is source of truth
+  capabilities   Json      @default("{}")
+  lastActivityAt DateTime  @default(now()) @map("last_activity_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  actions   ControlAction[]
+  approvals ControlApproval[]
+  artifacts ControlArtifact[]
+
+  @@index([workroomId, status])
+  @@index([machineId])
+  @@map("control_sessions")
+}
+
+/// Task — work item with atomic CAS claim.
+model ControlTask {
+  id              String    @id @default(uuid())
+  workroomId      String    @map("workroom_id")
+  workroom        ControlWorkroom @relation(fields: [workroomId], references: [id])
+  goalId          String?   @map("goal_id")
+  sourceMessageId String?   @map("source_message_id")
+  title           String
+  description     String    @default("")
+  ownerRole       String?   @map("owner_role")
+  ownerInstanceId String?   @map("owner_instance_id") // FK → ControlAgent; CAS claim
+  ownerAgent      ControlAgent? @relation("TaskOwner", fields: [ownerInstanceId], references: [id])
+  status          String    @default("todo")
+  // todo | in_progress | waiting_approval | in_review | done | canceled
+  linkedSessionIds String[] @map("linked_session_ids")
+  threadId        String?   @map("thread_id")
+  thread          ControlThread? @relation(fields: [threadId], references: [id])
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  actions   ControlAction[]
+  approvals ControlApproval[]
+  artifacts ControlArtifact[]
+  handoffs  ControlHandoff[]
+
+  @@index([workroomId, status])
+  @@index([ownerInstanceId])
+  @@map("control_tasks")
+}
+
+/// Action proposed by a session. Requires approval when irreversible_no_abort.
+/// approval_id is a plain String (breaks circular FK with ControlApproval).
+model ControlAction {
+  id                    String    @id @default(uuid())
+  sessionId             String    @map("session_id")
+  session               ControlSession @relation(fields: [sessionId], references: [id])
+  workroomId            String    @map("workroom_id")
+  workroom              ControlWorkroom @relation(fields: [workroomId], references: [id])
+  taskId                String?   @map("task_id")
+  task                  ControlTask? @relation(fields: [taskId], references: [id])
+  actorAgentId          String    @map("actor_agent_id")
+  actorAgent            ControlAgent @relation("ActionActor", fields: [actorAgentId], references: [id])
+  kind                  String    // deploy | upload | db_migrate | env_change | ...
+  summary               String
+  reversibility         String    // reversible | irreversible_abortable | irreversible_no_abort
+  riskLevel             String    @map("risk_level") // low | medium | high | critical
+  status                String    @default("proposed")
+  // proposed | approved | rejected | canceled | fired | transmission_complete | reconciling | succeeded | failed | needs_human
+  transmissionCompletedAt DateTime? @map("transmission_completed_at")
+  externalConfirmedAt   DateTime? @map("external_confirmed_at")
+  requiresApproval      Boolean   @default(false) @map("requires_approval")
+  approvalId            String?   @map("approval_id")   // set at fire; no Prisma relation (circular)
+  approvedAtSnapshot    DateTime? @map("approved_at_snapshot")
+  credentialAliasRef    String?   @map("credential_alias_ref")
+  clientIdempotencyKey  String    @unique @map("client_idempotency_key")
+  createdAt             DateTime  @default(now()) @map("created_at")
+  firedAt               DateTime? @map("fired_at")
+
+  approvalConsumption   ControlActionApprovalConsumption?
+  artifacts             ControlArtifact[]
+  approvals             ControlApproval[]
+
+  @@index([workroomId, status])
+  @@index([sessionId])
+  @@map("control_actions")
+}
+
+/// Approval — pre-action gate or artifact review.
+/// action_id and artifact_id are plain String NULLable to break circular FKs.
+model ControlApproval {
+  id              String    @id @default(uuid())
+  workroomId      String    @map("workroom_id")
+  workroom        ControlWorkroom @relation(fields: [workroomId], references: [id])
+  sessionId       String?   @map("session_id")
+  session         ControlSession? @relation(fields: [sessionId], references: [id])
+  taskId          String?   @map("task_id")
+  task            ControlTask? @relation(fields: [taskId], references: [id])
+  actionId        String?   @map("action_id")
+  action          ControlAction? @relation(fields: [actionId], references: [id])
+  artifactId      String?   @map("artifact_id")   // nullable UUID; no Prisma relation (circular)
+  kind            String    // pre_action | disposal | artifact_review
+  status          String    @default("pending")
+  // pending | approved | consumed | rejected | snoozed | expired | ignored | rolled_forward | accepted | changes_requested | remediation_created
+  reviewerUserId  String?   @map("reviewer_user_id")
+  riskSummary     String    @default("") @map("risk_summary")
+  evidenceSummary String    @default("") @map("evidence_summary")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  expiresAt       DateTime? @map("expires_at")
+  decidedAt       DateTime? @map("decided_at")
+
+  approvalConsumption ControlActionApprovalConsumption?
+
+  @@index([workroomId, status])
+  @@map("control_approvals")
+}
+
+/// Atomic fire-gate: one approval → one irreversible_no_abort action. DB-level enforcement.
+/// Both columns have UNIQUE constraints. Fire transaction INSERTs here atomically.
+model ControlActionApprovalConsumption {
+  id         String          @id @default(uuid())
+  approvalId String          @unique @map("approval_id")
+  approval   ControlApproval @relation(fields: [approvalId], references: [id])
+  actionId   String          @unique @map("action_id")
+  action     ControlAction   @relation(fields: [actionId], references: [id])
+  consumedAt DateTime        @default(now()) @map("consumed_at")
+
+  @@map("control_action_approval_consumptions")
+}
+
+/// Artifact — evidence of work progress. Three-state milestone.
+model ControlArtifact {
+  id                   String    @id @default(uuid())
+  orgId                String    @map("org_id")
+  org                  ControlOrg @relation(fields: [orgId], references: [id])
+  workroomId           String    @map("workroom_id")
+  workroom             ControlWorkroom @relation(fields: [workroomId], references: [id])
+  taskId               String?   @map("task_id")
+  task                 ControlTask? @relation(fields: [taskId], references: [id])
+  sessionId            String?   @map("session_id")
+  session              ControlSession? @relation(fields: [sessionId], references: [id])
+  actionId             String?   @map("action_id")
+  action               ControlAction? @relation(fields: [actionId], references: [id])
+  scopeType            String    @map("scope_type") // org | workroom | task | session | action
+  type                 String
+  // prd | design | code_path | build | deployment_url | ipa_upload | test_report | runbook | log | screenshot
+  title                String
+  summary              String    @default("")
+  url                  String?
+  localPath            String?   @map("local_path")
+  hash                 String?
+  externalId           String?   @map("external_id")
+  status               String    @default("created")
+  // created | verified | external_confirmed | accepted | superseded | rejected | expired | disposed | ignored | rolled_forward
+  verifiedAt           DateTime? @map("verified_at")         // milestone 1: agent verified
+  externalConfirmedAt  DateTime? @map("external_confirmed_at") // milestone 2: external system confirmed
+  humanAckedAt         DateTime? @map("human_acked_at")       // milestone 3: human accepted
+  disposalStatus       String    @default("none") @map("disposal_status")
+  // none | expired | ignored | rolled_forward | remediation_created
+  currentPointerKey    String?   @map("current_pointer_key")
+  createdByAgentId     String?   @map("created_by_agent_id")
+  createdByAgent       ControlAgent? @relation("ArtifactCreator", fields: [createdByAgentId], references: [id])
+  clientIdempotencyKey String    @unique @map("client_idempotency_key")
+  createdAt            DateTime  @default(now()) @map("created_at")
+
+  verificationLogs ControlArtifactVerificationLog[]
+  pointers         ControlArtifactPointer[]
+
+  @@index([workroomId, type])
+  @@index([sessionId])
+  @@map("control_artifacts")
+}
+
+/// Artifact pointer — "which artifact is current?" per semantic key per workroom.
+model ControlArtifactPointer {
+  id         String          @id @default(uuid())
+  workroomId String          @map("workroom_id")
+  workroom   ControlWorkroom @relation(fields: [workroomId], references: [id])
+  key        String          // e.g. current_prd, current_deployment
+  artifactId String          @map("artifact_id")
+  artifact   ControlArtifact @relation(fields: [artifactId], references: [id])
+  updatedBy  String          @map("updated_by")
+  updatedAt  DateTime        @updatedAt @map("updated_at")
+
+  @@unique([workroomId, key])
+  @@map("control_artifact_pointers")
+}
+
+/// Artifact verification log — process evidence, not just a single status field.
+model ControlArtifactVerificationLog {
+  id                   String          @id @default(uuid())
+  artifactId           String          @map("artifact_id")
+  artifact             ControlArtifact @relation(fields: [artifactId], references: [id])
+  verifierAgentId      String          @map("verifier_agent_id")
+  verifierAgent        ControlAgent    @relation(fields: [verifierAgentId], references: [id])
+  method               String
+  // curl | hash_compare | app_store_check | browser_check | codesign_verify | ipa_inspect | manual
+  status               String          // passed | failed | inconclusive
+  evidence             Json            @default("{}")
+  error                String?
+  clientIdempotencyKey String          @unique @map("client_idempotency_key")
+  createdAt            DateTime        @default(now()) @map("created_at")
+
+  @@index([artifactId])
+  @@map("control_artifact_verification_logs")
+}
+
+/// Working agreement — persistent team-level rule discovered through collaboration.
+model ControlWorkingAgreement {
+  id                   String          @id @default(uuid())
+  workroomId           String          @map("workroom_id")
+  workroom             ControlWorkroom @relation(fields: [workroomId], references: [id])
+  participants         String[]        // user/agent ids
+  summary              String
+  rules                Json            @default("[]")
+  createdFromMessageId String?         @map("created_from_message_id")
+  createdFromMessage   ControlMessage? @relation("AgreementSourceMessage", fields: [createdFromMessageId], references: [id])
+  createdAt            DateTime        @default(now()) @map("created_at")
+  updatedAt            DateTime        @updatedAt @map("updated_at")
+
+  @@index([workroomId])
+  @@map("control_working_agreements")
+}
+
+/// Handoff — structured work transfer between roles.
+model ControlHandoff {
+  id                   String          @id @default(uuid())
+  workroomId           String          @map("workroom_id")
+  workroom             ControlWorkroom @relation(fields: [workroomId], references: [id])
+  fromActorKind        String          @map("from_actor_kind") // user | agent
+  fromActorId          String          @map("from_actor_id")
+  toRole               String          @map("to_role")
+  toInstanceId         String?         @map("to_instance_id")
+  toAgent              ControlAgent?   @relation("HandoffTarget", fields: [toInstanceId], references: [id])
+  taskId               String?         @map("task_id")
+  task                 ControlTask?    @relation(fields: [taskId], references: [id])
+  inputArtifactIds     String[]        @map("input_artifact_ids")
+  expectedOutput       String          @default("") @map("expected_output")
+  acceptanceCriteria   String          @default("") @map("acceptance_criteria")
+  status               String          @default("proposed")
+  // proposed | accepted | declined | completed | canceled
+  createdFromMessageId String?         @map("created_from_message_id")
+  createdFromMessage   ControlMessage? @relation("HandoffSourceMessage", fields: [createdFromMessageId], references: [id])
+  createdAt            DateTime        @default(now()) @map("created_at")
+  updatedAt            DateTime        @updatedAt @map("updated_at")
+
+  @@index([workroomId, status])
+  @@map("control_handoffs")
+}
+
+/// Workroom summary — LLM-generated context digest for mobile first-load.
+model ControlWorkroomSummary {
+  id                    String          @id @default(uuid())
+  workroomId            String          @map("workroom_id")
+  workroom              ControlWorkroom @relation(fields: [workroomId], references: [id])
+  goalId                String?         @map("goal_id")
+  goal                  ControlGoal?    @relation(fields: [goalId], references: [id])
+  headline              String
+  currentPhase          String          @default("") @map("current_phase")
+  activeOwnerSummary    Json            @default("{}") @map("active_owner_summary")
+  needsAttentionCount   Int             @default(0) @map("needs_attention_count")
+  latestArtifactIds     String[]        @map("latest_artifact_ids")
+  blockedItems          Json            @default("[]") @map("blocked_items")
+  nextRecommendedAction String          @default("") @map("next_recommended_action")
+  generatedAt           DateTime        @default(now()) @map("generated_at")
+
+  @@index([workroomId, generatedAt(sort: Desc)])
+  @@map("control_workroom_summaries")
+}
+
+/// Role insight — proactive input from an agent watching the conversation.
+model ControlRoleInsight {
+  id                String          @id @default(uuid())
+  workroomId        String          @map("workroom_id")
+  workroom          ControlWorkroom @relation(fields: [workroomId], references: [id])
+  agentId           String          @map("agent_id")
+  agent             ControlAgent    @relation(fields: [agentId], references: [id])
+  relatedMessageId  String?         @map("related_message_id")
+  relatedMessage    ControlMessage? @relation(fields: [relatedMessageId], references: [id])
+  relatedObjectType String?         @map("related_object_type")
+  relatedObjectId   String?         @map("related_object_id")
+  reason            String
+  content           String
+  suggestedAction   Json?           @map("suggested_action")
+  createdAt         DateTime        @default(now()) @map("created_at")
+
+  @@index([workroomId, createdAt(sort: Desc)])
+  @@map("control_role_insights")
+}
+
+/// Router decision log — why a message was routed to which agent(s).
+model ControlRouterDecision {
+  id                      String          @id @default(uuid())
+  workroomId              String          @map("workroom_id")
+  workroom                ControlWorkroom @relation(fields: [workroomId], references: [id])
+  triggerMessageId        String?         @map("trigger_message_id")
+  triggerMessage          ControlMessage? @relation(fields: [triggerMessageId], references: [id])
+  targetAgentIds          String[]        @map("target_agent_ids")
+  reason                  String
+  confidence              Float
+  triggerType             String          @map("trigger_type")
+  // explicit_mention | role_capability | artifact_type | task_owner | missing_perspective
+  relatedObjectIds        Json            @default("{}") @map("related_object_ids")
+  contextSelectionLog     Json            @default("{}") @map("context_selection_log")
+  requiresHumanConfirmation Boolean       @default(false) @map("requires_human_confirmation")
+  createTask              Boolean         @default(false) @map("create_task")
+  createdAt               DateTime        @default(now()) @map("created_at")
+
+  @@index([workroomId, createdAt(sort: Desc)])
+  @@map("control_router_decisions")
+}
+
+/// Event log — persisted before WS fanout. Monotonic seq per workroom.
+/// Retention must cover max_catch_up_events (500). Pruning checks MIN(apply_seq) across ClientCursors.
+model ControlEventLog {
+  id          String          @id @default(uuid())
+  workroomId  String          @map("workroom_id")
+  workroom    ControlWorkroom @relation(fields: [workroomId], references: [id])
+  seq         BigInt          // monotonically increasing per workroom
+  eventId     String          @unique @map("event_id") // stable dedup key
+  topic       String          // event topic string
+  payloadJson Json            @map("payload_json")
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  @@unique([workroomId, seq])
+  @@index([workroomId, seq])
+  @@map("control_event_logs")
+}
+
+/// Client cursor — per-device × per-scope catch-up position.
+/// One row per (user, device, scope_type, scope_id, topic_group).
+/// apply_seq: highest seq received and applied.
+/// read_seq: highest seq human has visibly read (drives unread badge).
+model ControlClientCursor {
+  id         String   @id @default(uuid())
+  userId     String   @map("user_id")
+  deviceId   String   @map("device_id")
+  scopeType  String   @map("scope_type") // workroom | thread | session
+  scopeId    String   @map("scope_id")
+  topicGroup String   @default("all") @map("topic_group") // messages | tasks | events | all
+  applySeq   BigInt   @default(0) @map("apply_seq")
+  readSeq    BigInt   @default(0) @map("read_seq")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@unique([userId, deviceId, scopeType, scopeId, topicGroup])
+  @@index([userId, deviceId])
+  @@map("control_client_cursors")
+}
