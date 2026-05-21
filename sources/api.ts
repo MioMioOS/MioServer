@@ -23,6 +23,7 @@ import { actionRoutes } from '@/control/actions/actionRoutes';
 import { eventRoutes } from '@/control/events/eventRoutes';
 import { artifactRoutes } from '@/control/artifacts/artifactRoutes';
 import { summaryRoutes } from '@/control/workrooms/summaryRoutes';
+import { sessionRoutes as controlSessionRoutes } from '@/control/sessions/sessionRoutes';
 import { config } from '@/config';
 
 export async function startApi() {
@@ -63,6 +64,7 @@ export async function startApi() {
     await app.register(eventRoutes);
     await app.register(artifactRoutes);
     await app.register(summaryRoutes);
+    await app.register(controlSessionRoutes);
 
     await app.listen({ port: config.port, host: '0.0.0.0' });
     console.log(`CodeLight Server listening on port ${config.port}`);

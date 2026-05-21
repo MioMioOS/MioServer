@@ -31,6 +31,7 @@
 import { FastifyInstance } from 'fastify';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
+import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { publishControlEvent } from './publishControlEvent';
 import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
 
@@ -55,9 +56,9 @@ export async function eventRoutes(app: FastifyInstance) {
    * Idempotency: event_id is @unique. Retried publishes with the same event_id
    * return the existing event as 200 { idempotent: true }.
    *
-   * WS fanout: TODO — implement after WS gateway. Write-before-broadcast
-   * contract is satisfied: DB write commits before this handler returns.
-   * Fanout can happen here (post-commit) or via a DB trigger/polling loop.
+   * WS fanout: implemented via workroomBroadcaster (see :92). Write-before-broadcast
+   * contract satisfied — event is persisted before broadcast() is called.
+   * Fanout failure is non-fatal; client catches up via GET /events?after_seq=N.
    *
    * Body: { event_id, topic, payload, publisher_session_id? }
    */
@@ -68,6 +69,10 @@ export async function eventRoutes(app: FastifyInstance) {
     }
 
     const { workroomId } = request.params as { workroomId: string };
+
+    const access = await requireMachineAccessToWorkroom(machine, workroomId);
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+
     const body = request.body as {
       event_id: string;     // client dedup key — stable across retries
       topic: string;
@@ -145,6 +150,10 @@ export async function eventRoutes(app: FastifyInstance) {
     }
 
     const { workroomId } = request.params as { workroomId: string };
+
+    const access = await requireMachineAccessToWorkroom(machine, workroomId);
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
+
     const query = request.query as {
       after_seq?: string;
       limit?: string;
@@ -240,6 +249,9 @@ export async function eventRoutes(app: FastifyInstance) {
     }
 
     const { workroomId } = request.params as { workroomId: string };
+
+    const access = await requireMachineAccessToWorkroom(machine, workroomId);
+    if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
     const [{ max_seq }] = await db.$queryRaw<[{ max_seq: bigint | null }]>`
       SELECT MAX(seq) AS max_seq

@@ -37,6 +37,7 @@ import { Server as HttpServer } from 'http';
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
+import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { workroomBroadcaster, WorkroomSubscriber } from './workroomBroadcaster';
 
 export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
@@ -71,13 +72,12 @@ export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
       authenticatedMachineId.value = machine.id;
       subscriber.context = `machine:${machine.id}`;
 
-      // Verify workroom exists
-      const workroom = await db.controlWorkroom.findUnique({
-        where: { id: msg.workroom_id },
-        select: { id: true },
-      });
-      if (!workroom) {
-        socket.emit('error', { code: 'WORKROOM_NOT_FOUND', message: `Workroom ${msg.workroom_id} not found` });
+      // Verify workroom exists AND machine is authorized to access it.
+      // requireMachineAccessToWorkroom enforces: machine must have bound org + org matches workroom.
+      const access = await requireMachineAccessToWorkroom(machine, msg.workroom_id);
+      if (!access.ok) {
+        socket.emit('error', { code: access.error.code, message: access.error.message });
+        if (access.status === 403) socket.disconnect(true);
         return;
       }
 
