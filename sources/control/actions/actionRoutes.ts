@@ -779,28 +779,67 @@ export async function actionRoutes(app: FastifyInstance) {
       });
     }
 
-    // ── 7. Transaction: INSERT evidence record + CAS fired→needs_human ──
+    // ── 7. Transaction: CAS fired→needs_human THEN conditionally INSERT evidence ──
+    //
+    // ORDER IS CRITICAL: CAS before INSERT prevents orphan evidence rows.
+    //
+    // Scenario A (happy path): action is 'fired'
+    //   → CAS count=1 → transition happened → INSERT evidence → 200
+    //
+    // Scenario B (race: action→terminal between pre-check and CAS):
+    //   → CAS count=0 → status is terminal → NO evidence insert → 409
+    //   (Pre-check caught the deterministic terminal case; this handles the race.)
+    //
+    // Scenario C (action already 'needs_human' — reconciled via different path):
+    //   → CAS count=0 → status is needs_human → INSERT evidence (full audit trail)
+    //   → P2002 on insert = same evidence_id = idempotent 200
     let casCount = 0;
+    let casCurrentStatus: string | null = null;
     try {
-      casCount = await db.$transaction(async (tx) => {
-        // INSERT evidence record (P2002 on duplicate evidence_id = idempotent re-report)
-        await tx.controlActionReconciliation.create({
-          data: {
-            id: randomUUID(),
-            actionId,
-            evidenceId: evidenceId as string,
-            reasonCode: reason,
-            machineId: machine.id,            // bound from firing machine, NOT from body
-          },
-        });
-
-        // CAS: advance status only if currently 'fired' (atomic, prevents overwriting a true terminal)
+      const txResult = await db.$transaction(async (tx) => {
+        // Step 1: CAS — advance status only if currently 'fired'
         const cas = await tx.controlAction.updateMany({
           where: { id: actionId, status: 'fired' },
           data: { status: 'needs_human' },
         });
-        return cas.count;
+
+        if (cas.count === 1) {
+          // Transition happened — insert evidence record
+          await tx.controlActionReconciliation.create({
+            data: {
+              id: randomUUID(),
+              actionId,
+              evidenceId: evidenceId as string,
+              reasonCode: reason,
+              machineId: machine.id,            // bound from firing machine, NOT from body
+            },
+          });
+          return { count: 1 as number, currentStatus: 'needs_human' };
+        }
+
+        // CAS count=0 — read current status inside the transaction
+        const current = await tx.controlAction.findUnique({ where: { id: actionId }, select: { status: true } });
+        const currentStatus = current?.status ?? null;
+
+        if (currentStatus === 'needs_human') {
+          // Already reconciled (different path) — insert evidence for full audit trail.
+          // P2002 = same evidence_id already reported → idempotent (caught by outer catch).
+          await tx.controlActionReconciliation.create({
+            data: {
+              id: randomUUID(),
+              actionId,
+              evidenceId: evidenceId as string,
+              reasonCode: reason,
+              machineId: machine.id,
+            },
+          });
+        }
+        // else: hard terminal race — DO NOT insert evidence (no orphan rows)
+
+        return { count: 0 as number, currentStatus };
       });
+      casCount = txResult.count;
+      casCurrentStatus = txResult.currentStatus;
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
         // Same (action_id, evidence_id) already processed — idempotent 200
@@ -839,20 +878,18 @@ export async function actionRoutes(app: FastifyInstance) {
       });
     }
 
-    // ── 9. CAS count=0: action was not in 'fired' state ──
-    // Read current status to determine response.
-    const current = await db.controlAction.findUnique({ where: { id: actionId }, select: { status: true } });
-    if (current?.status === 'needs_human') {
-      // Already reconciled (via different evidence ID) — idempotent 200
+    // ── 9. CAS count=0 ──
+    if (casCurrentStatus === 'needs_human') {
+      // Already reconciled (via different evidence ID or path) — idempotent 200
       return reply.code(200).send({
         action_id: actionId,
         status: 'needs_human',
         idempotent: true,
       });
     }
-    // Must be in a terminal state (race: fired→terminal between pre-check and CAS)
+    // Terminal race (fired→terminal between pre-check and CAS) — no evidence was inserted
     return reply.code(409).send({
-      error: { code: 'RECONCILE_TERMINAL_CONFLICT', message: `Action status is ${current?.status ?? 'unknown'} — cannot reconcile` },
+      error: { code: 'RECONCILE_TERMINAL_CONFLICT', message: `Action status is ${casCurrentStatus ?? 'unknown'} — cannot reconcile` },
     });
   });
 

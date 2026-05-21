@@ -162,27 +162,12 @@ function simulateReconcile(
     return { ok: false, statusCode: 409, code: 'RECONCILE_NOT_FIRED' };
   }
 
-  // ── 7. Transaction simulation: INSERT evidence + CAS ──
-  const evidenceKey = `${actionId}:${evidenceId}`;
-
-  // P2002 simulation: same evidence already exists
-  if (opts.evidenceTable.has(evidenceKey)) {
-    return {
-      ok: true,
-      statusCode: 200,
-      body: { action_id: actionId, status: action.status, idempotent: true },
-      eventEmitted: false,
-    };
-  }
-
-  // INSERT evidence record
-  opts.evidenceTable.set(evidenceKey, {
-    id: randomUUID(),
-    actionId,
-    evidenceId: evidenceId,
-    reasonCode: reason,
-    machineId: machine.id,
-  });
+  // ── 7. Transaction simulation: CAS first, THEN conditionally INSERT evidence ──
+  //
+  // ORDER MIRRORS PRODUCTION: CAS before INSERT prevents orphan evidence rows.
+  // - CAS count=1 (fired→needs_human): insert evidence
+  // - CAS count=0 + needs_human: insert evidence (audit trail; P2002 = idempotent)
+  // - CAS count=0 + terminal race: NO evidence insert (no orphan rows)
 
   // CAS: UPDATE WHERE status='fired' → 'needs_human'
   let casCount = 0;
@@ -197,6 +182,38 @@ function simulateReconcile(
     // action.status = 'needs_human' (already reconciled via different evidence)
     casCount = 0;
   }
+
+  const evidenceKey = `${actionId}:${evidenceId}`;
+
+  if (casCount === 1) {
+    // CAS succeeded — insert evidence
+    // P2002 simulation: same evidence already exists (concurrent same-evidence race)
+    if (opts.evidenceTable.has(evidenceKey)) {
+      return {
+        ok: true,
+        statusCode: 200,
+        body: { action_id: actionId, status: action.status, idempotent: true },
+        eventEmitted: false,
+      };
+    }
+    opts.evidenceTable.set(evidenceKey, {
+      id: randomUUID(), actionId, evidenceId, reasonCode: reason, machineId: machine.id,
+    });
+  } else if (action.status === 'needs_human') {
+    // Already reconciled (different path) — insert evidence for audit trail
+    if (opts.evidenceTable.has(evidenceKey)) {
+      return {
+        ok: true,
+        statusCode: 200,
+        body: { action_id: actionId, status: action.status, idempotent: true },
+        eventEmitted: false,
+      };
+    }
+    opts.evidenceTable.set(evidenceKey, {
+      id: randomUUID(), actionId, evidenceId, reasonCode: reason, machineId: machine.id,
+    });
+  }
+  // else: terminal race → no evidence insert
 
   // ── 8. Post-transaction ──
   if (casCount === 1) {
@@ -574,7 +591,10 @@ describe('reconcile — CAS race condition', () => {
     expect(result.code).toBe('RECONCILE_TERMINAL_CONFLICT');
   });
 
-  it('evidence IS recorded even if CAS race occurs (audit trail preserved)', () => {
+  it('evidence is NOT recorded when CAS race sends action to terminal (no orphan rows)', () => {
+    // Scenario: action was 'fired' when pre-check ran, but transitioned to terminal
+    // (e.g. 'canceled') before the CAS executed. Under the new CAS-first ordering,
+    // no evidence row should be inserted — prevents audit orphans for hard-terminal actions.
     const evidenceTable: EvidenceTable = new Map();
     simulateReconcile(makeReconcileInput(), {
       machine: makeMachine(),
@@ -583,7 +603,20 @@ describe('reconcile — CAS race condition', () => {
       evidenceTable,
       simulateCasRaceToTerminal: 'canceled',
     });
-    // Evidence was inserted before the CAS failed
+    // CAS failed (race to terminal) → evidence must NOT be inserted
+    expect(evidenceTable.size).toBe(0);
+  });
+
+  it('evidence IS recorded when action is already needs_human (audit trail preserved)', () => {
+    // Scenario: action already at needs_human (reconciled via different path).
+    // New evidence (different evidence_id) should still be inserted for full audit trail.
+    const evidenceTable: EvidenceTable = new Map();
+    simulateReconcile(makeReconcileInput({ body: { reason: 'drain_deadline_exceeded', evidence_id: 'ev-audit-2' } }), {
+      machine: makeMachine(),
+      action: makeAction({ status: 'needs_human' }),
+      tokenRow: makeTokenRow(),
+      evidenceTable,
+    });
     expect(evidenceTable.size).toBe(1);
   });
 });
