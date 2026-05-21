@@ -121,7 +121,7 @@ describe('PATCH /api/v1/cursors — security', () => {
     expect(mockQueryRaw).not.toHaveBeenCalled();
   });
 
-  it('user_id forced to machine.id — client cannot supply arbitrary user_id', async () => {
+  it('user_id forced to machine.id — client does not send user_id, server fills machine.id', async () => {
     mockResolveCursorScopeAccess.mockResolvedValue(SCOPE_ACCESS_OK);
     mockQueryRaw.mockResolvedValue([]);
     mockCursorFindUnique.mockResolvedValue(CURSOR_ROW);
@@ -136,15 +136,47 @@ describe('PATCH /api/v1/cursors — security', () => {
 
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
-    // Response user_id must be machine.id, not any client-supplied value
+    // Response user_id must be machine.id
     expect(body.user_id).toBe('machine-1');
 
     // Cursor lookup must use machine.id — proves the DB query is machine-scoped
     expect(mockCursorFindUnique).toHaveBeenCalledWith({
       where: {
         userId_deviceId_scopeType_scopeId_topicGroup: expect.objectContaining({
-          userId: 'machine-1',  // MUST be machine.id, not any client-supplied value
+          userId: 'machine-1',  // MUST be machine.id
           deviceId: 'dev-1',
+        }),
+      },
+    });
+  });
+
+  it('user_id forced to machine.id — attacker explicitly sending a different user_id is ignored', async () => {
+    // Belt-and-suspenders: even if a client sends user_id='attacker-id' in the body,
+    // the handler ignores it (body type does not include user_id) and uses machine.id.
+    // The handler code path is: `const userId = machine.id` ignoring body entirely.
+    mockResolveCursorScopeAccess.mockResolvedValue(SCOPE_ACCESS_OK);
+    mockQueryRaw.mockResolvedValue([]);
+    mockCursorFindUnique.mockResolvedValue(CURSOR_ROW);
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/cursors',
+      headers: { authorization: 'Bearer token', 'content-type': 'application/json' },
+      // Attacker tries to force a different user_id — handler should ignore it
+      payload: { user_id: 'attacker-id', device_id: 'dev-1', scope_type: 'workroom', scope_id: 'wroom-A', apply_seq: '10' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    // user_id in response must still be machine.id, not 'attacker-id'
+    expect(body.user_id).toBe('machine-1');
+    expect(body.user_id).not.toBe('attacker-id');
+
+    // DB lookup must use machine.id — 'attacker-id' must not appear in the query
+    expect(mockCursorFindUnique).toHaveBeenCalledWith({
+      where: {
+        userId_deviceId_scopeType_scopeId_topicGroup: expect.objectContaining({
+          userId: 'machine-1',
         }),
       },
     });
