@@ -233,50 +233,54 @@ model RedeemCodeUsage {
 // CONTROL PLANE — Server Control Plane (feat/server-control-plane)
 // ERD source: erd-api-contract.md v3 (4d5d06e6)
 // All new models use UUID PKs (distinct from legacy CUID models above)
+// @db.Uuid annotations align Prisma String fields with native PostgreSQL UUID
+// columns in the migration SQL, preventing `prisma migrate dev` from generating
+// spurious PK-type drift migrations (UUID→TEXT flip). Arrays (String[]) cannot
+// carry @db.Uuid and are left as-is.
 // ============================================================
 
 /// Top-level org/team boundary.
 model ControlOrg {
-  id          String   @id @default(uuid())
+  id          String   @id @default(uuid()) @db.Uuid
   name        String
   slug        String   @unique
-  ownerUserId String   @map("owner_user_id")
+  ownerUserId String   @map("owner_user_id") @db.Uuid
   billingPlan String   @default("free") @map("billing_plan")
   createdAt   DateTime @default(now()) @map("created_at")
 
-  credentials   ControlCredential[]
-  workrooms     ControlWorkroom[]
-  agents        ControlAgent[]
-  artifacts     ControlArtifact[]
-  machines      ControlMachine[]
+  credentials ControlCredential[]
+  workrooms   ControlWorkroom[]
+  agents      ControlAgent[]
+  artifacts   ControlArtifact[]
+  machines    ControlMachine[]
 
   @@map("control_orgs")
 }
 
 /// Credential/secret alias. Content lives in secure vault, never in DB.
 model ControlCredential {
-  id                  String    @id @default(uuid())
-  orgId               String    @map("org_id")
-  org                 ControlOrg @relation(fields: [orgId], references: [id])
-  alias               String
-  kind                String    // asc_api_key | vercel_token | ssh_key | cert | env_group | other
-  storageRef          String    @map("storage_ref")  // pointer to vault; never plain secret
-  scopeMode           String    @default("workroom") @map("scope_mode")
-                                // 'workroom': scope_workroom_ids ≥1 required
-                                // 'org':      org-wide (admin-only, enforced in API layer)
-  scopeWorkroomIds    String[]  @default([]) @map("scope_workroom_ids")
-                                // UUID strings; app-layer validates org membership
-  allowedActionKinds  String[]  @default([]) @map("allowed_action_kinds")
-                                // empty = no restriction
+  id                 String     @id @default(uuid()) @db.Uuid
+  orgId              String     @map("org_id") @db.Uuid
+  org                ControlOrg @relation(fields: [orgId], references: [id])
+  alias              String
+  kind               String // asc_api_key | vercel_token | ssh_key | cert | env_group | other
+  storageRef         String     @map("storage_ref") // pointer to vault; never plain secret
+  scopeMode          String     @default("workroom") @map("scope_mode")
+  // 'workroom': scope_workroom_ids ≥1 required
+  // 'org':      org-wide (admin-only, enforced in API layer)
+  scopeWorkroomIds   String[]   @default([]) @map("scope_workroom_ids")
+  // UUID strings; app-layer validates org membership
+  allowedActionKinds String[]   @default([]) @map("allowed_action_kinds")
+  // empty = no restriction
   // allowedRuntimeKinds: deferred to post-v1 (no server-authoritative runtime source yet)
-  revoked             Boolean   @default(false)
-  revokedAt           DateTime? @map("revoked_at")
-  expiresAt           DateTime? @map("expires_at")
-  createdBy           String    @map("created_by")
-  createdAt           DateTime  @default(now()) @map("created_at")
-  lastUsedAt          DateTime? @map("last_used_at")
+  revoked            Boolean    @default(false)
+  revokedAt          DateTime?  @map("revoked_at")
+  expiresAt          DateTime?  @map("expires_at")
+  createdBy          String     @map("created_by") @db.Uuid
+  createdAt          DateTime   @default(now()) @map("created_at")
+  lastUsedAt         DateTime?  @map("last_used_at")
 
-  accessLogs          ControlCredentialAccessLog[]
+  accessLogs ControlCredentialAccessLog[]
 
   @@unique([orgId, alias])
   @@map("control_credentials")
@@ -284,15 +288,15 @@ model ControlCredential {
 
 /// Audit log for credential resolution events. NEVER contains secret values.
 model ControlCredentialAccessLog {
-  id           String    @id @default(uuid())
-  credentialId String    @map("credential_id")
+  id           String            @id @default(uuid()) @db.Uuid
+  credentialId String            @map("credential_id") @db.Uuid
   credential   ControlCredential @relation(fields: [credentialId], references: [id])
-  actionId     String    @map("action_id")
-  action       ControlAction @relation(fields: [actionId], references: [id])
-  machineId    String    @map("machine_id")
+  actionId     String            @map("action_id") @db.Uuid
+  action       ControlAction     @relation(fields: [actionId], references: [id])
+  machineId    String            @map("machine_id") @db.Uuid
   success      Boolean
-  reasonCode   String?   @map("reason_code")  // controlled enum on failure; NEVER secret values
-  accessedAt   DateTime  @default(now()) @map("accessed_at")
+  reasonCode   String?           @map("reason_code") // controlled enum on failure; NEVER secret values
+  accessedAt   DateTime          @default(now()) @map("accessed_at")
 
   @@index([credentialId])
   @@index([actionId])
@@ -301,17 +305,17 @@ model ControlCredentialAccessLog {
 
 /// Machine registered by mio-agent daemon. machine_token stored in Keychain, not here.
 model ControlMachine {
-  id               String    @id @default(uuid()) // permanent machine UUID
-  orgId            String?   @map("org_id")
-  org              ControlOrg? @relation(fields: [orgId], references: [id])
-  displayName      String?   @map("display_name")
-  platform         String    @default("darwin") // darwin | linux
-  arch             String    @default("arm64")  // arm64 | x64
-  tokenHash        String    @map("token_hash") // SHA-256 of machine_token; actual token is in Keychain on Mac
-  tokenExpiresAt   DateTime  @map("token_expires_at")
-  boundAt          DateTime? @map("bound_at")   // when bind-org was called
-  lastSeenAt       DateTime? @map("last_seen_at")
-  createdAt        DateTime  @default(now()) @map("created_at")
+  id             String      @id @default(uuid()) @db.Uuid // permanent machine UUID
+  orgId          String?     @map("org_id") @db.Uuid
+  org            ControlOrg? @relation(fields: [orgId], references: [id])
+  displayName    String?     @map("display_name")
+  platform       String      @default("darwin") // darwin | linux
+  arch           String      @default("arm64") // arm64 | x64
+  tokenHash      String      @map("token_hash") // SHA-256 of machine_token; actual token is in Keychain on Mac
+  tokenExpiresAt DateTime    @map("token_expires_at")
+  boundAt        DateTime?   @map("bound_at") // when bind-org was called
+  lastSeenAt     DateTime?   @map("last_seen_at")
+  createdAt      DateTime    @default(now()) @map("created_at")
 
   sessions ControlSession[]
 
@@ -321,17 +325,17 @@ model ControlMachine {
 /// Workroom / collaborative channel for a project.
 /// current_goal_id is a plain UUID reference (nullable; breaks circular FK).
 model ControlWorkroom {
-  id            String    @id @default(uuid())
-  orgId         String    @map("org_id")
+  id            String     @id @default(uuid()) @db.Uuid
+  orgId         String     @map("org_id") @db.Uuid
   org           ControlOrg @relation(fields: [orgId], references: [id])
   name          String
   description   String?
-  visibility    String    @default("private") // public | private
+  visibility    String     @default("private") // public | private
   purpose       String?
-  currentGoalId String?   @map("current_goal_id") // nullable UUID; no Prisma relation (circular)
-  createdBy     String    @map("created_by")
-  createdAt     DateTime  @default(now()) @map("created_at")
-  archivedAt    DateTime? @map("archived_at")
+  currentGoalId String?    @map("current_goal_id") @db.Uuid // nullable UUID; no Prisma relation (circular)
+  createdBy     String     @map("created_by") @db.Uuid
+  createdAt     DateTime   @default(now()) @map("created_at")
+  archivedAt    DateTime?  @map("archived_at")
 
   goals             ControlGoal[]
   messages          ControlMessage[]
@@ -353,19 +357,19 @@ model ControlWorkroom {
 
 /// Goal for a workroom.
 model ControlGoal {
-  id                  String   @id @default(uuid())
-  workroomId          String   @map("workroom_id")
+  id                  String          @id @default(uuid()) @db.Uuid
+  workroomId          String          @map("workroom_id") @db.Uuid
   workroom            ControlWorkroom @relation(fields: [workroomId], references: [id])
-  sourceMessageId     String?  @map("source_message_id")
+  sourceMessageId     String?         @map("source_message_id") @db.Uuid
   title               String
-  description         String   @default("")
-  successCriteria     String   @default("") @map("success_criteria")
-  status              String   @default("active") // active | paused | in_review | achieved | canceled
-  ownerUserId         String   @map("owner_user_id")
-  currentTaskIds      String[] @map("current_task_ids")
-  acceptedArtifactIds String[] @map("accepted_artifact_ids")
-  createdAt           DateTime @default(now()) @map("created_at")
-  updatedAt           DateTime @updatedAt @map("updated_at")
+  description         String          @default("")
+  successCriteria     String          @default("") @map("success_criteria")
+  status              String          @default("active") // active | paused | in_review | achieved | canceled
+  ownerUserId         String          @map("owner_user_id") @db.Uuid
+  currentTaskIds      String[]        @map("current_task_ids")
+  acceptedArtifactIds String[]        @map("accepted_artifact_ids")
+  createdAt           DateTime        @default(now()) @map("created_at")
+  updatedAt           DateTime        @updatedAt @map("updated_at")
 
   workroomSummaries ControlWorkroomSummary[]
 
@@ -375,27 +379,27 @@ model ControlGoal {
 
 /// Agent (AI agent or human proxy) registered in the system.
 model ControlAgent {
-  id          String   @id @default(uuid())
-  orgId       String   @map("org_id")
-  org         ControlOrg @relation(fields: [orgId], references: [id])
-  name        String
-  displayName String   @map("display_name")
-  role        String   // ops | pm | engineer | designer | researcher | other
-  description String   @default("")
-  capabilities Json    @default("{}")
-  runtime     String?  // claude | codex | opencode | kimi | other
-  machineId   String?  @map("machine_id")
-  status      String   @default("offline") // online | offline | busy | drain
-  permissions Json     @default("{}")
-  createdAt   DateTime @default(now()) @map("created_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
+  id           String     @id @default(uuid()) @db.Uuid
+  orgId        String     @map("org_id") @db.Uuid
+  org          ControlOrg @relation(fields: [orgId], references: [id])
+  name         String
+  displayName  String     @map("display_name")
+  role         String // ops | pm | engineer | designer | researcher | other
+  description  String     @default("")
+  capabilities Json       @default("{}")
+  runtime      String? // claude | codex | opencode | kimi | other
+  machineId    String?    @map("machine_id")
+  status       String     @default("offline") // online | offline | busy | drain
+  permissions  Json       @default("{}")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
 
-  tasks              ControlTask[]       @relation("TaskOwner")
-  actedActions       ControlAction[]     @relation("ActionActor")
-  createdArtifacts   ControlArtifact[]   @relation("ArtifactCreator")
-  verificationLogs   ControlArtifactVerificationLog[]
-  handoffs           ControlHandoff[]    @relation("HandoffTarget")
-  roleInsights       ControlRoleInsight[]
+  tasks            ControlTask[]                    @relation("TaskOwner")
+  actedActions     ControlAction[]                  @relation("ActionActor")
+  createdArtifacts ControlArtifact[]                @relation("ArtifactCreator")
+  verificationLogs ControlArtifactVerificationLog[]
+  handoffs         ControlHandoff[]                 @relation("HandoffTarget")
+  roleInsights     ControlRoleInsight[]
 
   @@index([orgId, status])
   @@map("control_agents")
@@ -403,27 +407,27 @@ model ControlAgent {
 
 /// Message in a workroom timeline.
 model ControlMessage {
-  id               String    @id @default(uuid())
-  workroomId       String    @map("workroom_id")
-  workroom         ControlWorkroom @relation(fields: [workroomId], references: [id])
-  senderKind       String    @map("sender_kind") // user | agent | system
-  senderId         String    @map("sender_id")
-  content          String
-  mentions         String[]
-  hashRefs         Json      @default("{}") @map("hash_refs")
-  attachmentIds    String[]  @map("attachment_ids")
-  embeddedCardType String?   @map("embedded_card_type")
-  embeddedCardId   String?   @map("embedded_card_id")
-  threadReplyCount Int       @default(0) @map("thread_reply_count")
-  lastThreadReplyAt DateTime? @map("last_thread_reply_at")
-  createdAt        DateTime  @default(now()) @map("created_at")
+  id                String          @id @default(uuid()) @db.Uuid
+  workroomId        String          @map("workroom_id") @db.Uuid
+  workroom          ControlWorkroom @relation(fields: [workroomId], references: [id])
+  senderKind        String          @map("sender_kind") // user | agent | system
+  senderId          String          @map("sender_id") @db.Uuid
+  content           String
+  mentions          String[]
+  hashRefs          Json            @default("{}") @map("hash_refs")
+  attachmentIds     String[]        @map("attachment_ids")
+  embeddedCardType  String?         @map("embedded_card_type")
+  embeddedCardId    String?         @map("embedded_card_id") @db.Uuid
+  threadReplyCount  Int             @default(0) @map("thread_reply_count")
+  lastThreadReplyAt DateTime?       @map("last_thread_reply_at")
+  createdAt         DateTime        @default(now()) @map("created_at")
 
-  attachments     ControlAttachment[]
-  thread          ControlThread?
+  attachments       ControlAttachment[]
+  thread            ControlThread?
   workingAgreements ControlWorkingAgreement[] @relation("AgreementSourceMessage")
-  handoffs        ControlHandoff[]            @relation("HandoffSourceMessage")
-  roleInsights    ControlRoleInsight[]
-  routerDecisions ControlRouterDecision[]
+  handoffs          ControlHandoff[]          @relation("HandoffSourceMessage")
+  roleInsights      ControlRoleInsight[]
+  routerDecisions   ControlRouterDecision[]
 
   @@index([workroomId, createdAt(sort: Desc)])
   @@map("control_messages")
@@ -431,24 +435,24 @@ model ControlMessage {
 
 /// Attachment on a message or thread reply.
 model ControlAttachment {
-  id                  String   @id @default(uuid())
-  workroomId          String   @map("workroom_id")
-  messageId           String?  @map("message_id")
-  message             ControlMessage? @relation(fields: [messageId], references: [id])
-  threadReplyId       String?  @map("thread_reply_id")
-  uploaderKind        String   @map("uploader_kind") // user | agent | daemon
-  uploaderId          String   @map("uploader_id")
-  filename            String
-  mimeType            String   @map("mime_type")
-  sizeBytes           BigInt   @map("size_bytes")
-  previewMetadata     Json?    @map("preview_metadata")
-  sensitivity         String   @default("normal") // normal | secret
-  classificationSource String  @default("uploader") @map("classification_source")
-  policyResult        String   @default("allowed") @map("policy_result")
-  storageKey          String?  @map("storage_key")
-  credentialAliasRef  String?  @map("credential_alias_ref")
-  permissionScope     String   @default("members") @map("permission_scope")
-  createdAt           DateTime @default(now()) @map("created_at")
+  id                   String          @id @default(uuid()) @db.Uuid
+  workroomId           String          @map("workroom_id") @db.Uuid
+  messageId            String?         @map("message_id") @db.Uuid
+  message              ControlMessage? @relation(fields: [messageId], references: [id])
+  threadReplyId        String?         @map("thread_reply_id") @db.Uuid
+  uploaderKind         String          @map("uploader_kind") // user | agent | daemon
+  uploaderId           String          @map("uploader_id") @db.Uuid
+  filename             String
+  mimeType             String          @map("mime_type")
+  sizeBytes            BigInt          @map("size_bytes")
+  previewMetadata      Json?           @map("preview_metadata")
+  sensitivity          String          @default("normal") // normal | secret
+  classificationSource String          @default("uploader") @map("classification_source")
+  policyResult         String          @default("allowed") @map("policy_result")
+  storageKey           String?         @map("storage_key")
+  credentialAliasRef   String?         @map("credential_alias_ref")
+  permissionScope      String          @default("members") @map("permission_scope")
+  createdAt            DateTime        @default(now()) @map("created_at")
 
   @@index([workroomId])
   @@map("control_attachments")
@@ -456,12 +460,12 @@ model ControlAttachment {
 
 /// Thread attached to a workroom message.
 model ControlThread {
-  id             String    @id @default(uuid())
-  parentMessageId String   @unique @map("parent_message_id")
-  parentMessage  ControlMessage @relation(fields: [parentMessageId], references: [id])
-  workroomId     String    @map("workroom_id")
-  replyCount     Int       @default(0) @map("reply_count")
-  lastReplyAt    DateTime? @map("last_reply_at")
+  id              String         @id @default(uuid()) @db.Uuid
+  parentMessageId String         @unique @map("parent_message_id") @db.Uuid
+  parentMessage   ControlMessage @relation(fields: [parentMessageId], references: [id])
+  workroomId      String         @map("workroom_id") @db.Uuid
+  replyCount      Int            @default(0) @map("reply_count")
+  lastReplyAt     DateTime?      @map("last_reply_at")
 
   tasks ControlTask[]
 
@@ -471,21 +475,21 @@ model ControlThread {
 
 /// AI/runtime session (cmux | daemon | applescript).
 model ControlSession {
-  id             String    @id @default(uuid())
-  orgId          String    @map("org_id")
-  workroomId     String    @map("workroom_id")
+  id             String          @id @default(uuid()) @db.Uuid
+  orgId          String          @map("org_id") @db.Uuid
+  workroomId     String          @map("workroom_id") @db.Uuid
   workroom       ControlWorkroom @relation(fields: [workroomId], references: [id])
-  machineId      String?   @map("machine_id")
+  machineId      String?         @map("machine_id") @db.Uuid
   machine        ControlMachine? @relation(fields: [machineId], references: [id])
-  mode           String    // cmux | daemon | applescript
-  runtime        String    // claude | codex | opencode | kimi | other
-  displayName    String    @map("display_name")
-  status         String    @default("idle")
+  mode           String // cmux | daemon | applescript
+  runtime        String // claude | codex | opencode | kimi | other
+  displayName    String          @map("display_name")
+  status         String          @default("idle")
   // idle | running | waiting_for_user | blocked | completed | failed | disconnected | reconnecting
-  currentTaskId  String?   @map("current_task_id") // UI cache only; Task is source of truth
-  capabilities   Json      @default("{}")
-  lastActivityAt DateTime  @default(now()) @map("last_activity_at")
-  createdAt      DateTime  @default(now()) @map("created_at")
+  currentTaskId  String?         @map("current_task_id") @db.Uuid // UI cache only; Task is source of truth
+  capabilities   Json            @default("{}")
+  lastActivityAt DateTime        @default(now()) @map("last_activity_at")
+  createdAt      DateTime        @default(now()) @map("created_at")
 
   actions   ControlAction[]
   approvals ControlApproval[]
@@ -498,23 +502,23 @@ model ControlSession {
 
 /// Task — work item with atomic CAS claim.
 model ControlTask {
-  id              String    @id @default(uuid())
-  workroomId      String    @map("workroom_id")
-  workroom        ControlWorkroom @relation(fields: [workroomId], references: [id])
-  goalId          String?   @map("goal_id")
-  sourceMessageId String?   @map("source_message_id")
-  title           String
-  description     String    @default("")
-  ownerRole       String?   @map("owner_role")
-  ownerInstanceId String?   @map("owner_instance_id") // FK → ControlAgent; CAS claim
-  ownerAgent      ControlAgent? @relation("TaskOwner", fields: [ownerInstanceId], references: [id])
-  status          String    @default("todo")
+  id               String          @id @default(uuid()) @db.Uuid
+  workroomId       String          @map("workroom_id") @db.Uuid
+  workroom         ControlWorkroom @relation(fields: [workroomId], references: [id])
+  goalId           String?         @map("goal_id") @db.Uuid
+  sourceMessageId  String?         @map("source_message_id") @db.Uuid
+  title            String
+  description      String          @default("")
+  ownerRole        String?         @map("owner_role")
+  ownerInstanceId  String?         @map("owner_instance_id") @db.Uuid // FK → ControlAgent; CAS claim
+  ownerAgent       ControlAgent?   @relation("TaskOwner", fields: [ownerInstanceId], references: [id])
+  status           String          @default("todo")
   // todo | in_progress | waiting_approval | in_review | done | canceled
-  linkedSessionIds String[] @map("linked_session_ids")
-  threadId        String?   @map("thread_id")
-  thread          ControlThread? @relation(fields: [threadId], references: [id])
-  createdAt       DateTime  @default(now()) @map("created_at")
-  updatedAt       DateTime  @updatedAt @map("updated_at")
+  linkedSessionIds String[]        @map("linked_session_ids")
+  threadId         String?         @map("thread_id") @db.Uuid
+  thread           ControlThread?  @relation(fields: [threadId], references: [id])
+  createdAt        DateTime        @default(now()) @map("created_at")
+  updatedAt        DateTime        @updatedAt @map("updated_at")
 
   actions   ControlAction[]
   approvals ControlApproval[]
@@ -529,37 +533,37 @@ model ControlTask {
 /// Action proposed by a session. Requires approval when irreversible_no_abort.
 /// approval_id is a plain String (breaks circular FK with ControlApproval).
 model ControlAction {
-  id                    String    @id @default(uuid())
-  sessionId             String    @map("session_id")
-  session               ControlSession @relation(fields: [sessionId], references: [id])
-  workroomId            String    @map("workroom_id")
-  workroom              ControlWorkroom @relation(fields: [workroomId], references: [id])
-  taskId                String?   @map("task_id")
-  task                  ControlTask? @relation(fields: [taskId], references: [id])
-  actorAgentId          String    @map("actor_agent_id")
-  actorAgent            ControlAgent @relation("ActionActor", fields: [actorAgentId], references: [id])
-  kind                  String    // deploy | upload | db_migrate | env_change | ...
-  summary               String
-  reversibility         String    // reversible | irreversible_abortable | irreversible_no_abort
-  riskLevel             String    @map("risk_level") // low | medium | high | critical
-  status                String    @default("proposed")
+  id                      String          @id @default(uuid()) @db.Uuid
+  sessionId               String          @map("session_id") @db.Uuid
+  session                 ControlSession  @relation(fields: [sessionId], references: [id])
+  workroomId              String          @map("workroom_id") @db.Uuid
+  workroom                ControlWorkroom @relation(fields: [workroomId], references: [id])
+  taskId                  String?         @map("task_id") @db.Uuid
+  task                    ControlTask?    @relation(fields: [taskId], references: [id])
+  actorAgentId            String          @map("actor_agent_id") @db.Uuid
+  actorAgent              ControlAgent    @relation("ActionActor", fields: [actorAgentId], references: [id])
+  kind                    String // deploy | upload | db_migrate | env_change | ...
+  summary                 String
+  reversibility           String // reversible | irreversible_abortable | irreversible_no_abort
+  riskLevel               String          @map("risk_level") // low | medium | high | critical
+  status                  String          @default("proposed")
   // proposed | approved | rejected | canceled | fired | transmission_complete | reconciling | succeeded | failed | needs_human
-  transmissionCompletedAt DateTime? @map("transmission_completed_at")
-  externalConfirmedAt   DateTime? @map("external_confirmed_at")
-  requiresApproval      Boolean   @default(false) @map("requires_approval")
-  approvalId            String?   @map("approval_id")   // set at fire; no Prisma relation (circular)
-  approvedAtSnapshot    DateTime? @map("approved_at_snapshot")
-  credentialAliasRef    String?   @map("credential_alias_ref")
-  clientIdempotencyKey  String    @unique @map("client_idempotency_key")
-  createdAt             DateTime  @default(now()) @map("created_at")
-  firedAt               DateTime? @map("fired_at")
+  transmissionCompletedAt DateTime?       @map("transmission_completed_at")
+  externalConfirmedAt     DateTime?       @map("external_confirmed_at")
+  requiresApproval        Boolean         @default(false) @map("requires_approval")
+  approvalId              String?         @map("approval_id") @db.Uuid // set at fire; no Prisma relation (circular)
+  approvedAtSnapshot      DateTime?       @map("approved_at_snapshot")
+  credentialAliasRef      String?         @map("credential_alias_ref")
+  clientIdempotencyKey    String          @unique @map("client_idempotency_key")
+  createdAt               DateTime        @default(now()) @map("created_at")
+  firedAt                 DateTime?       @map("fired_at")
 
-  approvalConsumption   ControlActionApprovalConsumption?
-  actionToken           ControlActionToken?
-  reconciliations       ControlActionReconciliation[]
-  artifacts             ControlArtifact[]
-  approvals             ControlApproval[]
-  credentialAccessLogs  ControlCredentialAccessLog[]
+  approvalConsumption  ControlActionApprovalConsumption?
+  actionToken          ControlActionToken?
+  reconciliations      ControlActionReconciliation[]
+  artifacts            ControlArtifact[]
+  approvals            ControlApproval[]
+  credentialAccessLogs ControlCredentialAccessLog[]
 
   @@index([workroomId, status])
   @@index([sessionId])
@@ -569,25 +573,25 @@ model ControlAction {
 /// Approval — pre-action gate or artifact review.
 /// action_id and artifact_id are plain String NULLable to break circular FKs.
 model ControlApproval {
-  id              String    @id @default(uuid())
-  workroomId      String    @map("workroom_id")
+  id              String          @id @default(uuid()) @db.Uuid
+  workroomId      String          @map("workroom_id") @db.Uuid
   workroom        ControlWorkroom @relation(fields: [workroomId], references: [id])
-  sessionId       String?   @map("session_id")
+  sessionId       String?         @map("session_id") @db.Uuid
   session         ControlSession? @relation(fields: [sessionId], references: [id])
-  taskId          String?   @map("task_id")
-  task            ControlTask? @relation(fields: [taskId], references: [id])
-  actionId        String?   @map("action_id")
-  action          ControlAction? @relation(fields: [actionId], references: [id])
-  artifactId      String?   @map("artifact_id")   // nullable UUID; no Prisma relation (circular)
-  kind            String    // pre_action | disposal | artifact_review
-  status          String    @default("pending")
+  taskId          String?         @map("task_id") @db.Uuid
+  task            ControlTask?    @relation(fields: [taskId], references: [id])
+  actionId        String?         @map("action_id") @db.Uuid
+  action          ControlAction?  @relation(fields: [actionId], references: [id])
+  artifactId      String?         @map("artifact_id") @db.Uuid // nullable UUID; no Prisma relation (circular)
+  kind            String // pre_action | disposal | artifact_review
+  status          String          @default("pending")
   // pending | approved | consumed | rejected | snoozed | expired | ignored | rolled_forward | accepted | changes_requested | remediation_created
-  reviewerUserId  String?   @map("reviewer_user_id")
-  riskSummary     String    @default("") @map("risk_summary")
-  evidenceSummary String    @default("") @map("evidence_summary")
-  createdAt       DateTime  @default(now()) @map("created_at")
-  expiresAt       DateTime? @map("expires_at")
-  decidedAt       DateTime? @map("decided_at")
+  reviewerUserId  String?         @map("reviewer_user_id") @db.Uuid
+  riskSummary     String          @default("") @map("risk_summary")
+  evidenceSummary String          @default("") @map("evidence_summary")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  expiresAt       DateTime?       @map("expires_at")
+  decidedAt       DateTime?       @map("decided_at")
 
   approvalConsumption ControlActionApprovalConsumption?
 
@@ -602,13 +606,13 @@ model ControlApproval {
 /// Status semantics: action status is advanced to 'needs_human' on first reconcile;
 ///   subsequent reconcile calls only add evidence records (no state change, no duplicate events).
 model ControlActionReconciliation {
-  id          String        @id @default(uuid())
-  actionId    String        @map("action_id")
-  action      ControlAction @relation(fields: [actionId], references: [id])
-  evidenceId  String        @map("evidence_id")       // stable file-based ID from daemon
-  reasonCode  String        @map("reason_code")        // controlled enum: fire_response_lost_token_unrecoverable | drain_deadline_exceeded
-  machineId   String        @map("machine_id")         // bound at issuance (verified, not from body)
-  createdAt   DateTime      @default(now()) @map("created_at")
+  id         String        @id @default(uuid()) @db.Uuid
+  actionId   String        @map("action_id") @db.Uuid
+  action     ControlAction @relation(fields: [actionId], references: [id])
+  evidenceId String        @map("evidence_id") // stable file-based ID from daemon
+  reasonCode String        @map("reason_code") // controlled enum: fire_response_lost_token_unrecoverable | drain_deadline_exceeded
+  machineId  String        @map("machine_id") @db.Uuid // bound at issuance (verified, not from body)
+  createdAt  DateTime      @default(now()) @map("created_at")
 
   @@unique([actionId, evidenceId])
   @@map("control_action_reconciliations")
@@ -619,13 +623,13 @@ model ControlActionReconciliation {
 /// Consumed by subprocess via POST /actions/:id/token/consume (action_token bearer auth, NOT machine_token).
 /// UNIQUE(actionId) + UNIQUE(tokenHash) prevent double-issuance and hash collisions.
 model ControlActionToken {
-  id         String        @id @default(uuid())
-  actionId   String        @unique @map("action_id")
+  id         String        @id @default(uuid()) @db.Uuid
+  actionId   String        @unique @map("action_id") @db.Uuid
   action     ControlAction @relation(fields: [actionId], references: [id])
   tokenHash  String        @unique @map("token_hash")
-  sessionId  String        @map("session_id")
-  workroomId String        @map("workroom_id")
-  machineId  String        @map("machine_id")
+  sessionId  String        @map("session_id") @db.Uuid
+  workroomId String        @map("workroom_id") @db.Uuid
+  machineId  String        @map("machine_id") @db.Uuid
   issuedAt   DateTime      @default(now()) @map("issued_at")
   expiresAt  DateTime      @map("expires_at")
   consumedAt DateTime?     @map("consumed_at")
@@ -633,13 +637,33 @@ model ControlActionToken {
   @@map("control_action_tokens")
 }
 
+/// #32: Debug/dev-only READ-ONLY token for human UI (CodeLight) to call control-plane
+/// GET endpoints WITHOUT machine_token. Minted via root-only CLI/seed (HTTP issuance is
+/// disabled when NODE_ENV=production). Raw token returned once; only sha256 hash stored.
+/// scope fixed read_only; bound to a workroom; short TTL + revocable. Verify layer enforces
+/// GET allowlist + workroom-scope (reverse-lookup for /actions/:id) + uniform 403
+/// (anti-enumeration: never leak expired/revoked/out-of-scope/non-allowlist reason).
+model ControlDevToken {
+  id                 String    @id @default(uuid())
+  tokenHash          String    @unique @map("token_hash")
+  orgId              String    @map("org_id")
+  workroomId         String    @map("workroom_id")
+  scope              String    @default("read_only")
+  createdByMachineId String?   @map("created_by_machine_id")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  expiresAt          DateTime  @map("expires_at")
+  revokedAt          DateTime? @map("revoked_at")
+
+  @@map("control_dev_tokens")
+}
+
 /// Atomic fire-gate: one approval → one irreversible_no_abort action. DB-level enforcement.
 /// Both columns have UNIQUE constraints. Fire transaction INSERTs here atomically.
 model ControlActionApprovalConsumption {
-  id         String          @id @default(uuid())
-  approvalId String          @unique @map("approval_id")
+  id         String          @id @default(uuid()) @db.Uuid
+  approvalId String          @unique @map("approval_id") @db.Uuid
   approval   ControlApproval @relation(fields: [approvalId], references: [id])
-  actionId   String          @unique @map("action_id")
+  actionId   String          @unique @map("action_id") @db.Uuid
   action     ControlAction   @relation(fields: [actionId], references: [id])
   consumedAt DateTime        @default(now()) @map("consumed_at")
 
@@ -648,38 +672,38 @@ model ControlActionApprovalConsumption {
 
 /// Artifact — evidence of work progress. Three-state milestone.
 model ControlArtifact {
-  id                   String    @id @default(uuid())
-  orgId                String    @map("org_id")
-  org                  ControlOrg @relation(fields: [orgId], references: [id])
-  workroomId           String    @map("workroom_id")
+  id                   String          @id @default(uuid()) @db.Uuid
+  orgId                String          @map("org_id") @db.Uuid
+  org                  ControlOrg      @relation(fields: [orgId], references: [id])
+  workroomId           String          @map("workroom_id") @db.Uuid
   workroom             ControlWorkroom @relation(fields: [workroomId], references: [id])
-  taskId               String?   @map("task_id")
-  task                 ControlTask? @relation(fields: [taskId], references: [id])
-  sessionId            String?   @map("session_id")
+  taskId               String?         @map("task_id") @db.Uuid
+  task                 ControlTask?    @relation(fields: [taskId], references: [id])
+  sessionId            String?         @map("session_id") @db.Uuid
   session              ControlSession? @relation(fields: [sessionId], references: [id])
-  actionId             String?   @map("action_id")
-  action               ControlAction? @relation(fields: [actionId], references: [id])
-  scopeType            String    @map("scope_type") // org | workroom | task | session | action
+  actionId             String?         @map("action_id") @db.Uuid
+  action               ControlAction?  @relation(fields: [actionId], references: [id])
+  scopeType            String          @map("scope_type") // org | workroom | task | session | action
   type                 String
   // prd | design | code_path | build | deployment_url | ipa_upload | test_report | runbook | log | screenshot
   title                String
-  summary              String    @default("")
+  summary              String          @default("")
   url                  String?
-  localPath            String?   @map("local_path")
+  localPath            String?         @map("local_path")
   hash                 String?
-  externalId           String?   @map("external_id")
-  status               String    @default("created")
+  externalId           String?         @map("external_id")
+  status               String          @default("created")
   // created | verified | external_confirmed | accepted | superseded | rejected | expired | disposed | ignored | rolled_forward
-  verifiedAt           DateTime? @map("verified_at")         // milestone 1: agent verified
-  externalConfirmedAt  DateTime? @map("external_confirmed_at") // milestone 2: external system confirmed
-  humanAckedAt         DateTime? @map("human_acked_at")       // milestone 3: human accepted
-  disposalStatus       String    @default("none") @map("disposal_status")
+  verifiedAt           DateTime?       @map("verified_at") // milestone 1: agent verified
+  externalConfirmedAt  DateTime?       @map("external_confirmed_at") // milestone 2: external system confirmed
+  humanAckedAt         DateTime?       @map("human_acked_at") // milestone 3: human accepted
+  disposalStatus       String          @default("none") @map("disposal_status")
   // none | expired | ignored | rolled_forward | remediation_created
-  currentPointerKey    String?   @map("current_pointer_key")
-  createdByAgentId     String?   @map("created_by_agent_id")
-  createdByAgent       ControlAgent? @relation("ArtifactCreator", fields: [createdByAgentId], references: [id])
-  clientIdempotencyKey String    @unique @map("client_idempotency_key")
-  createdAt            DateTime  @default(now()) @map("created_at")
+  currentPointerKey    String?         @map("current_pointer_key")
+  createdByAgentId     String?         @map("created_by_agent_id") @db.Uuid
+  createdByAgent       ControlAgent?   @relation("ArtifactCreator", fields: [createdByAgentId], references: [id])
+  clientIdempotencyKey String          @unique @map("client_idempotency_key")
+  createdAt            DateTime        @default(now()) @map("created_at")
 
   verificationLogs ControlArtifactVerificationLog[]
   pointers         ControlArtifactPointer[]
@@ -691,13 +715,13 @@ model ControlArtifact {
 
 /// Artifact pointer — "which artifact is current?" per semantic key per workroom.
 model ControlArtifactPointer {
-  id         String          @id @default(uuid())
-  workroomId String          @map("workroom_id")
+  id         String          @id @default(uuid()) @db.Uuid
+  workroomId String          @map("workroom_id") @db.Uuid
   workroom   ControlWorkroom @relation(fields: [workroomId], references: [id])
-  key        String          // e.g. current_prd, current_deployment
-  artifactId String          @map("artifact_id")
+  key        String // e.g. current_prd, current_deployment
+  artifactId String          @map("artifact_id") @db.Uuid
   artifact   ControlArtifact @relation(fields: [artifactId], references: [id])
-  updatedBy  String          @map("updated_by")
+  updatedBy  String          @map("updated_by") @db.Uuid
   updatedAt  DateTime        @updatedAt @map("updated_at")
 
   @@unique([workroomId, key])
@@ -706,14 +730,14 @@ model ControlArtifactPointer {
 
 /// Artifact verification log — process evidence, not just a single status field.
 model ControlArtifactVerificationLog {
-  id                   String          @id @default(uuid())
-  artifactId           String          @map("artifact_id")
+  id                   String          @id @default(uuid()) @db.Uuid
+  artifactId           String          @map("artifact_id") @db.Uuid
   artifact             ControlArtifact @relation(fields: [artifactId], references: [id])
-  verifierAgentId      String          @map("verifier_agent_id")
+  verifierAgentId      String          @map("verifier_agent_id") @db.Uuid
   verifierAgent        ControlAgent    @relation(fields: [verifierAgentId], references: [id])
   method               String
   // curl | hash_compare | app_store_check | browser_check | codesign_verify | ipa_inspect | manual
-  status               String          // passed | failed | inconclusive
+  status               String // passed | failed | inconclusive
   evidence             Json            @default("{}")
   error                String?
   clientIdempotencyKey String          @unique @map("client_idempotency_key")
@@ -725,13 +749,13 @@ model ControlArtifactVerificationLog {
 
 /// Working agreement — persistent team-level rule discovered through collaboration.
 model ControlWorkingAgreement {
-  id                   String          @id @default(uuid())
-  workroomId           String          @map("workroom_id")
+  id                   String          @id @default(uuid()) @db.Uuid
+  workroomId           String          @map("workroom_id") @db.Uuid
   workroom             ControlWorkroom @relation(fields: [workroomId], references: [id])
-  participants         String[]        // user/agent ids
+  participants         String[] // user/agent ids
   summary              String
   rules                Json            @default("[]")
-  createdFromMessageId String?         @map("created_from_message_id")
+  createdFromMessageId String?         @map("created_from_message_id") @db.Uuid
   createdFromMessage   ControlMessage? @relation("AgreementSourceMessage", fields: [createdFromMessageId], references: [id])
   createdAt            DateTime        @default(now()) @map("created_at")
   updatedAt            DateTime        @updatedAt @map("updated_at")
@@ -742,22 +766,22 @@ model ControlWorkingAgreement {
 
 /// Handoff — structured work transfer between roles.
 model ControlHandoff {
-  id                   String          @id @default(uuid())
-  workroomId           String          @map("workroom_id")
+  id                   String          @id @default(uuid()) @db.Uuid
+  workroomId           String          @map("workroom_id") @db.Uuid
   workroom             ControlWorkroom @relation(fields: [workroomId], references: [id])
   fromActorKind        String          @map("from_actor_kind") // user | agent
-  fromActorId          String          @map("from_actor_id")
+  fromActorId          String          @map("from_actor_id") @db.Uuid
   toRole               String          @map("to_role")
-  toInstanceId         String?         @map("to_instance_id")
+  toInstanceId         String?         @map("to_instance_id") @db.Uuid
   toAgent              ControlAgent?   @relation("HandoffTarget", fields: [toInstanceId], references: [id])
-  taskId               String?         @map("task_id")
+  taskId               String?         @map("task_id") @db.Uuid
   task                 ControlTask?    @relation(fields: [taskId], references: [id])
   inputArtifactIds     String[]        @map("input_artifact_ids")
   expectedOutput       String          @default("") @map("expected_output")
   acceptanceCriteria   String          @default("") @map("acceptance_criteria")
   status               String          @default("proposed")
   // proposed | accepted | declined | completed | canceled
-  createdFromMessageId String?         @map("created_from_message_id")
+  createdFromMessageId String?         @map("created_from_message_id") @db.Uuid
   createdFromMessage   ControlMessage? @relation("HandoffSourceMessage", fields: [createdFromMessageId], references: [id])
   createdAt            DateTime        @default(now()) @map("created_at")
   updatedAt            DateTime        @updatedAt @map("updated_at")
@@ -768,10 +792,10 @@ model ControlHandoff {
 
 /// Workroom summary — LLM-generated context digest for mobile first-load.
 model ControlWorkroomSummary {
-  id                    String          @id @default(uuid())
-  workroomId            String          @map("workroom_id")
+  id                    String          @id @default(uuid()) @db.Uuid
+  workroomId            String          @map("workroom_id") @db.Uuid
   workroom              ControlWorkroom @relation(fields: [workroomId], references: [id])
-  goalId                String?         @map("goal_id")
+  goalId                String?         @map("goal_id") @db.Uuid
   goal                  ControlGoal?    @relation(fields: [goalId], references: [id])
   headline              String
   currentPhase          String          @default("") @map("current_phase")
@@ -788,15 +812,15 @@ model ControlWorkroomSummary {
 
 /// Role insight — proactive input from an agent watching the conversation.
 model ControlRoleInsight {
-  id                String          @id @default(uuid())
-  workroomId        String          @map("workroom_id")
+  id                String          @id @default(uuid()) @db.Uuid
+  workroomId        String          @map("workroom_id") @db.Uuid
   workroom          ControlWorkroom @relation(fields: [workroomId], references: [id])
-  agentId           String          @map("agent_id")
+  agentId           String          @map("agent_id") @db.Uuid
   agent             ControlAgent    @relation(fields: [agentId], references: [id])
-  relatedMessageId  String?         @map("related_message_id")
+  relatedMessageId  String?         @map("related_message_id") @db.Uuid
   relatedMessage    ControlMessage? @relation(fields: [relatedMessageId], references: [id])
   relatedObjectType String?         @map("related_object_type")
-  relatedObjectId   String?         @map("related_object_id")
+  relatedObjectId   String?         @map("related_object_id") @db.Uuid
   reason            String
   content           String
   suggestedAction   Json?           @map("suggested_action")
@@ -808,21 +832,21 @@ model ControlRoleInsight {
 
 /// Router decision log — why a message was routed to which agent(s).
 model ControlRouterDecision {
-  id                      String          @id @default(uuid())
-  workroomId              String          @map("workroom_id")
-  workroom                ControlWorkroom @relation(fields: [workroomId], references: [id])
-  triggerMessageId        String?         @map("trigger_message_id")
-  triggerMessage          ControlMessage? @relation(fields: [triggerMessageId], references: [id])
-  targetAgentIds          String[]        @map("target_agent_ids")
-  reason                  String
-  confidence              Float
-  triggerType             String          @map("trigger_type")
+  id                        String          @id @default(uuid()) @db.Uuid
+  workroomId                String          @map("workroom_id") @db.Uuid
+  workroom                  ControlWorkroom @relation(fields: [workroomId], references: [id])
+  triggerMessageId          String?         @map("trigger_message_id") @db.Uuid
+  triggerMessage            ControlMessage? @relation(fields: [triggerMessageId], references: [id])
+  targetAgentIds            String[]        @map("target_agent_ids")
+  reason                    String
+  confidence                Float
+  triggerType               String          @map("trigger_type")
   // explicit_mention | role_capability | artifact_type | task_owner | missing_perspective
-  relatedObjectIds        Json            @default("{}") @map("related_object_ids")
-  contextSelectionLog     Json            @default("{}") @map("context_selection_log")
-  requiresHumanConfirmation Boolean       @default(false) @map("requires_human_confirmation")
-  createTask              Boolean         @default(false) @map("create_task")
-  createdAt               DateTime        @default(now()) @map("created_at")
+  relatedObjectIds          Json            @default("{}") @map("related_object_ids")
+  contextSelectionLog       Json            @default("{}") @map("context_selection_log")
+  requiresHumanConfirmation Boolean         @default(false) @map("requires_human_confirmation")
+  createTask                Boolean         @default(false) @map("create_task")
+  createdAt                 DateTime        @default(now()) @map("created_at")
 
   @@index([workroomId, createdAt(sort: Desc)])
   @@map("control_router_decisions")
@@ -831,12 +855,12 @@ model ControlRouterDecision {
 /// Event log — persisted before WS fanout. Monotonic seq per workroom.
 /// Retention must cover max_catch_up_events (500). Pruning checks MIN(apply_seq) across ClientCursors.
 model ControlEventLog {
-  id          String          @id @default(uuid())
-  workroomId  String          @map("workroom_id")
+  id          String          @id @default(uuid()) @db.Uuid
+  workroomId  String          @map("workroom_id") @db.Uuid
   workroom    ControlWorkroom @relation(fields: [workroomId], references: [id])
-  seq         BigInt          // monotonically increasing per workroom
-  eventId     String          @unique @map("event_id") // stable dedup key
-  topic       String          // event topic string
+  seq         BigInt // monotonically increasing per workroom
+  eventId     String          @unique @map("event_id") @db.Uuid // stable dedup key
+  topic       String // event topic string
   payloadJson Json            @map("payload_json")
   createdAt   DateTime        @default(now()) @map("created_at")
 
@@ -850,11 +874,11 @@ model ControlEventLog {
 /// apply_seq: highest seq received and applied.
 /// read_seq: highest seq human has visibly read (drives unread badge).
 model ControlClientCursor {
-  id         String   @id @default(uuid())
-  userId     String   @map("user_id")
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
   deviceId   String   @map("device_id")
   scopeType  String   @map("scope_type") // workroom | thread | session
-  scopeId    String   @map("scope_id")
+  scopeId    String   @map("scope_id") @db.Uuid
   topicGroup String   @default("all") @map("topic_group") // messages | tasks | events | all
   applySeq   BigInt   @default(0) @map("apply_seq")
   readSeq    BigInt   @default(0) @map("read_seq")
