@@ -87,3 +87,15 @@ export const SUMMARY_TERMINAL_STATUSES = new Set([
   'succeeded',          // execution confirmed successful
   'transmission_complete', // action completed; external system confirmed
 ]);
+
+/**
+ * Summary executing statuses — actions actively running that drive the "executing" phase.
+ *
+ * Note: transmission_complete is intentionally EXCLUDED here.
+ * It is in SUMMARY_TERMINAL_STATUSES → filtered out of activeActions before summaryLogic
+ * sees them → any transmission_complete branch in summaryLogic would be dead code.
+ *
+ * Used by:
+ *   - summaryLogic.ts (deriveCurrentPhase, deriveHeadline): executing phase detection.
+ */
+export const SUMMARY_EXECUTING_STATUSES = ['fired', 'reconciling'] as const;

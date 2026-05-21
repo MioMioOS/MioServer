@@ -10,6 +10,8 @@
  *    External confirmation alone (externalConfirmedAt only) does NOT mean done.
  */
 
+import { SUMMARY_EXECUTING_STATUSES } from '../actionStatusSets.js';
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface ArtifactMilestones {
@@ -173,8 +175,7 @@ export function deriveCurrentPhase(inputs: Pick<SummaryInputs, 'taskCounts' | 'a
   if (activeArtifacts.some(a => deriveArtifactCompletionState(a) === 'pending_external')) {
     return 'waiting_external';
   }
-  const EXECUTING_STATUSES = ['fired', 'transmission_complete', 'reconciling'];
-  if (activeActions.some(a => EXECUTING_STATUSES.includes(a.status))) {
+  if (activeActions.some(a => (SUMMARY_EXECUTING_STATUSES as readonly string[]).includes(a.status))) {
     return 'executing';
   }
   if (taskCounts.in_progress > 0 || taskCounts.in_review > 0) {
@@ -252,7 +253,7 @@ export function deriveHeadline(inputs: SummaryInputs, phase: string): string {
   }
 
   if (phase === 'executing') {
-    const action = activeActions.find(a => ['fired', 'transmission_complete', 'reconciling'].includes(a.status));
+    const action = activeActions.find(a => (SUMMARY_EXECUTING_STATUSES as readonly string[]).includes(a.status));
     return `执行中：${action?.summary ?? '操作进行中'}${taskContext ? `，${taskContext}` : ''}`;
   }
 
