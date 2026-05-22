@@ -1,6 +1,19 @@
 # Operator Session Request Signing — Key Material Decision (#87)
 
-Status: decision note (API/auth lane, owner @运维). Unblocks the #87 signing-verifier implementation.
+> ## ⏸️ NOT CURRENT MAINLINE — FUTURE HARDENING ONLY (2026-05-22, Laurent + PM)
+> **V1 operator write auth = a SIMPLE writable session token** (bearer; hash-only stored;
+> workroom/command-scoped; short TTL; revocable; HTTPS; uniform 401/403; `dev_ctl_` stays read-only
+> hard-reject). NO request signing, NO nonce, NO Ed25519. Rationale: the product is single-user
+> controlling their OWN agents on their OWN device (phone → server → own daemon) — TLS + a scoped
+> bearer token covers that threat model; Ed25519+nonce is for an UNTRUSTED/MULTI-OPERATOR/public-API
+> scenario we don't have.
+>
+> This Ed25519 design is retained ONLY as a **future hardening** option, to be revisited if/when a
+> multi-operator or untrusted-client scenario appears. It is NOT to be implemented now.
+> The live V1 token is the existing `ControlOperatorSession` (#86) used as a plain bearer; the
+> `signing_public_key` column + nonce table described below are NOT added in V1.
+
+Status: ~~decision note~~ **FUTURE HARDENING — not current mainline (see banner).** (API/auth lane, owner @运维.)
 Pairs with: `CodeLight/docs/productization/operator-session-issuance-decision-v1.md` (#85),
 `docs/operator-write-api-runway.md` (#91). Hard prerequisite flagged in the #80/#85 reviews.
 
