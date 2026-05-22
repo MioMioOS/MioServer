@@ -83,6 +83,11 @@ beforeAll(async () => {
   await db.controlWorkroom.create({
     data: { id: WORKROOM_ID, orgId: ORG_ID, name: 'OpCmd Workroom', createdBy: randomUUID() },
   });
+  // WORKROOM_ID_OTHER must also exist to satisfy the FK on control_actions.workroom_id.
+  // Used by test 6 (cross-workroom rejection) to seed an action in a different workroom.
+  await db.controlWorkroom.create({
+    data: { id: WORKROOM_ID_OTHER, orgId: ORG_ID, name: 'OpCmd Workroom Other', createdBy: randomUUID() },
+  });
   await db.controlSession.create({
     data: {
       id: SESSION_ID,
@@ -117,7 +122,7 @@ afterAll(async () => {
   await db.controlAction.deleteMany({ where: { workroomId: { in: [WORKROOM_ID, WORKROOM_ID_OTHER] } } });
   await db.controlSession.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlOperatorSession.deleteMany({ where: { workroomId: WORKROOM_ID } });
-  await db.controlWorkroom.deleteMany({ where: { id: WORKROOM_ID } });
+  await db.controlWorkroom.deleteMany({ where: { id: { in: [WORKROOM_ID, WORKROOM_ID_OTHER] } } });
   await db.controlAgent.deleteMany({ where: { id: AGENT_ID } });
   await db.controlMachine.deleteMany({ where: { id: MACHINE_ID } });
   await db.controlOrg.deleteMany({ where: { id: ORG_ID } });
