@@ -16,7 +16,27 @@
 export type CredentialStoreErrorReason =
   | 'store_unavailable'        // transient: vault/file unreachable; action → needs_human
   | 'credential_not_found'     // permanent config error; action → needs_human
-  | 'credential_config_invalid'; // storage_ref broken/malformed; action → needs_human
+  | 'credential_config_invalid' // storage_ref broken/malformed; action → needs_human
+  | 'credential_denied';        // #72/#69: adapter authZ/policy denial (IAM/policy refused) →
+                                // action → `failed + credential_denied`, NOT needs_human (5D decision).
+                                // A denial is an authorization failure, not a recoverable infra blip.
+
+/**
+ * #72: error reasons that mean "infrastructure could not resolve" → the action should go to
+ * `needs_human` (recoverable / config attention). DISTINCT from `credential_denied`, which is
+ * an authorization denial → `failed + credential_denied`. Callers (consume route) must branch
+ * on this set so a denial is never misclassified as a recoverable infra error.
+ */
+export const NEEDS_HUMAN_RESOLVE_REASONS: ReadonlySet<CredentialStoreErrorReason> = new Set([
+  'store_unavailable',
+  'credential_not_found',
+  'credential_config_invalid',
+]);
+
+/** True iff the reason is an authorization denial (→ failed + credential_denied), not infra. */
+export function isCredentialDenial(reason: CredentialStoreErrorReason): boolean {
+  return reason === 'credential_denied';
+}
 
 export class CredentialStoreError extends Error {
   constructor(
@@ -183,5 +203,44 @@ function assertNotProduction(storeName: string): void {
       `Use a production-grade CredentialStore adapter (KMS/Vault/Keychain). ` +
       `Refusing to start.`,
     );
+  }
+}
+
+// ── #72: production provider allow-list (positive fail-closed factory guard) ──────
+//
+// The complement to assertNotProduction: in production, ONLY a vetted production provider
+// may back the CredentialStore. Anything else (fixture/aesfile/unknown) → fail closed at
+// startup. This prevents prod from silently running with a dev/test store, and prevents a
+// future provider being enabled in prod before it has been security-reviewed.
+
+/** Provider identifiers allowed to back the CredentialStore in production. */
+export const PROD_CREDENTIAL_PROVIDERS: ReadonlySet<string> = new Set([
+  'ssm',   // cloud Secrets Manager (Tencent SSM) — MVP target (#69/#72)
+  'kms',   // KMS-envelope adapter (vendor-neutral fallback)
+  'vault', // HashiCorp Vault (deferred)
+]);
+
+/** Dev/test-only providers — forbidden in production. */
+const NON_PROD_CREDENTIAL_PROVIDERS: ReadonlySet<string> = new Set(['fixture', 'aesfile']);
+
+/**
+ * Fail-closed factory guard. Throws if, in production, `provider` is not a vetted production
+ * provider (or is a known dev/test provider, or is unknown/empty). Non-production allows any
+ * known provider. Call this in the CredentialStore factory before constructing the adapter.
+ */
+export function assertProviderAllowedInEnv(provider: string | undefined, env = process.env.NODE_ENV): void {
+  const p = (provider ?? '').trim();
+  if (env === 'production') {
+    if (!PROD_CREDENTIAL_PROVIDERS.has(p)) {
+      throw new Error(
+        `[SECURITY] CredentialStore provider '${p || '(unset)'}' is not allowed in production. ` +
+        `Allowed: ${[...PROD_CREDENTIAL_PROVIDERS].join(', ')}. Refusing to start (fail-closed).`,
+      );
+    }
+    return;
+  }
+  // Non-production: allow any known provider (prod or dev/test).
+  if (!PROD_CREDENTIAL_PROVIDERS.has(p) && !NON_PROD_CREDENTIAL_PROVIDERS.has(p)) {
+    throw new Error(`Unknown CredentialStore provider '${p || '(unset)'}'.`);
   }
 }
