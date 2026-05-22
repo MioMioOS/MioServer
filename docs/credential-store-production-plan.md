@@ -64,8 +64,10 @@ So a production adapter only changes **where MioServer fetches plaintext**; it m
 ## 5. No-leak + audit requirements (per adapter)
 
 - **No-leak**: `resolve()` returns plaintext only in memory; never log the value; map ALL upstream errors (KMS/Vault/SSM) to the 3 controlled `CredentialStoreError` reasons — never surface the vendor error string (it can contain ref/policy detail). `storage_ref`, credential alias, token, file path must never appear in responses/logs (already enforced; CodeLight redactor + #59 cover the read surface).
-- **Audit**: emit an audit event on each resolve — `{ credentialId, orgId, storageRef (opaque), outcome, timestamp, adapter }` — **without the value**. Prefer the adapter's own audit (KMS/Vault/SSM access logs) PLUS a MioServer-side control-plane audit row so resolves are traceable to action/org even if the cloud audit is separate.
-- **Failure → needs_human**: all 3 error reasons drive the action to `needs_human` (already wired), never a silent success (consistent with the exit-0-not-trust principle).
+- **Audit**: emit an audit event on each resolve — `{ credentialId, orgId, storageRef (opaque), outcome, timestamp, adapter }` — **without the value**. The `storageRef` (even opaque) belongs **only in the restricted resolve-audit table / internal audit fields — never in EventLog, UI, or general application logs** (consistent with "storage_ref must not appear in responses/logs"). Prefer the adapter's own audit (KMS/Vault/SSM access logs) PLUS this MioServer-side audit row so resolves are traceable to action/org even if the cloud audit is separate.
+- **Failure mapping** (do NOT collapse two distinct outcomes):
+  - **Adapter resolve errors** (infra-level: `store_unavailable` / `credential_not_found` / `credential_config_invalid` — store unreachable, ref missing, ref malformed) → action → `needs_human` (already wired), never a silent success (exit-0-not-trust).
+  - **Credential auth/policy denial** (the credential exists but the resolve is *denied* by the adapter's policy/IAM) → keep the 5D decision: action → **`failed + credential_denied`**, NOT `needs_human`. A denial is an authorization failure, not a recoverable infra blip; the adapter must surface denial as a distinct controlled signal so the route maps it to `credential_denied`, not `store_unavailable`.
 
 ---
 
