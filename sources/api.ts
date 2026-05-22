@@ -28,6 +28,7 @@ import { operatorWriteRoutes } from '@/control/operatorSessions/operatorWriteRou
 import { operatorPairingRoutes } from '@/control/operatorSessions/operatorPairingRoutes';
 import { connectionRoutes } from '@/control/connections/connectionRoutes';
 import { explanationRoutes } from '@/control/llm/explanationRoutes';
+import { registerEmptyJsonBodyParser } from '@/jsonBodyParser';
 import { provisionCredentialStore } from '@/control/credentials/provisionCredentialStore';
 import { config } from '@/config';
 
@@ -38,6 +39,9 @@ export async function startApi() {
 
     app.setValidatorCompiler(validatorCompiler);
     app.setSerializerCompiler(serializerCompiler);
+
+    // #156: accept an empty application/json body as {} (clients needn't send a literal `{}`).
+    registerEmptyJsonBodyParser(app);
 
     await app.register(cors, {
         origin: '*',
