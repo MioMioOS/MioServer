@@ -57,6 +57,7 @@ CONTROL_PLANE_MIGRATIONS=(
   "prisma/migrations/20260522110000_add_control_operator_sessions/migration.sql"
   "prisma/migrations/20260522120000_add_operator_audit_log/migration.sql"
   "prisma/migrations/20260522130000_add_reconciliation_output_log/migration.sql"
+  "prisma/migrations/20260523001000_add_control_operator_pairings/migration.sql"
 )
 for migration in "${CONTROL_PLANE_MIGRATIONS[@]}"; do
   echo "==> Applying ${migration}"
