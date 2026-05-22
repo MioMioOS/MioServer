@@ -257,4 +257,31 @@ describe('reconcile endpoint — runtime_warnings persistence (#59)', () => {
         const res = await reconcileWithWarnings(actionId, `ev-many-${randomUUID()}`, many);
         expect(res.statusCode).toBe(400);
     });
+
+    it('GET /actions/:id surfaces persisted runtime_warnings (#59 展示)', async () => {
+        const actionId = await seedActionWithToken('fired');
+        const warnings = [
+            { code: 'CLAUDE_DELEGATION_CONFIG_NOT_PROVISIONED', severity: 'needs_human', message: 'user CLAUDE.md may be read' },
+        ];
+        await reconcileWithWarnings(actionId, `ev-surf-${randomUUID()}`, warnings);
+
+        const get = await app.inject({
+            method: 'GET',
+            url: `/api/v1/actions/${actionId}`,
+            headers: { authorization: `Bearer ${MACHINE_RAW_TOKEN}` },
+        });
+        expect(get.statusCode).toBe(200);
+        expect(JSON.parse(get.body).runtime_warnings).toEqual(warnings);
+    });
+
+    it('GET /actions/:id with no reconcile warnings -> runtime_warnings is empty array', async () => {
+        const actionId = await seedActionWithToken('fired');
+        const get = await app.inject({
+            method: 'GET',
+            url: `/api/v1/actions/${actionId}`,
+            headers: { authorization: `Bearer ${MACHINE_RAW_TOKEN}` },
+        });
+        expect(get.statusCode).toBe(200);
+        expect(JSON.parse(get.body).runtime_warnings).toEqual([]);
+    });
 });

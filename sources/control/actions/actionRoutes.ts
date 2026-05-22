@@ -248,7 +248,14 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
     const { id } = request.params as { id: string };
     const action = await db.controlAction.findUnique({
       where: { id },
-      include: { approvalConsumption: true, workroom: { select: { orgId: true } } },
+      include: {
+        approvalConsumption: true,
+        workroom: { select: { orgId: true } },
+        // #59: surface runtime warnings (e.g. CLAUDE_DELEGATION_CONFIG_NOT_PROVISIONED)
+        // recorded on this action's reconciliation rows, so the human UI sees the
+        // needs_human/known-gap context instead of it being silently buried.
+        reconciliations: { select: { runtimeWarnings: true }, orderBy: { createdAt: 'asc' } },
+      },
     });
     if (!action) {
       return reply.code(404).send({ error: { code: 'ACTION_NOT_FOUND', message: 'Action not found' } });
@@ -280,6 +287,10 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
       external_confirmed_at: action.externalConfirmedAt?.toISOString() ?? null,
       credential_alias_ref: action.credentialAliasRef,
       approval_consumed: !!action.approvalConsumption,
+      // #59: flattened runtime warnings from all reconciliation rows for this action.
+      runtime_warnings: action.reconciliations.flatMap((r) =>
+        Array.isArray(r.runtimeWarnings) ? r.runtimeWarnings : [],
+      ),
       created_at: action.createdAt.toISOString(),
     };
   });
