@@ -454,6 +454,53 @@ describe('Phase 5D consume — credential resolution route-level tests', () => {
     }
   });
 
+  // ── 9b. #72: adapter-level credential_denied from resolve() → failed (NOT needs_human) ──
+
+  it('9b. CredentialStore throws credential_denied → 403 TOKEN_NOT_CONSUMABLE, action=failed', async () => {
+    // An adapter-level authorization denial (IAM/policy refused the resolve, e.g. SSM AccessDenied)
+    // is a TERMINAL authz failure. It MUST map to failed + credential_denied — never the recoverable
+    // needs_human path. Retrying or human config changes won't reverse a policy denial.
+    const denyingStore = new FixtureCredentialStore({ [STORAGE_REF]: SECRET_VALUE });
+    vi.spyOn(denyingStore, 'resolve').mockRejectedValue(
+      new CredentialStoreError('credential_denied', 'Test: IAM/policy denied resolve'),
+    );
+
+    const testApp = await buildApp(denyingStore);
+    setupCasSuccess();
+    mockActionFindUnique.mockResolvedValue(FIRED_ACTION_WITH_CRED);
+    mockCredentialFindUnique.mockResolvedValue(VALID_CREDENTIAL);
+
+    try {
+      const res = await consumeRequest(testApp);
+
+      expect(res.statusCode).toBe(403);
+      expect(JSON.parse(res.body).error.code).toBe('TOKEN_NOT_CONSUMABLE');
+
+      // Terminal failure — action=failed, NOT needs_human.
+      expect(mockActionUpdateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ status: 'failed' }) }),
+      );
+      expect(mockPublishControlEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ topic: 'action.failed' }),
+      );
+      // Access log: success=false, reasonCode=credential_denied.
+      expect(mockAccessLogCreate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            success: false,
+            reasonCode: 'credential_denied',
+          }),
+        }),
+      );
+      // Regression guard: a denial must NEVER be routed to the recoverable needs_human path.
+      expect(mockPublishControlEvent).not.toHaveBeenCalledWith(
+        expect.objectContaining({ topic: 'action.needs_human' }),
+      );
+    } finally {
+      await testApp.close();
+    }
+  });
+
   // ── 10. No credential store configured ───────────────────────────────────
 
   it('10. no credentialStore configured → 403 TOKEN_NOT_CONSUMABLE, needs_human', async () => {

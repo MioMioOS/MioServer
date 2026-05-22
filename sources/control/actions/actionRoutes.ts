@@ -50,7 +50,7 @@ import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { publishControlEvent, type ControlEventResult } from '@/control/events/publishControlEvent';
 import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
 import { FIRE_GUARD_STATUSES, HARD_TERMINAL_STATUSES, ACTION_KIND_REQUIRES_CREDENTIAL } from '@/control/actionStatusSets';
-import { type CredentialStore, CredentialStoreError } from '@/control/credentials/credentialStore';
+import { type CredentialStore, CredentialStoreError, isCredentialDenial } from '@/control/credentials/credentialStore';
 
 /** Publish an event to DB + broadcast to WS subscribers (write-before-broadcast). */
 async function publishAndBroadcast(input: Parameters<typeof publishControlEvent>[0]): Promise<ControlEventResult> {
@@ -955,6 +955,19 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
       });
     } catch (err) {
       if (err instanceof CredentialStoreError) {
+        // #72/#69: adapter-level AUTHORIZATION denial (IAM/policy refused the resolve, e.g. SSM
+        // AccessDenied) is a TERMINAL authz failure → `failed + credential_denied`. It must NOT be
+        // misclassified as a recoverable infra blip (needs_human): retrying or human config fixes
+        // won't change a policy denial. This mirrors the earlier scope/revoked/expired denials
+        // (which already → failed + credential_denied) for the adapter-resolve path.
+        if (isCredentialDenial(err.reason)) {
+          await writeAccessLog(false, 'credential_denied');
+          await failAction('failed', 'credential_denied');
+          return reply.code(403).send({
+            error: { code: 'TOKEN_NOT_CONSUMABLE', message: 'Token not consumable' },
+          });
+        }
+        // Infra-level resolve errors → recoverable → needs_human (NEEDS_HUMAN_RESOLVE_REASONS).
         if (err.reason === 'store_unavailable') {
           await writeAccessLog(false, 'credential_store_unavailable');
           await failAction('needs_human', 'credential_store_unavailable');
