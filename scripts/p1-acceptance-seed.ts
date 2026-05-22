@@ -111,8 +111,10 @@ async function provision(ttlHours: number): Promise<void> {
     data: {
       id: randomUUID(), sessionId, workroomId: WORKROOM_ID, taskId: taskC.id, actorAgentId: agentId,
       kind: 'other',
-      // Redaction sample: a fake dev_ctl_ token + a temp path MUST render as [REDACTED] in the UI (ControlPlaneRedactor).
-      summary: '已轮换调试 token dev_ctl_FAKE0000000000000000000000000000 并清理 /Users/demo/Library/Caches/mio-secret-tmp-abc123，等待复核。',
+      // Redaction sample: a fake dev_ctl_ token + a daemon-secret-shaped temp path. BOTH must render
+      // as [REDACTED] in the UI. The path MUST match ControlPlaneRedactor's daemon-secret patterns
+      // (/tmp/mio-* or /var/folders/.../T/mio-*) — a generic /Users/... path is NOT redacted by the client.
+      summary: '已轮换调试 token dev_ctl_FAKE0000000000000000000000000000 并清理 /var/folders/zz/qm0n/T/mio-secret-tmp-abc123，等待复核。',
       reversibility: 'reversible', riskLevel: 'low', requiresApproval: false,
       status: 'transmission_complete', firedAt: new Date(Date.now() - 40 * 60_000),
       transmissionCompletedAt: new Date(Date.now() - 38 * 60_000),
