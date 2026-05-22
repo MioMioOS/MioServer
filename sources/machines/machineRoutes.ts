@@ -16,6 +16,12 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { randomBytes, createHash } from 'crypto';
 import { db } from '@/storage/db';
+import {
+  mintOperatorSession,
+  OperatorSessionMintError,
+  OPERATOR_SESSION_DEFAULT_TTL_HOURS,
+  OPERATOR_SESSION_MAX_TTL_HOURS,
+} from '@/control/operatorSessions/operatorSessionMint';
 
 const TOKEN_EXPIRY_DAYS = 90;
 const TOKEN_REFRESH_THRESHOLD_DAYS = 7;
@@ -191,5 +197,75 @@ export async function machineRoutes(app: FastifyInstance) {
       machine_token: new_token,  // New raw token — daemon must update Keychain immediately
       token_expires_at: updated.tokenExpiresAt.toISOString(),
     };
+  });
+
+  /**
+   * POST /api/v1/machines/:id/issue-operator-session   (#133 token onboarding)
+   *
+   * An already-authenticated Mac/daemon (machine_token) requests a scoped, short-lived
+   * op_sess_ for a workroom in its bound org, then relays it to a paired phone
+   * (QR / pairing code). The server issues ONLY to an authenticated machine — never to
+   * an unauthenticated phone — and holds no secret (local-auth-only: the auth root is the
+   * machine_token of the user's own Mac). The raw op_sess_ token is returned ONCE.
+   *
+   * Order (no-leak): auth (401) → machine/id match (403) → bound org (409) → workroom
+   * belongs to org (404, uniform for not-found OR cross-org) → mint.
+   */
+  app.post('/api/v1/machines/:id/issue-operator-session', {
+    schema: {
+      params: z.object({ id: z.string().uuid() }),
+      body: z.object({
+        workroom_id: z.string().uuid(),
+        operator_subject_id: z.string().optional(),
+        ttl_hours: z.number().int().positive().max(OPERATOR_SESSION_MAX_TTL_HOURS).optional(),
+      }),
+    },
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const { workroom_id, operator_subject_id, ttl_hours } = request.body as {
+      workroom_id: string; operator_subject_id?: string; ttl_hours?: number;
+    };
+
+    // 1. AUTH FIRST (anti-enumeration): valid machine_token AND it must match :id.
+    const machine = await verifyMachineToken(request.headers.authorization);
+    if (!machine) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired machine token' } });
+    }
+    if (machine.id !== id) {
+      return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Token does not match machine id' } });
+    }
+    if (!machine.orgId) {
+      return reply.code(409).send({ error: { code: 'MACHINE_NOT_BOUND', message: 'Machine is not bound to an org' } });
+    }
+
+    // 2. Workroom must belong to THIS machine's org. No-leak: not-found OR cross-org → 404.
+    const workroom = await db.controlWorkroom.findUnique({ where: { id: workroom_id }, select: { orgId: true } });
+    if (!workroom || workroom.orgId !== machine.orgId) {
+      return reply.code(404).send({ error: { code: 'WORKROOM_NOT_FOUND', message: 'Workroom not found' } });
+    }
+
+    // 3. Mint a scoped, short-lived op_sess_ (V1 commands by default). Raw token returned ONCE.
+    try {
+      const result = await mintOperatorSession({
+        orgId: machine.orgId,
+        workroomId: workroom_id,
+        operatorSubjectId: operator_subject_id ?? `machine:${machine.id}`,
+        issuedBy: `machine:${machine.id}`,
+        ttlHours: ttl_hours ?? OPERATOR_SESSION_DEFAULT_TTL_HOURS,
+      });
+      await db.controlMachine.update({ where: { id: machine.id }, data: { lastSeenAt: new Date() } });
+      return {
+        op_sess_token: result.rawToken,   // raw — returned ONCE; relay to phone, never stored server-side
+        workroom_id,
+        org_id: machine.orgId,
+        allowed_commands: result.allowedCommands,
+        expires_at: result.expiresAt.toISOString(),
+      };
+    } catch (err) {
+      if (err instanceof OperatorSessionMintError) {
+        return reply.code(422).send({ error: { code: 'MINT_FAILED', message: 'Operator session could not be issued' } });
+      }
+      throw err;
+    }
   });
 }
