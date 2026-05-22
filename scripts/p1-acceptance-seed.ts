@@ -198,4 +198,9 @@ async function main(): Promise<void> {
   await db.$disconnect();
 }
 
-main().catch(async (e) => { console.error('p1-acceptance-seed failed:', e); try { await db.$disconnect(); } catch { /* */ } process.exit(1); });
+// CLI entry — run ONLY when invoked directly, not on import (defensive vs the #179 crash-loop bug
+// class: a former-CLI module's main() firing on import → process.exit. Deploy preflight rule.)
+const isDirectRun = process.argv[1]?.endsWith('p1-acceptance-seed.ts') || process.argv[1]?.endsWith('p1-acceptance-seed.js');
+if (isDirectRun) {
+  main().catch(async (e) => { console.error('p1-acceptance-seed failed:', e); try { await db.$disconnect(); } catch { /* */ } process.exit(1); });
+}
