@@ -17,4 +17,10 @@ export const config = {
     appleApiPrivateKey: process.env.APPLE_API_PRIVATE_KEY || '', // base64-encoded .p8
     // 退款回调共享密钥（防伪造）
     revokeSharedSecret: process.env.REVOKE_SHARED_SECRET || '',
+    // CredentialStore selection (#72/#75). These are NON-secret selectors only.
+    // The AesFile KEK is NEVER here (and never in .env) — it is loaded from the OS Keychain
+    // at bootstrap (invariant 5: KEK must not share the .env/DB dump surface).
+    // Unset provider → no store provisioned → consume route fail-safe to needs_human.
+    credentialStoreProvider: (process.env.CREDENTIAL_STORE_PROVIDER ?? '').trim(),
+    credentialStoreAesFilePath: (process.env.CREDENTIAL_STORE_AESFILE_PATH ?? '').trim(),
 } as const;

@@ -24,6 +24,7 @@ import { eventRoutes } from '@/control/events/eventRoutes';
 import { artifactRoutes } from '@/control/artifacts/artifactRoutes';
 import { summaryRoutes } from '@/control/workrooms/summaryRoutes';
 import { sessionRoutes as controlSessionRoutes } from '@/control/sessions/sessionRoutes';
+import { provisionCredentialStore } from '@/control/credentials/provisionCredentialStore';
 import { config } from '@/config';
 
 export async function startApi() {
@@ -46,6 +47,13 @@ export async function startApi() {
 
     app.get('/health', async () => ({ status: 'ok' }));
 
+    // CredentialStore (#75): provision ONCE at bootstrap, fail-closed. If CREDENTIAL_STORE_PROVIDER
+    // is unset the result is undefined and the consume route fail-safes to needs_human (no store =
+    // no resolution, never a fake success). If a provider is set but invalid for the env / not yet
+    // implemented (ssm/kms/vault, blocked on #73) / missing its Keychain KEK (aesfile), this throws
+    // here and the server refuses to start — it never serves requests with a half-broken store.
+    const credentialStore = provisionCredentialStore();
+
     await app.register(authRoutes);
     await app.register(pairingRoutes);
     await app.register(devicesRoutes);
@@ -60,7 +68,7 @@ export async function startApi() {
     await app.register(machineRoutes);
     await app.register(workroomRoutes);
     await app.register(taskRoutes);
-    await app.register(actionRoutes);
+    await app.register(actionRoutes, { credentialStore });
     await app.register(eventRoutes);
     await app.register(artifactRoutes);
     await app.register(summaryRoutes);
