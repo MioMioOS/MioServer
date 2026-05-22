@@ -11,6 +11,9 @@ export const config = {
     trialDays: parseInt(process.env.TRIAL_DAYS || '3', 10),
     maxConcurrentDevices: parseInt(process.env.MAX_CONCURRENT_DEVICES || '1', 10),
     enforceSubscription: process.env.ENFORCE_SUBSCRIPTION !== 'false', // default true
+    // #164: server-assist LLM explanation layer feature gate. Phase 1 = a SERVER CONFIG gate
+    // (NOT per-org; per-org opt-in is a later DB-field upgrade). Default OFF.
+    serverLlmExplanationEnabled: process.env.SERVER_LLM_EXPLANATION_ENABLED === 'true',
     // Apple App Store Server API (用于验证 transactionId 真实性)
     appleApiKeyId: process.env.APPLE_API_KEY_ID || '',
     appleApiIssuerId: process.env.APPLE_API_ISSUER_ID || '',
