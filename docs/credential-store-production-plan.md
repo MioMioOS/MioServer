@@ -1,6 +1,23 @@
 # Production CredentialStore Adapter Plan (#69)
 
-Status: **design spec** (strict-lane). Owner: @运维. Reviewers: @Research (product), @Aaron (impl feasibility).
+> ## ⛔ SUPERSEDED — OUT OF SCOPE (2026-05-22, Laurent + PM, #95)
+> **The product is LOCAL-AUTH-ONLY: it orchestrates the user's own local Claude Code / Codex, which
+> authenticate with the user's local login. The server holds NO secrets and resolves NO credentials.**
+> If the user's local Claude/Codex isn't logged in, the product shows "needs login/config" and does
+> not execute — there is nothing for the server to resolve.
+>
+> Therefore this entire production-CredentialStore line is **not pursued**: no SSM, no cloud secret
+> manager, no server-hosted secret, no production provider adapter. **#73 closed; #87/#88 (operator
+> write signing) stopped** as far-future off-scope complexity.
+>
+> What remains in code is HARMLESS and DORMANT: the `CredentialStore` interface + factory + fail-closed
+> guard stay as a safety net (production `CREDENTIAL_STORE_PROVIDER` is unset → any hypothetical
+> credentialed action fail-closes to `needs_human`). No provider is ever configured. Ripping the
+> dormant code out is an optional later cleanup, not required (it cannot run a secret path).
+>
+> The rest of this doc is retained as HISTORICAL design record only.
+
+Status: ~~design spec (strict-lane)~~ **SUPERSEDED — see banner above.** Owner: @运维.
 **2026-05-22 pivot (#95, see §6):** VENDOR-NEUTRAL — NOT bound to Tencent SSM (or any cloud). Provider
 chosen per deployment when a real action needs it; until then production stays fail-closed (`needs_human`).
 Scope: keep production `CredentialStore` vendor-neutral + fail-closed, with a pluggable provider abstraction.
