@@ -1,8 +1,10 @@
 # Production CredentialStore Adapter Plan (#69)
 
 Status: **design spec** (strict-lane). Owner: @运维. Reviewers: @Research (product), @Aaron (impl feasibility).
-Scope: take production `CredentialStore` from "unimplemented blocker" to an executable plan.
-Non-goals: write the adapter code now; pick a final cloud vendor contract; build credential admin UI.
+**2026-05-22 pivot (#95, see §6):** VENDOR-NEUTRAL — NOT bound to Tencent SSM (or any cloud). Provider
+chosen per deployment when a real action needs it; until then production stays fail-closed (`needs_human`).
+Scope: keep production `CredentialStore` vendor-neutral + fail-closed, with a pluggable provider abstraction.
+Non-goals: commit to any cloud vendor now; build a cloud adapter before a real action needs it; credential admin UI.
 
 ---
 
@@ -71,23 +73,38 @@ So a production adapter only changes **where MioServer fetches plaintext**; it m
 
 ---
 
-## 6. MVP recommendation (support the next real action, not all-at-once)
+## 6. Recommendation — VENDOR-NEUTRAL, pick the provider when a real action needs it (#95 pivot)
 
-1. **MVP provider = Cloud Secrets Manager matching the deploy** (the box is Tencent Cloud → **Tencent SSM**), behind a thin `SsmCredentialStore implements CredentialStore`. Rationale: managed + audited + rotation + no KEK-on-box + no Vault to operate; smallest secure step to run one real credentialed action.
-   - If multi-cloud/vendor-neutral is required later, the **KMS-envelope** adapter is the fallback (works with any KMS; we hold ciphertext).
-2. **Keep `AesFileCredentialStore`** for owner-mac local dev (unchanged).
-3. **Defer Vault** until dynamic/short-lived secrets or fine-grained per-action policy is actually needed (heavier ops; not justified for the first credentialed action).
-4. **Factory + positive prod allow-list**: `NODE_ENV=production` must select a production provider or fail closed (extend `assertNotProduction`).
+> **2026-05-22 decision (Laurent + PM, task #95, #73 closed):** do NOT bind the production
+> CredentialStore to any cloud vendor (no Tencent SSM commitment). Keep the provider abstraction;
+> choose a backend only when a real credentialed action actually needs one, matching whatever
+> deployment we're on then. Until then, **production `CREDENTIAL_STORE_PROVIDER` stays unset =
+> fail-closed → credentialed actions go to `needs_human`** (safe, no fake success).
 
-### Implementation slices (separate tasks)
-1. `CredentialStore` factory + `CREDENTIAL_STORE_PROVIDER` env + prod allow-list (fail-closed).
-2. `SsmCredentialStore` (Tencent SSM) — implements interface, maps errors to controlled reasons, no value logging.
-3. MioServer-side resolve-audit row (credentialId/orgId/storageRef/outcome, no value).
-4. Staging wiring + one end-to-end credentialed-action test (real adapter, no-leak assertion) before any prod credential.
+1. **No cloud commitment now.** The `CredentialStore` interface + factory (#72) are already
+   vendor-neutral: a backend is one `CREDENTIAL_STORE_PROVIDER` switch. Switching/adding a vendor
+   later changes only a factory branch — interface, no-leak, audit, and fail-closed guard are stable.
+2. **Near-term demo route = `AesFileCredentialStore` (ALREADY BUILT).** If a demo needs a real
+   credential on the owner Mac, use the existing AES-256-GCM sealed-file store with the **KEK from the
+   macOS Keychain** (never `.env`). This is vendor-neutral, fail-closed, no-leak — and the factory
+   (#72) + bootstrap wiring (#75) + deploy preflight (#77) already support it (`aesfile` provider).
+3. **Future production providers are pluggable, choose on need:** AWS Secrets Manager / GCP Secret
+   Manager / HashiCorp Vault / KMS-envelope / Tencent SSM — ANY can be added as a provider when the
+   actual deployment is known. None is privileged; none is required now.
+4. **Factory + positive prod allow-list (DONE, #72):** `NODE_ENV=production` only permits a vetted
+   production provider; fixture/aesfile/unknown/empty fail closed at startup.
+
+### Implementation status / remaining slices
+1. ✅ `CredentialStore` factory + `CREDENTIAL_STORE_PROVIDER` env + prod allow-list (fail-closed) — DONE (#72).
+2. ✅ Bootstrap wiring (provisionCredentialStore) + deploy preflight — DONE (#75/#77); aesfile KEK from Keychain.
+3. ✅ resolve-audit substantially covered by existing `ControlCredentialAccessLog` (credentialId/actionId/machineId/success/reasonCode); optional enrich (adapter name/orgId/opaque storageRef) deferred.
+4. ⏳ A real cloud/Vault provider adapter — **deferred until a real credentialed action needs it**, then implement the one matching the deployment (no Tencent SSM prerequisite; #73 closed).
 
 ---
 
 ## 7. Open questions for review
-- @Research: env split (local-demo / remote-test / prod) — does staging need full Tencent SSM, or is a sealed file w/ Keychain-less KEK acceptable for staging only? (Current stance: staging = prod adapter, no env-KEK.)
-- @Aaron: feasibility of Tencent SSM SDK in the Node/tsx runtime + instance-role auth on the box.
-- Vendor lock: SSM-first vs KMS-envelope-first (vendor-neutral) — pick based on whether multi-cloud is a near-term need.
+- When a real credentialed action is first needed: which environment is it deployed on, and what is
+  the simplest vendor-neutral KEK/secret source there? (On Linux/cloud there is no OS Keychain, so a
+  managed-secret backend or KMS-envelope is chosen then — decided per deployment, not pre-committed.)
+- ~~Tencent SSM SDK feasibility / instance-role auth~~ — dropped (#73 closed; no Tencent SSM).
+- ~~SSM-first vs KMS-envelope-first~~ — moot; provider chosen on need, all pluggable.

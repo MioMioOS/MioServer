@@ -214,10 +214,15 @@ function assertNotProduction(storeName: string): void {
 // future provider being enabled in prod before it has been security-reviewed.
 
 /** Provider identifiers allowed to back the CredentialStore in production. */
+// #95 pivot (2026-05-22): VENDOR-NEUTRAL — none of these is privileged or required. A production
+// provider is chosen per deployment only when a real credentialed action needs one; until then
+// production runs with no provider (fail-closed → needs_human). 'ssm' here is just one allowed
+// option (AWS/GCP Secrets Manager would map to 'ssm'/'kms'-style adapters too), NOT a Tencent
+// commitment (#73 closed).
 export const PROD_CREDENTIAL_PROVIDERS: ReadonlySet<string> = new Set([
-  'ssm',   // cloud Secrets Manager (Tencent SSM) — MVP target (#69/#72)
-  'kms',   // KMS-envelope adapter (vendor-neutral fallback)
-  'vault', // HashiCorp Vault (deferred)
+  'ssm',   // a cloud Secrets Manager adapter (any vendor) — one option, not the default
+  'kms',   // KMS-envelope adapter (vendor-neutral)
+  'vault', // HashiCorp Vault
 ]);
 
 /** Dev/test-only providers — forbidden in production. */
