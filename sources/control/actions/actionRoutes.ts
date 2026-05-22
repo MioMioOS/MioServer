@@ -1062,6 +1062,40 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
       });
     }
 
+    // ── 2b. Optional runtime_warnings (#59) ──
+    // Daemon/harness forwards structured warnings produced by the runtime subprocess
+    // (e.g. CLAUDE_DELEGATION_CONFIG_NOT_PROVISIONED from #53). Structure-validated +
+    // capped only — these are our own controlled warning strings, not free-form user text.
+    let runtimeWarnings: Array<{ code: string; severity: string; message: string }> | undefined;
+    const rawWarnings = (body as { runtime_warnings?: unknown }).runtime_warnings;
+    if (rawWarnings !== undefined) {
+      if (!Array.isArray(rawWarnings) || rawWarnings.length > 50) {
+        return reply.code(400).send({
+          error: { code: 'INVALID_RUNTIME_WARNINGS', message: 'runtime_warnings must be an array (max 50 items)' },
+        });
+      }
+      const valid: Array<{ code: string; severity: string; message: string }> = [];
+      for (const w of rawWarnings) {
+        if (
+          typeof w !== 'object' || w === null ||
+          typeof (w as { code?: unknown }).code !== 'string' ||
+          typeof (w as { severity?: unknown }).severity !== 'string' ||
+          typeof (w as { message?: unknown }).message !== 'string'
+        ) {
+          return reply.code(400).send({
+            error: { code: 'INVALID_RUNTIME_WARNINGS', message: 'each warning must have string code, severity, message' },
+          });
+        }
+        const ww = w as { code: string; severity: string; message: string };
+        valid.push({
+          code: ww.code.slice(0, 120),
+          severity: ww.severity.slice(0, 32),
+          message: ww.message.slice(0, 2000),
+        });
+      }
+      runtimeWarnings = valid;
+    }
+
     // ── 3. Fetch action ──
     const action = await db.controlAction.findUnique({ where: { id: actionId } });
     if (!action) {
@@ -1135,6 +1169,7 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
               evidenceId: evidenceId as string,
               reasonCode: reason,
               machineId: machine.id,            // bound from firing machine, NOT from body
+              ...(runtimeWarnings ? { runtimeWarnings: runtimeWarnings as Prisma.InputJsonValue } : {}),
             },
           });
           return { count: 1 as number, currentStatus: 'needs_human' };
@@ -1154,6 +1189,7 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
               evidenceId: evidenceId as string,
               reasonCode: reason,
               machineId: machine.id,
+              ...(runtimeWarnings ? { runtimeWarnings: runtimeWarnings as Prisma.InputJsonValue } : {}),
             },
           });
         }

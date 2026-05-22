@@ -201,3 +201,60 @@ describe('reconcile endpoint — real DB evidence-ordering invariant (integratio
         expect(await evidenceCount(actionId)).toBe(1);
     });
 });
+
+describe('reconcile endpoint — runtime_warnings persistence (#59)', () => {
+    async function reconcileWithWarnings(actionId: string, evidenceId: string, warnings: unknown) {
+        return app.inject({
+            method: 'POST',
+            url: `/api/v1/actions/${actionId}/reconcile`,
+            headers: { authorization: `Bearer ${MACHINE_RAW_TOKEN}`, 'content-type': 'application/json' },
+            payload: { reason: VALID_REASON, evidence_id: evidenceId, runtime_warnings: warnings },
+        });
+    }
+
+    it('valid runtime_warnings -> 200 and persisted on the reconciliation row', async () => {
+        const actionId = await seedActionWithToken('fired');
+        const evidenceId = `ev-w-${randomUUID()}`;
+        const warnings = [
+            { code: 'CLAUDE_DELEGATION_CONFIG_NOT_PROVISIONED', severity: 'needs_human', message: 'user CLAUDE.md may be read' },
+        ];
+        const res = await reconcileWithWarnings(actionId, evidenceId, warnings);
+        expect(res.statusCode).toBe(200);
+        const row = await db.controlActionReconciliation.findFirst({ where: { actionId, evidenceId } });
+        expect(row?.runtimeWarnings).toEqual(warnings);
+    });
+
+    it('reconcile without runtime_warnings -> row.runtimeWarnings is null (backward compat)', async () => {
+        const actionId = await seedActionWithToken('fired');
+        const evidenceId = `ev-now-${randomUUID()}`;
+        const res = await reconcile(actionId, evidenceId);
+        expect(res.statusCode).toBe(200);
+        const row = await db.controlActionReconciliation.findFirst({ where: { actionId, evidenceId } });
+        expect(row?.runtimeWarnings ?? null).toBeNull();
+    });
+
+    it('malformed runtime_warnings (not an array) -> 400, no transition, no evidence row', async () => {
+        const actionId = await seedActionWithToken('fired');
+        const res = await reconcileWithWarnings(actionId, `ev-bad-${randomUUID()}`, { code: 'x' });
+        expect(res.statusCode).toBe(400);
+        expect(JSON.parse(res.body).error.code).toBe('INVALID_RUNTIME_WARNINGS');
+        // Validation runs before the CAS transaction: action untouched, no orphan evidence.
+        const action = await db.controlAction.findUnique({ where: { id: actionId }, select: { status: true } });
+        expect(action?.status).toBe('fired');
+        expect(await evidenceCount(actionId)).toBe(0);
+    });
+
+    it('runtime_warnings item missing a required field -> 400', async () => {
+        const actionId = await seedActionWithToken('fired');
+        const res = await reconcileWithWarnings(actionId, `ev-bad2-${randomUUID()}`, [{ code: 'x', severity: 'warning' }]);
+        expect(res.statusCode).toBe(400);
+        expect(JSON.parse(res.body).error.code).toBe('INVALID_RUNTIME_WARNINGS');
+    });
+
+    it('over-cap runtime_warnings (>50 items) -> 400', async () => {
+        const actionId = await seedActionWithToken('fired');
+        const many = Array.from({ length: 51 }, (_, i) => ({ code: `c${i}`, severity: 'warning', message: 'm' }));
+        const res = await reconcileWithWarnings(actionId, `ev-many-${randomUUID()}`, many);
+        expect(res.statusCode).toBe(400);
+    });
+});

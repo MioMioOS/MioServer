@@ -52,6 +52,7 @@ CONTROL_PLANE_MIGRATIONS=(
   "prisma/migrations/20260521200000_add_control_action_reconciliations/migration.sql"
   "prisma/migrations/20260521300000_5d_credential_scope/migration.sql"
   "prisma/migrations/20260521400000_add_control_dev_tokens/migration.sql"
+  "prisma/migrations/20260522000000_add_reconciliation_runtime_warnings/migration.sql"
 )
 for migration in "${CONTROL_PLANE_MIGRATIONS[@]}"; do
   echo "==> Applying ${migration}"

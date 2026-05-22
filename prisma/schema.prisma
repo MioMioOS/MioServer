@@ -612,6 +612,10 @@ model ControlActionReconciliation {
   evidenceId String        @map("evidence_id") // stable file-based ID from daemon
   reasonCode String        @map("reason_code") // controlled enum: fire_response_lost_token_unrecoverable | drain_deadline_exceeded
   machineId  String        @map("machine_id") @db.Uuid // bound at issuance (verified, not from body)
+  // #59: optional runtime-produced warnings forwarded by the daemon (e.g.
+  // CLAUDE_DELEGATION_CONFIG_NOT_PROVISIONED). Validated structure only:
+  // [{ code, severity, message }]. Surfaced to control-plane as needs_human context.
+  runtimeWarnings Json?    @map("runtime_warnings")
   createdAt  DateTime      @default(now()) @map("created_at")
 
   @@unique([actionId, evidenceId])
