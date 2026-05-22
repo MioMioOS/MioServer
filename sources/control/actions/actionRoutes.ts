@@ -52,6 +52,23 @@ import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
 import { FIRE_GUARD_STATUSES, HARD_TERMINAL_STATUSES, ACTION_KIND_REQUIRES_CREDENTIAL } from '@/control/actionStatusSets';
 import { type CredentialStore, CredentialStoreError, isCredentialDenial } from '@/control/credentials/credentialStore';
 import { buildReadOnlyDemoCapabilities } from '@/control/capabilities/buildReadOnlyDemoCapabilities';
+import { redactControlText } from '@/control/redaction/redactControlText';
+
+/**
+ * #141: pick the most recent non-null value of a reconciliation field (evidence/log are
+ * post-run reconcile evidence; the latest report wins). Reconciliations are passed in
+ * createdAt-ascending order, so we scan from the end.
+ */
+function latestReconciliationField(
+  reconciliations: Array<{ outputSummary?: string | null; rawLogRedacted?: string | null }>,
+  key: 'outputSummary' | 'rawLogRedacted',
+): string | null {
+  for (let i = reconciliations.length - 1; i >= 0; i -= 1) {
+    const v = reconciliations[i][key];
+    if (v != null && v !== '') return v;
+  }
+  return null;
+}
 
 /** Publish an event to DB + broadcast to WS subscribers (write-before-broadcast). */
 async function publishAndBroadcast(input: Parameters<typeof publishControlEvent>[0]): Promise<ControlEventResult> {
@@ -255,7 +272,11 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
         // #59: surface runtime warnings (e.g. CLAUDE_DELEGATION_CONFIG_NOT_PROVISIONED)
         // recorded on this action's reconciliation rows, so the human UI sees the
         // needs_human/known-gap context instead of it being silently buried.
-        reconciliations: { select: { runtimeWarnings: true }, orderBy: { createdAt: 'asc' } },
+        // #141: also pull output_summary + raw_log_redacted for the Evidence / Runtime Log pages.
+        reconciliations: {
+          select: { runtimeWarnings: true, outputSummary: true, rawLogRedacted: true, createdAt: true },
+          orderBy: { createdAt: 'asc' },
+        },
       },
     });
     if (!action) {
@@ -292,6 +313,10 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
       runtime_warnings: action.reconciliations.flatMap((r) =>
         Array.isArray(r.runtimeWarnings) ? r.runtimeWarnings : [],
       ),
+      // #141: latest reconciliation evidence/log for the Evidence / Runtime Log pushed pages.
+      // Re-redacted server-side (defense-in-depth) even though the daemon sends pre-redacted text.
+      output_summary: redactControlText(latestReconciliationField(action.reconciliations, 'outputSummary')),
+      raw_log_redacted: redactControlText(latestReconciliationField(action.reconciliations, 'rawLogRedacted')),
       created_at: action.createdAt.toISOString(),
     };
 
@@ -337,7 +362,15 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
         where,
         orderBy: { createdAt: 'desc' },
         take: limit,
-        include: { approvalConsumption: true },
+        include: {
+          approvalConsumption: true,
+          // #141: pull reconciliation evidence/log so the list-driven Evidence / Runtime Log
+          // pushed pages (CodeLight fetchActions) can show real content per action.
+          reconciliations: {
+            select: { outputSummary: true, rawLogRedacted: true, createdAt: true },
+            orderBy: { createdAt: 'asc' },
+          },
+        },
       }),
       db.controlAction.count({ where }),
     ]);
@@ -362,6 +395,9 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
         external_confirmed_at: action.externalConfirmedAt?.toISOString() ?? null,
         credential_alias_ref: action.credentialAliasRef,
         approval_consumed: !!action.approvalConsumption,
+        // #141: latest reconciliation evidence/log, re-redacted server-side (defense-in-depth).
+        output_summary: redactControlText(latestReconciliationField(action.reconciliations, 'outputSummary')),
+        raw_log_redacted: redactControlText(latestReconciliationField(action.reconciliations, 'rawLogRedacted')),
         created_at: action.createdAt.toISOString(),
       })),
       total,

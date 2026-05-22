@@ -624,6 +624,11 @@ model ControlActionReconciliation {
   // CLAUDE_DELEGATION_CONFIG_NOT_PROVISIONED). Validated structure only:
   // [{ code, severity, message }]. Surfaced to control-plane as needs_human context.
   runtimeWarnings Json?    @map("runtime_warnings")
+  // #141: productized runtime output summary + already-redacted runtime log excerpt, reported by
+  // the daemon at reconcile. Surfaced (re-redacted server-side as defense-in-depth) via GET /actions
+  // for the CodeLight Evidence / Runtime Log pushed pages. NULL until the daemon backfills (#141 daemon side).
+  outputSummary  String?  @map("output_summary")
+  rawLogRedacted String?  @map("raw_log_redacted")
   createdAt  DateTime      @default(now()) @map("created_at")
 
   @@unique([actionId, evidenceId])
