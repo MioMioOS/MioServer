@@ -23,6 +23,52 @@ import { db } from '@/storage/db';
 
 const TOKEN_PREFIX = 'dev_ctl_';
 
+export class DevTokenMintError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DevTokenMintError';
+  }
+}
+
+export interface MintDevControlTokenResult {
+  rawToken: string;
+  id: string;
+  expiresAt: Date;
+}
+
+/**
+ * Mint a READ-ONLY dev_control_token bound to one workroom. Stores ONLY the sha256; returns the raw
+ * once. Reused by the #179 /connections/access endpoint to derive a SHORT-LIVED read access token
+ * from a connection credential (pass a short ttlHours, e.g. 1). Validates workroom exists + org match.
+ *
+ * @param ttlHours  1..720 (max 30d). For derived access tokens pass a short value (≤ a few hours).
+ */
+export async function mintDevControlToken(params: {
+  orgId: string;
+  workroomId: string;
+  ttlHours: number;
+  createdByMachineId?: string;
+}): Promise<MintDevControlTokenResult> {
+  const { orgId, workroomId, ttlHours } = params;
+  if (!orgId || !workroomId) throw new DevTokenMintError('orgId and workroomId are required');
+  if (!Number.isFinite(ttlHours) || ttlHours <= 0 || ttlHours > 720) {
+    throw new DevTokenMintError('ttlHours must be in 1..720');
+  }
+
+  const wr = await db.controlWorkroom.findUnique({ where: { id: workroomId }, select: { orgId: true } });
+  if (!wr) throw new DevTokenMintError(`workroom not found: ${workroomId}`);
+  if (wr.orgId !== orgId) throw new DevTokenMintError('orgId mismatch: workroom belongs to a different org');
+
+  const rawToken = `${TOKEN_PREFIX}${randomBytes(32).toString('base64url')}`;
+  const tokenHash = createHash('sha256').update(rawToken).digest('hex');
+  const expiresAt = new Date(Date.now() + ttlHours * 3_600_000);
+
+  const rec = await db.controlDevToken.create({
+    data: { tokenHash, orgId, workroomId, scope: 'read_only', createdByMachineId: params.createdByMachineId ?? null, expiresAt },
+  });
+  return { rawToken, id: rec.id, expiresAt };
+}
+
 async function main(): Promise<void> {
   const [orgId, workroomId, ttlArg] = process.argv.slice(2);
 
@@ -39,30 +85,16 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Validate the workroom exists and belongs to the given org (no DB FK by convention,
-  // so we check here to avoid minting a token bound to a non-existent / mismatched workroom).
-  const wr = await db.controlWorkroom.findUnique({
-    where: { id: workroomId },
-    select: { orgId: true },
-  });
-  if (!wr) {
-    console.error(`workroom not found: ${workroomId}`);
+  let rec: MintDevControlTokenResult;
+  try {
+    rec = await mintDevControlToken({ orgId, workroomId, ttlHours });
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
     await db.$disconnect();
     process.exit(1);
   }
-  if (wr.orgId !== orgId) {
-    console.error(`orgId mismatch: workroom ${workroomId} belongs to a different org`);
-    await db.$disconnect();
-    process.exit(1);
-  }
-
-  const rawToken = `${TOKEN_PREFIX}${randomBytes(32).toString('base64url')}`;
-  const tokenHash = createHash('sha256').update(rawToken).digest('hex');
-  const expiresAt = new Date(Date.now() + ttlHours * 3_600_000);
-
-  const rec = await db.controlDevToken.create({
-    data: { tokenHash, orgId, workroomId, scope: 'read_only', expiresAt },
-  });
+  const rawToken = rec.rawToken;
+  const expiresAt = rec.expiresAt;
 
   // SECURITY: the raw token is printed ONCE here and never stored (only the hash is in DB).
   console.log('');

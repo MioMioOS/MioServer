@@ -26,6 +26,7 @@ import { summaryRoutes } from '@/control/workrooms/summaryRoutes';
 import { sessionRoutes as controlSessionRoutes } from '@/control/sessions/sessionRoutes';
 import { operatorWriteRoutes } from '@/control/operatorSessions/operatorWriteRoutes';
 import { operatorPairingRoutes } from '@/control/operatorSessions/operatorPairingRoutes';
+import { connectionRoutes } from '@/control/connections/connectionRoutes';
 import { explanationRoutes } from '@/control/llm/explanationRoutes';
 import { provisionCredentialStore } from '@/control/credentials/provisionCredentialStore';
 import { config } from '@/config';
@@ -74,6 +75,7 @@ export async function startApi() {
     await app.register(actionRoutes, { credentialStore });
     await app.register(operatorWriteRoutes);
     await app.register(operatorPairingRoutes);
+    await app.register(connectionRoutes);
     await app.register(explanationRoutes);
     await app.register(eventRoutes);
     await app.register(artifactRoutes);

@@ -34,6 +34,7 @@ import {
   OPERATOR_SESSION_MAX_TTL_HOURS,
   V1_OPERATOR_COMMANDS,
 } from '@/control/operatorSessions/operatorSessionMint';
+import { mintConnectionCredential, ConnectionCredentialError } from '@/control/connections/connectionCredential';
 
 const PAIRING_CODE_TTL_DEFAULT_S = 600;  // pairing code valid 10 min before redeem
 const PAIRING_CODE_TTL_MAX_S = 3600;     // hard cap 1 hour
@@ -146,13 +147,39 @@ export async function operatorPairingRoutes(app: FastifyInstance) {
         allowedCommands: pairing.allowedCommands,
         ttlHours: pairing.ttlHours,
       });
-      // SECURITY: op_sess_token appears ONLY here (TLS body) → iOS Keychain. Never log it.
+      // #179: also mint a long-lived CONNECTION CREDENTIAL (the "bind once" root). The pairing grants
+      // operator, so the connection carries read + operator. Returned ONCE alongside op_sess_; iOS
+      // stores the connection_credential in Keychain and uses /connections/access from then on.
+      // op_sess_token is retained for transition compatibility (removed once iOS cuts over).
+      let connection: { rawCredential: string; connectionId: string; scopes: string[]; expiresAt: Date } | null = null;
+      try {
+        connection = await mintConnectionCredential({
+          orgId: pairing.orgId,
+          workroomId: pairing.workroomId,
+          scopes: ['read', 'operator'],
+          operatorSubjectId: `pairing:${pairing.id}`,
+          allowedCommands: pairing.allowedCommands,
+          createdByMachineId: pairing.createdByMachineId,
+          deviceLabel: pairing.scopeLabel,
+        });
+      } catch (err) {
+        // Connection-credential mint failure must NOT break the existing op_sess_ path (back-compat).
+        // iOS falls back to op_sess_ until it can re-bind for a connection credential.
+        if (!(err instanceof ConnectionCredentialError)) throw err;
+      }
+
+      // SECURITY: op_sess_token + connection_credential appear ONLY here (TLS body) → iOS Keychain. Never log.
       return reply.code(200).send({
         op_sess_token: result.rawToken,
         workroom_id: pairing.workroomId,
         org_id: pairing.orgId,
         allowed_commands: result.allowedCommands,
         expires_at: result.expiresAt.toISOString(),
+        // #179 connection credential (bind-once root). Null only if its mint failed (op_sess_ still returned).
+        connection_credential: connection?.rawCredential ?? null,
+        connection_id: connection?.connectionId ?? null,
+        scopes: connection?.scopes ?? null,
+        connection_expires_at: connection?.expiresAt.toISOString() ?? null,
       });
     } catch (err) {
       if (err instanceof OperatorSessionMintError) {
