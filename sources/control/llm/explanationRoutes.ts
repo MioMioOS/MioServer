@@ -32,13 +32,15 @@ import {
   type OperatorStatus,
   type ServerStatus,
 } from './explanationCopy';
+import { getDoubaoProvider } from './doubaoProvider';
 
 /**
- * Phase 1: no provider wired yet (#165 will return a domestic-API adapter, gated by config).
- * Returning null makes generateExplanation fall back to deterministic copy — safe by default.
+ * #169: the explanation provider is the 豆包 (Ark) adapter, but ONLY when key+model are configured.
+ * getDoubaoProvider() returns null otherwise → generateExplanation falls back to deterministic copy.
+ * This preserves #164's default-OFF safety: feature flag on + provider unconfigured = safe fallback.
  */
 function getExplanationProvider(): LLMProvider | null {
-  return null;
+  return getDoubaoProvider();
 }
 
 const ISO = () => new Date().toISOString();

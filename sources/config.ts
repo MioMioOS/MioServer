@@ -14,6 +14,17 @@ export const config = {
     // #164: server-assist LLM explanation layer feature gate. Phase 1 = a SERVER CONFIG gate
     // (NOT per-org; per-org opt-in is a later DB-field upgrade). Default OFF.
     serverLlmExplanationEnabled: process.env.SERVER_LLM_EXPLANATION_ENABLED === 'true',
+    // #169: 豆包 (Volcengine Ark) explanation provider config. The adapter is only constructed when
+    // BOTH key AND model are set (getDoubaoProvider returns null otherwise → deterministic fallback,
+    // so the default-OFF safety of #164 is preserved even if the feature flag is on but unconfigured).
+    // SECURITY: doubaoApiKey is a low-privilege EXPLANATION-model key (NOT Claude/Codex execution
+    // creds). Phase 1 reads it from env for pragmatism; long-term it should move off the .env/DB-dump
+    // surface (like the credential-store KEK). It must NEVER appear in any response or log.
+    doubaoApiKey: process.env.DOUBAO_API_KEY || '',
+    doubaoBaseUrl: process.env.DOUBAO_BASE_URL || 'https://ark.cn-beijing.volces.com/api/v3',
+    doubaoModel: process.env.DOUBAO_MODEL || '', // ep-xxx endpoint id or model name (e.g. doubao-lite-4k)
+    doubaoMaxTokens: parseInt(process.env.DOUBAO_MAX_TOKENS || '120', 10), // explanation = short; cap cost
+    doubaoTimeoutMs: parseInt(process.env.DOUBAO_TIMEOUT_MS || '6000', 10),
     // Apple App Store Server API (用于验证 transactionId 真实性)
     appleApiKeyId: process.env.APPLE_API_KEY_ID || '',
     appleApiIssuerId: process.env.APPLE_API_ISSUER_ID || '',
