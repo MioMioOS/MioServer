@@ -25,6 +25,10 @@ export const config = {
     doubaoModel: process.env.DOUBAO_MODEL || '', // ep-xxx endpoint id or model name (e.g. doubao-lite-4k)
     doubaoMaxTokens: parseInt(process.env.DOUBAO_MAX_TOKENS || '120', 10), // explanation = short; cap cost
     doubaoTimeoutMs: parseInt(process.env.DOUBAO_TIMEOUT_MS || '6000', 10),
+    // #169 eval finding: Doubao-Seed-2.0 models are reasoning ("深度思考") models — by default they
+    // emit reasoning_content and take ~2.9s. Disabling thinking drops latency to ~1.0s with 0 reasoning
+    // tokens (cost), and the explanation task needs no chain-of-thought. Default ON (disable thinking).
+    doubaoDisableThinking: process.env.DOUBAO_DISABLE_THINKING !== 'false',
     // Apple App Store Server API (用于验证 transactionId 真实性)
     appleApiKeyId: process.env.APPLE_API_KEY_ID || '',
     appleApiIssuerId: process.env.APPLE_API_ISSUER_ID || '',
