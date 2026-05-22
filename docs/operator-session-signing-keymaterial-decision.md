@@ -50,14 +50,22 @@ signing material in either design; the win is entirely server-side (no decryptab
    `2026XXXX_add_operator_session_signing_public_key`. Public key is non-secret → plain column OK.
 2. **Mint change (extends #86 `mintOperatorSession`):** also `generateKeyPairSync('ed25519')`, store
    the public key (SPKI/raw), return the **private key (PKCS8/raw) once** alongside the bearer token.
-   Private key never persisted server-side (same "shown once" rule as the bearer token).
+   The private key is **as sensitive as the bearer token** (Research #87 constraint 3): returned to
+   the operator ONCE via stdout only, never persisted server-side and never written to any log, DB
+   column, audit row, EventLog payload, or UI surface.
 3. **Canonical request string** (client + server must agree byte-for-byte):
    `v1\n<METHOD>\n<PATH>\n<sha256(body) hex>\n<unix-timestamp>\n<nonce>`
-4. **Verifier (`verifyOperatorSession`)** — for each write request:
+   - `<PATH>` = normalized path **including query string** (if a write endpoint ever takes query
+     params), so the signature binds the full target. (Research #87 constraint 2.)
+   - body hash is computed over the **raw request body bytes** (pre-parse), so client/server JSON
+     re-serialization differences cannot break verification. (Research #87 constraint 2.)
+4. **Verifier (`verifyOperatorSession`)** — STRICT ORDER (Research #87 constraint 1):
    - look up session by `sha256(bearer)`; reject if missing/expired/revoked;
    - check timestamp within skew window (proposed ±300s);
-   - check nonce unused for this session (durable store, below);
-   - `crypto.verify(null, canonicalBytes, pubKey, sigBytes)` — reject on failure;
+   - **verify the signature FIRST** (`crypto.verify(null, canonicalBytes, pubKey, sigBytes)`) — reject on failure;
+   - **THEN consume the nonce** via a unique INSERT (only after timestamp + signature pass) — so an
+     invalid-signature request can NEVER burn a legitimate nonce; concurrent replay of a valid
+     request is rejected by the `UNIQUE(session_id, nonce)` constraint (P2002);
    - check command ∈ session.allowedCommands and workroom/org in scope;
    - all failures → uniform controlled error (no expired/revoked/scope distinction).
 5. **Nonce store (durability, per #85):** table `control_operator_session_nonces`
