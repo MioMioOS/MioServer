@@ -32,12 +32,12 @@
  * Excluded from the default `npm test` (no DB required there).
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import fastify, { FastifyInstance } from 'fastify';
 import { createHash, randomUUID } from 'crypto';
 import { db } from '@/storage/db';
 import { actionRoutes } from './actionRoutes';
-import { FixtureCredentialStore } from '@/control/credentials/credentialStore';
+import { FixtureCredentialStore, CredentialStoreError } from '@/control/credentials/credentialStore';
 
 const ORG_ID = randomUUID();
 const AGENT_ID = randomUUID();
@@ -301,6 +301,38 @@ describe('5D credential resolution — real DB authorization (integration)', () 
         const logs = await db.controlCredentialAccessLog.findMany({ where: { actionId } });
         expect(logs[0].success).toBe(false);
         expect(logs[0].reasonCode).toBe('credential_configuration_invalid');
+    });
+
+    it('adapter resolve denied (credential_denied) → 403 + action=failed (terminal authz, NOT needs_human)', async () => {
+        // #72: an adapter-level authorization denial (IAM/policy refused the resolve, e.g. SSM
+        // AccessDenied) is a TERMINAL authz failure → failed + credential_denied. The credential row
+        // + secret are valid and scope passes; only the resolve itself is denied. It must NOT be
+        // misclassified as the recoverable needs_human path.
+        const alias = `denied-${randomUUID()}`;
+        await seedCredential({ alias, secretValue: `s-${randomUUID()}`, allowedActionKinds: ['deploy_web'] });
+        const { actionId, rawToken } = await seedAction({ kind: 'deploy_web', credentialAliasRef: alias });
+
+        // Force the next resolve() to be denied at the adapter layer. spyOn falls through to the
+        // original for any later calls; restored in finally.
+        const denySpy = vi.spyOn(store, 'resolve').mockRejectedValueOnce(
+            new CredentialStoreError('credential_denied', 'integration: IAM/policy denied resolve'),
+        );
+        try {
+            const res = await consume(actionId, rawToken);
+            expect(res.statusCode).toBe(403);
+            expect(JSON.parse(res.body).error.code).toBe('TOKEN_NOT_CONSUMABLE');
+            // Terminal failure — action=failed, NOT needs_human.
+            expect(await actionStatus(actionId)).toBe('failed');
+            const logs = await db.controlCredentialAccessLog.findMany({ where: { actionId } });
+            expect(logs[0].success).toBe(false);
+            expect(logs[0].reasonCode).toBe('credential_denied');
+            // The emitted event is action.failed, never action.needs_human.
+            const events = await db.controlEventLog.findMany({ where: { workroomId: WORKROOM_ID } });
+            const evt = events.find((e) => JSON.stringify(e.payloadJson).includes(actionId));
+            expect(evt?.topic).toBe('action.failed');
+        } finally {
+            denySpy.mockRestore();
+        }
     });
 
     it('non-credential action kind → 200 + empty bundle, no credential lookup', async () => {
