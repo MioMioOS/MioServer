@@ -146,6 +146,12 @@ export async function executeOperatorCommand(input: OperatorCommandInput): Promi
       }
 
       // Step 2: Workroom ownership guard (inside tx — fail-closed, no-leak: 404 not 403)
+      // DEBUG: log actual values to diagnose cross-workroom test failure (#88 test 7)
+      if (process.env.DEBUG_OPERATOR_TX) {
+        console.warn(
+          `[operatorCommandTransaction] step2 workroom check: txAction.workroomId=${txAction.workroomId} session.workroomId=${session.workroomId} match=${txAction.workroomId === session.workroomId}`,
+        );
+      }
       if (txAction.workroomId !== session.workroomId) {
         throw new OperatorCmdError({ ok: false, code: 'ACTION_NOT_FOUND', httpStatus: 404 });
       }
@@ -181,11 +187,20 @@ export async function executeOperatorCommand(input: OperatorCommandInput): Promi
       // approve / retry: V2 — V1 gate above ensures we never reach here for those commands.
 
       if (casCount === 0) {
-        // CAS failed: a concurrent mutation changed the status after our Step 3 read.
-        // Re-query for the current committed status so the caller gets an accurate error.
-        // Under READ COMMITTED, this fresh read sees any commit that landed since step 3.
+        // CAS returned 0: either a concurrent status change, a wrong workroom, or action gone.
+        // Re-query (fresh READ COMMITTED read) to distinguish these cases accurately.
         const reloaded = await tx.controlAction.findUnique({ where: { id: actionId } });
-        const currentStatus = reloaded?.status ?? txAction.status;
+
+        // Defense-in-depth workroom guard: CAS WHERE already filters by workroomId so a
+        // cross-workroom action always yields count=0.  Step 2 above should have caught this,
+        // but if it somehow didn't (e.g. Prisma quirk returning stale workroomId at step 2),
+        // this is the authoritative backstop — no-leak 404 same as step 2.
+        if (!reloaded || reloaded.workroomId !== session.workroomId) {
+          throw new OperatorCmdError({ ok: false, code: 'ACTION_NOT_FOUND', httpStatus: 404 });
+        }
+
+        // CAS failed due to concurrent status mutation — report accurate current status.
+        const currentStatus = reloaded.status;
         throw new OperatorCmdError(
           HARD_TERMINAL_STATUSES.has(currentStatus)
             ? { ok: false, code: 'ACTION_TERMINAL',    httpStatus: 409, currentStatus }

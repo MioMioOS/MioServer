@@ -310,6 +310,11 @@ describe('#88 executeOperatorCommand — real DB atomicity', () => {
     // Seed action in a different workroom (WORKROOM_ID_OTHER ≠ session.workroomId)
     const actionId = await seedAction('needs_human', WORKROOM_ID_OTHER);
 
+    // DEBUG: verify seeded workroomId matches what we expect (helps diagnose test 7 failure)
+    const seeded = await db.controlAction.findUnique({ where: { id: actionId }, select: { workroomId: true } });
+    console.warn(`[test7-debug] WORKROOM_ID=${WORKROOM_ID} WORKROOM_ID_OTHER=${WORKROOM_ID_OTHER} seeded.workroomId=${seeded?.workroomId} session.workroomId=${SESSION_V1.workroomId}`);
+    expect(seeded!.workroomId).toBe(WORKROOM_ID_OTHER); // assert the seed is correct
+
     const result = await executeOperatorCommand({
       session: SESSION_V1,           // session.workroomId = WORKROOM_ID
       actionId,
