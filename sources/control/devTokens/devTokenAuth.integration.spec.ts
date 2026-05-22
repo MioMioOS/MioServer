@@ -96,6 +96,27 @@ describe('dev_control_token dual-auth — real DB security matrix (#32)', () => 
         expect(JSON.parse(res.body).action_id).toBe(ACTION_A);
     });
 
+    // #83 (Slice 2): dev_ctl_ (read-only) session GET includes a server-authoritative
+    // read_only_demo capabilities block driving CodeLight's Operator Actions rendering.
+    it('dev token GET /actions/:id includes read_only_demo capabilities (open_evidence enabled, writes disabled)', async () => {
+        const res = await get(`/api/v1/actions/${ACTION_A}`, RAW_VALID);
+        expect(res.statusCode).toBe(200);
+        const caps = JSON.parse(res.body).capabilities;
+        expect(caps, 'capabilities block present for dev session').toBeDefined();
+        expect(caps.mode).toBe('read_only_demo');
+        // Two distinct CAS markers (capability_version != action_version; action_version is real).
+        expect(typeof caps.capability_version).toBe('string');
+        expect(typeof caps.action_version).toBe('string');
+        // open_evidence is a read capability → enabled; write commands disabled w/ read_only_session.
+        expect(caps.commands.open_evidence.enabled).toBe(true);
+        for (const k of ['acknowledge_needs_human', 'mark_reviewed', 'approve', 'retry']) {
+            expect(caps.commands[k].enabled, k).toBe(false);
+            expect(caps.commands[k].reason, k).toBe('read_only_session');
+        }
+        // No-leak: capabilities block must not carry tokens/paths/secrets.
+        expect(JSON.stringify(caps)).not.toMatch(/dev_ctl_|act_tok_|storage_ref|\/var\/folders/);
+    });
+
     it('cross-workroom: GET /actions/:id in OTHER workroom -> 403 (scope, anti-enumeration)', async () => {
         const res = await get(`/api/v1/actions/${ACTION_B}`, RAW_VALID);
         expect(res.statusCode).toBe(403);

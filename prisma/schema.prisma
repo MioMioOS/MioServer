@@ -556,6 +556,9 @@ model ControlAction {
   credentialAliasRef      String?         @map("credential_alias_ref")
   clientIdempotencyKey    String          @unique @map("client_idempotency_key")
   createdAt               DateTime        @default(now()) @map("created_at")
+  // #83: bumped by Prisma on every action mutation — backs capabilities.action_version
+  // (stale-write CAS marker for future operator-write endpoints).
+  updatedAt               DateTime        @updatedAt @map("updated_at")
   firedAt                 DateTime?       @map("fired_at")
 
   approvalConsumption  ControlActionApprovalConsumption?

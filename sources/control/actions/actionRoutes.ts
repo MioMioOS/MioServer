@@ -51,6 +51,7 @@ import { publishControlEvent, type ControlEventResult } from '@/control/events/p
 import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
 import { FIRE_GUARD_STATUSES, HARD_TERMINAL_STATUSES, ACTION_KIND_REQUIRES_CREDENTIAL } from '@/control/actionStatusSets';
 import { type CredentialStore, CredentialStoreError, isCredentialDenial } from '@/control/credentials/credentialStore';
+import { buildReadOnlyDemoCapabilities } from '@/control/capabilities/buildReadOnlyDemoCapabilities';
 
 /** Publish an event to DB + broadcast to WS subscribers (write-before-broadcast). */
 async function publishAndBroadcast(input: Parameters<typeof publishControlEvent>[0]): Promise<ControlEventResult> {
@@ -268,7 +269,7 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
       if (!access.ok) return reply.code(access.status).send({ error: access.error });
     }
 
-    return {
+    const response: Record<string, unknown> = {
       action_id: action.id,
       workroom_id: action.workroomId,
       session_id: action.sessionId,
@@ -293,6 +294,15 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
       ),
       created_at: action.createdAt.toISOString(),
     };
+
+    // #83 (Slice 2): server-authoritative capabilities for the read-only (dev_ctl_) UI session.
+    // Only emitted for dev-mode sessions (CodeLight). machine_token (daemon) mode omits it —
+    // absent block = all writes unavailable (fail-closed), per the capability contract.
+    if (auth.mode === 'dev') {
+      response.capabilities = buildReadOnlyDemoCapabilities(action);
+    }
+
+    return response;
   });
 
   /**
