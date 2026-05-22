@@ -10,7 +10,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fastify, { type FastifyInstance } from 'fastify';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomBytes, createHash } from 'crypto';
 import { db } from '@/storage/db';
 import { operatorWriteRoutes } from './operatorWriteRoutes.js';
 import { mintOperatorSession } from './operatorSessionMint.js';
@@ -142,11 +142,31 @@ describe('#97 operator write endpoints — scope/command (404/403/422)', () => {
     expect((await post(id, 'mark-reviewed', tokenAckOnly)).statusCode).toBe(403);
   });
 
-  it('approve / retry → 422 (not in V1)', async () => {
+  it('approve / retry with default (ack+mark) token → 403 (command not in scope, no V1-gate leak)', async () => {
     const id1 = await seedAction({ status: 'proposed' });
     const id2 = await seedAction({ status: 'failed' });
-    expect((await post(id1, 'approve', tokenBoth)).statusCode).toBe(422);
-    expect((await post(id2, 'retry', tokenBoth)).statusCode).toBe(422);
+    // Unscoped session must NOT learn the command is "V1-gated" (422) — it gets fail-closed 403.
+    expect((await post(id1, 'approve', tokenBoth)).statusCode).toBe(403);
+    expect((await post(id2, 'retry', tokenBoth)).statusCode).toBe(403);
+  });
+
+  it('approve with a session GRANTED approve scope → 422 (authorized but not supported in V1)', async () => {
+    // mintOperatorSession refuses approve/retry (V1 allow-list), so insert a session row directly
+    // with approve scope to reach the helper's V1-gate.
+    const raw = `op_sess_${randomBytes(32).toString('base64url')}`;
+    await db.controlOperatorSession.create({
+      data: {
+        tokenHash: createHash('sha256').update(raw).digest('hex'),
+        orgId: ORG_ID,
+        workroomId: WORKROOM_ID,
+        allowedCommands: ['approve'],
+        operatorSubjectId: 'subj',
+        issuedBy: 'cli:test',
+        expiresAt: new Date(Date.now() + 3_600_000),
+      },
+    });
+    const id = await seedAction({ status: 'proposed' });
+    expect((await post(id, 'approve', raw)).statusCode).toBe(422);
   });
 });
 

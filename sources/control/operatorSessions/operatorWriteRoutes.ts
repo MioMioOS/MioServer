@@ -20,10 +20,13 @@
  *      not found OR cross-workroom both return 404, never revealing cross-workroom existence). This
  *      is the ROUTE-layer workroom enforcement; the #88 helper re-checks workroom INSIDE the tx too
  *      (two-layer, both no-leak 404).
- *   4. executeOperatorCommand (#88) — atomic mutation + audit, with CAS on status inside the tx.
- *      It owns the command checks: V1-gate (approve/retry → 422 COMMAND_NOT_IN_V1) BEFORE
- *      command-scope (403), plus status guard (409). We deliberately do NOT pre-check command scope
- *      in the route so approve/retry surface as 422 (not-in-V1) rather than 403.
+ *   4. command scope: session.allowedCommands.includes(command) → 403 if not granted. This runs
+ *      BEFORE the helper's V1-gate so an UNSCOPED session calling approve/retry gets a fail-closed
+ *      403 (command not in your scope) — NOT a 422 that would leak "this command exists but is
+ *      V1-gated". Only a session actually GRANTED approve/retry reaches the helper, where the V1-gate
+ *      then returns the accurate 422 COMMAND_NOT_IN_V1 ("authorized, but server doesn't support yet").
+ *   5. executeOperatorCommand (#88) — atomic mutation + audit, status CAS in-tx, V1-gate (422),
+ *      duplicate-idempotency (409), in-tx workroom re-check (404).
  */
 
 import type { FastifyInstance } from 'fastify';
@@ -69,7 +72,15 @@ export async function operatorWriteRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(404).send({ error: { code: 'ACTION_NOT_FOUND', message: 'Action not found' } });
       }
 
-      // 4. Atomic mutation + audit (#88). Helper owns command V1-gate (422)/scope (403), status CAS
+      // 4. Command scope (fail-closed) BEFORE the helper's V1-gate: an unscoped session calling
+      //    approve/retry gets 403 (command not granted), never the 422 that would leak the V1-gate.
+      //    Only a session granted the command proceeds — and the helper's V1-gate then 422s
+      //    approve/retry accurately ("authorized but not yet supported in V1").
+      if (!session.allowedCommands.includes(commandKey)) {
+        return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
+      }
+
+      // 5. Atomic mutation + audit (#88). Helper owns command V1-gate (422), status CAS
       //    (409), in-tx workroom re-check (404), and duplicate-idempotency (409).
       const result = await executeOperatorCommand({
         session: {
