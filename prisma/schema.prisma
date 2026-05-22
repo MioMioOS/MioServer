@@ -664,6 +664,31 @@ model ControlDevToken {
   @@map("control_dev_tokens")
 }
 
+/// ControlOperatorSession (#86) — scoped operator WRITE credential (`op_sess_` class).
+/// SEPARATE class from ControlDevToken: dev_ctl_ is read-only allowlist; op_sess_ authorizes
+/// limited operator writes. Root/owner-only CLI mint; raw token printed once, only hash stored.
+/// V1 default allowed commands: acknowledge_needs_human + mark_reviewed (NOT approve/retry).
+///
+/// NOTE: anti-replay signing-key material is intentionally NOT stored here — that is the #87
+/// decision (encrypted symmetric MAC key vs asymmetric public key). Conflating the bearer-auth
+/// hash with a MAC verification key is the exact gap flagged in the #80/#85 reviews. #87 adds the
+/// signing-key column once the model is chosen. This row is bearer-auth + scope + lifecycle only.
+model ControlOperatorSession {
+  id                String    @id @default(uuid()) @db.Uuid
+  tokenHash         String    @unique @map("token_hash") // sha256(op_sess_...), never raw
+  orgId             String    @map("org_id") @db.Uuid
+  workroomId        String    @map("workroom_id") @db.Uuid
+  allowedCommands   String[]  @map("allowed_commands") // controlled command keys; V1 default ack+mark_reviewed
+  operatorSubjectId String    @map("operator_subject_id") // opaque operator identity (resolvable only in restricted forensics)
+  issuedBy          String    @map("issued_by") // who minted (CLI admin/owner id)
+  createdAt         DateTime  @default(now()) @map("created_at")
+  expiresAt         DateTime  @map("expires_at")
+  revokedAt         DateTime? @map("revoked_at")
+
+  @@index([workroomId])
+  @@map("control_operator_sessions")
+}
+
 /// Atomic fire-gate: one approval → one irreversible_no_abort action. DB-level enforcement.
 /// Both columns have UNIQUE constraints. Fire transaction INSERTs here atomically.
 model ControlActionApprovalConsumption {
