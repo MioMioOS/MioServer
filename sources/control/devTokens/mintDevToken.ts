@@ -113,12 +113,20 @@ async function main(): Promise<void> {
   await db.$disconnect();
 }
 
-main().catch(async (err) => {
-  console.error('mint failed:', err);
-  try {
-    await db.$disconnect();
-  } catch {
-    /* ignore */
-  }
-  process.exit(1);
-});
+// CLI entry — run ONLY when invoked directly, NOT when imported (e.g. by connectionRoutes for
+// mintDevControlToken). Without this guard, importing the module ran main() → process.exit(1),
+// which crash-loops the server. (Caught by the #182 deploy dry-run.)
+const isDirectRun =
+  process.argv[1]?.endsWith('mintDevToken.ts') || process.argv[1]?.endsWith('mintDevToken.js');
+
+if (isDirectRun) {
+  main().catch(async (err) => {
+    console.error('mint failed:', err);
+    try {
+      await db.$disconnect();
+    } catch {
+      /* ignore */
+    }
+    process.exit(1);
+  });
+}
