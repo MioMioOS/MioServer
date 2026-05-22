@@ -89,10 +89,27 @@ const VALID_STATUSES_FOR_COMMAND: Readonly<Record<OperatorCommandKey, readonly s
 /** Statuses that are hard terminal — no further operator commands allowed. */
 const HARD_TERMINAL_STATUSES = new Set(['canceled', 'transmission_complete']);
 
+// ─── Internal typed error for propagating failures out of a $transaction ─────
+
+class OperatorCmdError extends Error {
+  constructor(public readonly result: Exclude<OperatorCommandResult, { ok: true }>) {
+    super(result.code);
+    this.name = 'OperatorCmdError';
+  }
+}
+
 // ─── Main helper ──────────────────────────────────────────────────────────────
 
 /**
  * Execute a V1 operator write command atomically.
+ *
+ * Security invariants (#88 Research blockers fixed):
+ *   - action.workroomId is verified against session.workroomId INSIDE the transaction
+ *     (fails as ACTION_NOT_FOUND — no workroom membership leak).
+ *   - action load + status check are INSIDE the transaction to prevent TOCTOU races:
+ *     a concurrent status change between a pre-flight read and the mutation can no longer
+ *     yield a mutation+audit commit with stale status.
+ *
  * Returns a typed result; callers map the result to HTTP status codes.
  */
 export async function executeOperatorCommand(input: OperatorCommandInput): Promise<OperatorCommandResult> {
@@ -110,31 +127,38 @@ export async function executeOperatorCommand(input: OperatorCommandInput): Promi
     return { ok: false, code: 'COMMAND_NOT_ALLOWED', httpStatus: 403 };
   }
 
-  // ── Guard 3: Load action ──
-  const action = await db.controlAction.findUnique({ where: { id: actionId } });
-  if (!action) {
-    return { ok: false, code: 'ACTION_NOT_FOUND', httpStatus: 404 };
-  }
-
-  // ── Guard 4: Status guard ──
-  const validStatuses = VALID_STATUSES_FOR_COMMAND[commandKey];
-  if (!validStatuses.includes(action.status)) {
-    if (HARD_TERMINAL_STATUSES.has(action.status)) {
-      return { ok: false, code: 'ACTION_TERMINAL', httpStatus: 409, currentStatus: action.status };
-    }
-    return { ok: false, code: 'ACTION_WRONG_STATUS', httpStatus: 409, currentStatus: action.status };
-  }
-
   const now = new Date();
+  const validStatuses = VALID_STATUSES_FOR_COMMAND[commandKey];
 
-  // ── Transaction: mutation + audit row ──
+  // ── Transaction: action load + workroom guard + status CAS + mutation + audit ──
   //
-  // INVARIANT: both writes succeed or both roll back.
-  //   - Mutation failure (e.g. concurrent update) → transaction rolls back → no orphan audit row.
-  //   - Audit P2002 (duplicate idempotency key) → transaction rolls back → mutation NOT applied.
+  // ALL action-state checks happen inside the transaction to prevent TOCTOU races.
+  // If any check fails, the transaction throws OperatorCmdError — both the mutation
+  // and the audit row are rolled back atomically (no orphan rows in either direction).
   try {
     await db.$transaction(async (tx) => {
-      // Step 1: State mutation on control_actions
+      // Step 1: Load action INSIDE the transaction (authoritative, race-safe)
+      const txAction = await tx.controlAction.findUnique({ where: { id: actionId } });
+      if (!txAction) {
+        throw new OperatorCmdError({ ok: false, code: 'ACTION_NOT_FOUND', httpStatus: 404 });
+      }
+
+      // Step 2: Workroom ownership guard (inside tx — fail-closed, no-leak: 404 not 403)
+      if (txAction.workroomId !== session.workroomId) {
+        throw new OperatorCmdError({ ok: false, code: 'ACTION_NOT_FOUND', httpStatus: 404 });
+      }
+
+      // Step 3: Status guard (inside tx — prevents TOCTOU on concurrent status mutation)
+      if (!validStatuses.includes(txAction.status)) {
+        const isTerminal = HARD_TERMINAL_STATUSES.has(txAction.status);
+        throw new OperatorCmdError(
+          isTerminal
+            ? { ok: false, code: 'ACTION_TERMINAL', httpStatus: 409, currentStatus: txAction.status }
+            : { ok: false, code: 'ACTION_WRONG_STATUS', httpStatus: 409, currentStatus: txAction.status },
+        );
+      }
+
+      // Step 4: State mutation on control_actions
       if (commandKey === 'acknowledge_needs_human') {
         await tx.controlAction.update({
           where: { id: actionId },
@@ -148,7 +172,7 @@ export async function executeOperatorCommand(input: OperatorCommandInput): Promi
       }
       // approve / retry: V2 — V1 gate above ensures we never reach here for those commands.
 
-      // Step 2: Audit row — same transaction
+      // Step 5: Audit row — same transaction as mutation
       // SECURITY: only controlled metadata. NEVER: raw token, secret, path, stack trace.
       await tx.controlOperatorAuditLog.create({
         data: {
@@ -165,6 +189,10 @@ export async function executeOperatorCommand(input: OperatorCommandInput): Promi
       });
     });
   } catch (err) {
+    // Propagate typed action-guard failures from inside the transaction
+    if (err instanceof OperatorCmdError) {
+      return err.result;
+    }
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
       // Unique violation on clientIdempotencyKey — duplicate submission rejected.
       // The mutation was NOT applied (transaction rolled back).

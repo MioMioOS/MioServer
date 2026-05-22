@@ -19,12 +19,13 @@ import { executeOperatorCommand, type VerifiedOperatorSession } from './operator
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
-const ORG_ID       = randomUUID();
-const WORKROOM_ID  = randomUUID();
-const SESSION_ID   = randomUUID();  // ControlSession (for actions)
-const AGENT_ID     = randomUUID();
-const MACHINE_ID   = randomUUID();
-const OP_SESS_ID   = randomUUID();  // operator session id (used in VerifiedOperatorSession)
+const ORG_ID           = randomUUID();
+const WORKROOM_ID      = randomUUID();
+const WORKROOM_ID_OTHER = randomUUID();  // different workroom — used to test cross-workroom rejection
+const SESSION_ID       = randomUUID();  // ControlSession (for actions)
+const AGENT_ID         = randomUUID();
+const MACHINE_ID       = randomUUID();
+const OP_SESS_ID       = randomUUID();  // operator session id (used in VerifiedOperatorSession)
 
 /** Pre-verified session passed to executeOperatorCommand (auth bypassed — tested in #96). */
 const SESSION_V1: VerifiedOperatorSession = {
@@ -34,14 +35,14 @@ const SESSION_V1: VerifiedOperatorSession = {
   allowedCommands: ['acknowledge_needs_human', 'mark_reviewed'],
 };
 
-/** Seed a ControlAction with the given status. */
-async function seedAction(status: string): Promise<string> {
+/** Seed a ControlAction with the given status (defaults to session's WORKROOM_ID). */
+async function seedAction(status: string, workroomId = WORKROOM_ID): Promise<string> {
   const id = randomUUID();
   await db.controlAction.create({
     data: {
       id,
       sessionId: SESSION_ID,
-      workroomId: WORKROOM_ID,
+      workroomId,
       actorAgentId: AGENT_ID,
       kind: 'deploy',
       summary: '#88 integration test action',
@@ -112,7 +113,8 @@ afterAll(async () => {
   // Delete in dependency order (audit logs reference actions)
   await db.controlOperatorAuditLog.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlEventLog.deleteMany({ where: { workroomId: WORKROOM_ID } });
-  await db.controlAction.deleteMany({ where: { workroomId: WORKROOM_ID } });
+  // Actions seeded in WORKROOM_ID_OTHER also need cleanup
+  await db.controlAction.deleteMany({ where: { workroomId: { in: [WORKROOM_ID, WORKROOM_ID_OTHER] } } });
   await db.controlSession.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlOperatorSession.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlWorkroom.deleteMany({ where: { id: WORKROOM_ID } });
@@ -245,6 +247,27 @@ describe('#88 executeOperatorCommand — real DB atomicity', () => {
 
     expect(result.ok).toBe(false);
     expect((result as { code: string }).code).toBe('ACTION_WRONG_STATUS');
+
+    // No mutation, no audit row
+    const action = await db.controlAction.findUnique({ where: { id: actionId } });
+    expect(action!.operatorAcknowledgedAt).toBeNull();
+    expect(await auditCount(actionId)).toBe(0);
+  });
+
+  it('action belonging to a different workroom is rejected as NOT_FOUND — no-leak, no DB writes', async () => {
+    // Seed action in a different workroom (WORKROOM_ID_OTHER ≠ session.workroomId)
+    const actionId = await seedAction('needs_human', WORKROOM_ID_OTHER);
+
+    const result = await executeOperatorCommand({
+      session: SESSION_V1,           // session.workroomId = WORKROOM_ID
+      actionId,
+      commandKey: 'acknowledge_needs_human',
+      clientIdempotencyKey: randomUUID(),
+    });
+
+    // Fail-closed no-leak: returns 404 not 403 (no workroom membership disclosure)
+    expect(result.ok).toBe(false);
+    expect((result as { code: string }).code).toBe('ACTION_NOT_FOUND');
 
     // No mutation, no audit row
     const action = await db.controlAction.findUnique({ where: { id: actionId } });
