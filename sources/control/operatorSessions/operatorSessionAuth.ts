@@ -19,7 +19,6 @@
 import type { FastifyRequest } from 'fastify';
 import { createHash } from 'crypto';
 import { db } from '@/storage/db';
-import { verifyMachineToken } from '@/machines/machineRoutes';
 import { OPERATOR_SESSION_TOKEN_PREFIX } from './operatorSessionMint.js';
 
 function hashToken(token: string): string {
@@ -109,7 +108,3 @@ export async function authorizeOperatorWrite(
   }
   return { ok: true, session };
 }
-
-// Referenced to keep the machine-token import meaningful for future dual-auth needs without
-// silently dropping it; operator writes are op_sess_-only in V1.
-void verifyMachineToken;
