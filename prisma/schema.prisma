@@ -728,6 +728,40 @@ model ControlOperatorPairing {
   @@map("control_operator_pairings")
 }
 
+/// ControlConnectionCredential (#179, Track 4) — the long-lived, refreshable ROOT credential for
+/// CodeLight's "bind once, stay connected" model. Replaces the manual dev_ctl_/op_sess_ user flow.
+///
+/// SECURITY MODEL (mirrors the rest of the system — only sha256 stored, raw returned once):
+///   - Minted at pairing redeem (extends #153). Raw `conn_...` returned exactly once → iOS Keychain.
+///   - This credential is NEVER sent on data requests; it is exchanged at POST /connections/access
+///     for SHORT-LIVED read/operator access tokens (existing dev_ctl_/op_sess_ classes, short TTL).
+///   - Long-lived (default 60d) + ROLLING: each refresh may rotate it (rotatedFromId lineage) so a
+///     leaked snapshot ages out.
+///   - revokedAt is the single kill switch: revoke → next /access exchange fails → all derived access
+///     dies within the access TTL (bounded exposure). Self-revoke (by the credential itself, phone
+///     "disconnect") AND machine_token revoke (Mac/daemon device management) are both allowed.
+///   - scopes carries what was granted at bind: ["read"] or ["read","operator"]. Operator access is
+///     only ever minted when "operator" ∈ scopes (no silent scope escalation).
+model ControlConnectionCredential {
+  id                 String    @id @default(uuid()) @db.Uuid // connection_id
+  credentialHash     String    @unique @map("credential_hash") // sha256(conn_...), never raw
+  orgId              String    @map("org_id") @db.Uuid
+  workroomId         String    @map("workroom_id") @db.Uuid
+  scopes             String[]  @map("scopes") // granted scopes: read, operator
+  operatorSubjectId  String?   @map("operator_subject_id") // opaque operator identity (set iff operator granted)
+  allowedCommands    String[]  @map("allowed_commands") // operator command keys to mint into operator access (V1: ack+mark_reviewed)
+  deviceLabel        String?   @map("device_label") // non-secret display label (e.g. "Laurent's iPhone")
+  createdByMachineId String?   @map("created_by_machine_id") @db.Uuid // Mac/daemon that authorized the bind
+  rotatedFromId      String?   @map("rotated_from_id") @db.Uuid // rolling-refresh lineage (previous credential id)
+  createdAt          DateTime  @default(now()) @map("created_at")
+  expiresAt          DateTime  @map("expires_at") // long-lived (default 60d)
+  lastRefreshAt      DateTime? @map("last_refresh_at")
+  revokedAt          DateTime? @map("revoked_at") // single kill switch
+
+  @@index([workroomId])
+  @@map("control_connection_credentials")
+}
+
 /// ControlOperatorAuditLog (#88) — immutable audit record for operator write commands.
 ///
 /// WRITTEN IN THE SAME Prisma $transaction as the state mutation on ControlAction.
