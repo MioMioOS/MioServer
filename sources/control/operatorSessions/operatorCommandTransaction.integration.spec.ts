@@ -12,7 +12,7 @@
  *   5. action in wrong status (proposed): guard fires before tx — no audit row
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { randomUUID } from 'crypto';
 import { db } from '@/storage/db';
 import { executeOperatorCommand, type VerifiedOperatorSession } from './operatorCommandTransaction.js';
@@ -251,6 +251,53 @@ describe('#88 executeOperatorCommand — real DB atomicity', () => {
     // No mutation, no audit row
     const action = await db.controlAction.findUnique({ where: { id: actionId } });
     expect(action!.operatorAcknowledgedAt).toBeNull();
+    expect(await auditCount(actionId)).toBe(0);
+  });
+
+  it('CAS count=0: no mutation and no audit row when concurrent status change races the write', async () => {
+    // Simulate a concurrent status change that lands between our Step 3 read and Step 4 write:
+    // spy on db.$transaction and wrap the tx proxy so controlAction.updateMany returns { count: 0 }.
+    // All other tx operations (findUnique, controlOperatorAuditLog.create) are real DB calls,
+    // so if the audit INSERT somehow ran despite count=0 it would be persisted and caught below.
+    const actionId = await seedAction('needs_human');
+
+    const realTransaction = (db.$transaction as any).bind(db);
+    vi.spyOn(db as any, '$transaction').mockImplementationOnce((...args: any[]) => {
+      const [fn] = args;
+      return realTransaction((tx: any) =>
+        fn(
+          new Proxy(tx, {
+            get(target: any, prop: string | symbol) {
+              if (prop !== 'controlAction') return Reflect.get(target, prop);
+              return new Proxy(Reflect.get(target, prop), {
+                get(delegate: any, method: string | symbol) {
+                  // Intercept updateMany only — simulate CAS returning 0 matched rows
+                  if (method === 'updateMany') return async () => ({ count: 0 });
+                  return Reflect.get(delegate, method);
+                },
+              });
+            },
+          }),
+        ),
+      );
+    });
+
+    const result = await executeOperatorCommand({
+      session: SESSION_V1,
+      actionId,
+      commandKey: 'acknowledge_needs_human',
+      clientIdempotencyKey: randomUUID(),
+    });
+
+    // CAS failure → ACTION_WRONG_STATUS (re-query sees needs_human → non-terminal)
+    expect(result.ok).toBe(false);
+    expect((result as { code: string }).code).toBe('ACTION_WRONG_STATUS');
+
+    // No mutation written (transaction rolled back by the OperatorCmdError throw)
+    const action = await db.controlAction.findUnique({ where: { id: actionId } });
+    expect(action!.operatorAcknowledgedAt).toBeNull();
+
+    // No audit row — CAS fail throws before the audit INSERT, so audit was never committed
     expect(await auditCount(actionId)).toBe(0);
   });
 

@@ -106,9 +106,11 @@ class OperatorCmdError extends Error {
  * Security invariants (#88 Research blockers fixed):
  *   - action.workroomId is verified against session.workroomId INSIDE the transaction
  *     (fails as ACTION_NOT_FOUND — no workroom membership leak).
- *   - action load + status check are INSIDE the transaction to prevent TOCTOU races:
- *     a concurrent status change between a pre-flight read and the mutation can no longer
- *     yield a mutation+audit commit with stale status.
+ *   - Mutation uses CAS (updateMany WHERE id + workroomId + status IN validStatuses):
+ *     a concurrent status change between the in-tx read and the write yields count=0 →
+ *     transaction aborts, no mutation committed, no audit row written.
+ *   - Pre-check (step 3) provides early terminal/wrong-status UX; CAS (step 4) is the
+ *     authoritative atomicity guard that closes the READ COMMITTED window.
  *
  * Returns a typed result; callers map the result to HTTP status codes.
  */
@@ -158,19 +160,38 @@ export async function executeOperatorCommand(input: OperatorCommandInput): Promi
         );
       }
 
-      // Step 4: State mutation on control_actions
+      // Step 4: CAS mutation — authoritative TOCTOU guard.
+      // updateMany WHERE includes status condition: if a concurrent transaction committed a
+      // status change between our Step 3 read and this write, count === 0 and we abort
+      // without writing the audit row (transaction throws → rolls back atomically).
+      let casCount = 0;
       if (commandKey === 'acknowledge_needs_human') {
-        await tx.controlAction.update({
-          where: { id: actionId },
+        const { count } = await tx.controlAction.updateMany({
+          where: { id: actionId, workroomId: session.workroomId, status: { in: [...validStatuses] } },
           data: { operatorAcknowledgedAt: now },
         });
+        casCount = count;
       } else if (commandKey === 'mark_reviewed') {
-        await tx.controlAction.update({
-          where: { id: actionId },
+        const { count } = await tx.controlAction.updateMany({
+          where: { id: actionId, workroomId: session.workroomId, status: { in: [...validStatuses] } },
           data: { operatorReviewedAt: now },
         });
+        casCount = count;
       }
       // approve / retry: V2 — V1 gate above ensures we never reach here for those commands.
+
+      if (casCount === 0) {
+        // CAS failed: a concurrent mutation changed the status after our Step 3 read.
+        // Re-query for the current committed status so the caller gets an accurate error.
+        // Under READ COMMITTED, this fresh read sees any commit that landed since step 3.
+        const reloaded = await tx.controlAction.findUnique({ where: { id: actionId } });
+        const currentStatus = reloaded?.status ?? txAction.status;
+        throw new OperatorCmdError(
+          HARD_TERMINAL_STATUSES.has(currentStatus)
+            ? { ok: false, code: 'ACTION_TERMINAL',    httpStatus: 409, currentStatus }
+            : { ok: false, code: 'ACTION_WRONG_STATUS', httpStatus: 409, currentStatus },
+        );
+      }
 
       // Step 5: Audit row — same transaction as mutation
       // SECURITY: only controlled metadata. NEVER: raw token, secret, path, stack trace.
