@@ -24,6 +24,7 @@ import { eventRoutes } from '@/control/events/eventRoutes';
 import { artifactRoutes } from '@/control/artifacts/artifactRoutes';
 import { summaryRoutes } from '@/control/workrooms/summaryRoutes';
 import { sessionRoutes as controlSessionRoutes } from '@/control/sessions/sessionRoutes';
+import { operatorWriteRoutes } from '@/control/operatorSessions/operatorWriteRoutes';
 import { provisionCredentialStore } from '@/control/credentials/provisionCredentialStore';
 import { config } from '@/config';
 
@@ -69,6 +70,7 @@ export async function startApi() {
     await app.register(workroomRoutes);
     await app.register(taskRoutes);
     await app.register(actionRoutes, { credentialStore });
+    await app.register(operatorWriteRoutes);
     await app.register(eventRoutes);
     await app.register(artifactRoutes);
     await app.register(summaryRoutes);
