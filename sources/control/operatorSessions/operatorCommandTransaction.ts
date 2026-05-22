@@ -146,12 +146,6 @@ export async function executeOperatorCommand(input: OperatorCommandInput): Promi
       }
 
       // Step 2: Workroom ownership guard (inside tx — fail-closed, no-leak: 404 not 403)
-      // DEBUG: log actual values to diagnose cross-workroom test failure (#88 test 7)
-      if (process.env.DEBUG_OPERATOR_TX) {
-        console.warn(
-          `[operatorCommandTransaction] step2 workroom check: txAction.workroomId=${txAction.workroomId} session.workroomId=${session.workroomId} match=${txAction.workroomId === session.workroomId}`,
-        );
-      }
       if (txAction.workroomId !== session.workroomId) {
         throw new OperatorCmdError({ ok: false, code: 'ACTION_NOT_FOUND', httpStatus: 404 });
       }

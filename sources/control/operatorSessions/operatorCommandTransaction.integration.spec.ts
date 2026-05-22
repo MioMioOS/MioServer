@@ -264,56 +264,68 @@ describe('#88 executeOperatorCommand — real DB atomicity', () => {
     // spy on db.$transaction and wrap the tx proxy so controlAction.updateMany returns { count: 0 }.
     // All other tx operations (findUnique, controlOperatorAuditLog.create) are real DB calls,
     // so if the audit INSERT somehow ran despite count=0 it would be persisted and caught below.
+    //
+    // ISOLATION NOTE: In Vitest 3.2, a vi.spyOn-based mockImplementationOnce on db.$transaction
+    // does NOT fall through to the original after the one-time mock is consumed — subsequent calls
+    // silently skip the callback (returns resolved promise without calling fn). We capture the real
+    // $transaction BEFORE installing the spy and restore it manually in a finally block so no spy
+    // state leaks into subsequent tests. Do NOT use vi.restoreAllMocks() — it sets db.$transaction
+    // to undefined on Prisma's own-property client instance.
+    const originalTransaction = (db as any).$transaction.bind(db);
     const actionId = await seedAction('needs_human');
 
-    const realTransaction = (db.$transaction as any).bind(db);
-    vi.spyOn(db as any, '$transaction').mockImplementationOnce((...args: any[]) => {
-      const [fn] = args;
-      return realTransaction((tx: any) =>
-        fn(
-          new Proxy(tx, {
-            get(target: any, prop: string | symbol) {
-              if (prop !== 'controlAction') return Reflect.get(target, prop);
-              return new Proxy(Reflect.get(target, prop), {
-                get(delegate: any, method: string | symbol) {
-                  // Intercept updateMany only — simulate CAS returning 0 matched rows
-                  if (method === 'updateMany') return async () => ({ count: 0 });
-                  return Reflect.get(delegate, method);
-                },
-              });
-            },
-          }),
-        ),
-      );
-    });
+    try {
+      vi.spyOn(db as any, '$transaction').mockImplementationOnce((...args: any[]) => {
+        const [fn] = args;
+        return originalTransaction((tx: any) =>
+          fn(
+            new Proxy(tx, {
+              get(target: any, prop: string | symbol) {
+                if (prop !== 'controlAction') return Reflect.get(target, prop);
+                return new Proxy(Reflect.get(target, prop), {
+                  get(delegate: any, method: string | symbol) {
+                    // Intercept updateMany only — simulate CAS returning 0 matched rows
+                    if (method === 'updateMany') return async () => ({ count: 0 });
+                    return Reflect.get(delegate, method);
+                  },
+                });
+              },
+            }),
+          ),
+        );
+      });
 
-    const result = await executeOperatorCommand({
-      session: SESSION_V1,
-      actionId,
-      commandKey: 'acknowledge_needs_human',
-      clientIdempotencyKey: randomUUID(),
-    });
+      const result = await executeOperatorCommand({
+        session: SESSION_V1,
+        actionId,
+        commandKey: 'acknowledge_needs_human',
+        clientIdempotencyKey: randomUUID(),
+      });
 
-    // CAS failure → ACTION_WRONG_STATUS (re-query sees needs_human → non-terminal)
-    expect(result.ok).toBe(false);
-    expect((result as { code: string }).code).toBe('ACTION_WRONG_STATUS');
+      // CAS failure → ACTION_WRONG_STATUS (re-query sees needs_human → non-terminal)
+      expect(result.ok).toBe(false);
+      expect((result as { code: string }).code).toBe('ACTION_WRONG_STATUS');
 
-    // No mutation written (transaction rolled back by the OperatorCmdError throw)
-    const action = await db.controlAction.findUnique({ where: { id: actionId } });
-    expect(action!.operatorAcknowledgedAt).toBeNull();
+      // No mutation written (transaction rolled back by the OperatorCmdError throw)
+      const action = await db.controlAction.findUnique({ where: { id: actionId } });
+      expect(action!.operatorAcknowledgedAt).toBeNull();
 
-    // No audit row — CAS fail throws before the audit INSERT, so audit was never committed
-    expect(await auditCount(actionId)).toBe(0);
+      // No audit row — CAS fail throws before the audit INSERT, so audit was never committed
+      expect(await auditCount(actionId)).toBe(0);
+    } finally {
+      // Always restore db.$transaction after this test — vi.spyOn's exhausted mock silently
+      // swallows subsequent calls, causing false-positive results in test 7 (cross-workroom guard).
+      (db as any).$transaction = originalTransaction;
+    }
   });
 
   it('action belonging to a different workroom is rejected as NOT_FOUND — no-leak, no DB writes', async () => {
     // Seed action in a different workroom (WORKROOM_ID_OTHER ≠ session.workroomId)
     const actionId = await seedAction('needs_human', WORKROOM_ID_OTHER);
 
-    // DEBUG: verify seeded workroomId matches what we expect (helps diagnose test 7 failure)
+    // Verify the seed is correct — action must be in the other workroom for this test to be meaningful.
     const seeded = await db.controlAction.findUnique({ where: { id: actionId }, select: { workroomId: true } });
-    console.warn(`[test7-debug] WORKROOM_ID=${WORKROOM_ID} WORKROOM_ID_OTHER=${WORKROOM_ID_OTHER} seeded.workroomId=${seeded?.workroomId} session.workroomId=${SESSION_V1.workroomId}`);
-    expect(seeded!.workroomId).toBe(WORKROOM_ID_OTHER); // assert the seed is correct
+    expect(seeded!.workroomId).toBe(WORKROOM_ID_OTHER);
 
     const result = await executeOperatorCommand({
       session: SESSION_V1,           // session.workroomId = WORKROOM_ID
