@@ -1,0 +1,207 @@
+/**
+ * #88 Operator Write — Command Transaction Helper
+ *
+ * Executes an operator write command as a single atomic DB transaction:
+ *   1. State mutation on control_actions (operatorAcknowledgedAt / operatorReviewedAt)
+ *   2. INSERT to control_operator_audit_logs
+ *
+ * If either step fails the whole transaction rolls back — no orphan mutations,
+ * no orphan audit rows.
+ *
+ * AUTH: accepts a VerifiedOperatorSession (output of verifyOperatorSession from #96).
+ * This module does NOT perform bearer-token verification — that is #96's responsibility.
+ * Decoupling ensures #88 can be tested and reviewed independently of auth complexity.
+ *
+ * V1 commands: acknowledge_needs_human, mark_reviewed
+ * V2 commands: approve, retry (rejected until #97 write endpoints are ready)
+ *
+ * Security invariants (no-leak):
+ *   - Audit row only contains controlled enums + opaque IDs.
+ *   - NEVER written to audit row: raw token, secret, storage_ref, evidence bytes, stack traces.
+ *   - clientIdempotencyKey UNIQUE constraint is the backstop against duplicate submission.
+ *   - dev_ctl_ tokens MUST NOT reach this helper — enforced by the calling route (#97).
+ */
+
+import { db } from '@/storage/db';
+import { Prisma } from '@prisma/client';
+import { randomUUID } from 'crypto';
+import { publishControlEvent } from '@/control/events/publishControlEvent';
+import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+/**
+ * An already-verified operator session context.
+ * Produced by verifyOperatorSession() (#96) — NOT produced here.
+ * Passing pre-verified session decouples this module from the auth layer.
+ */
+export interface VerifiedOperatorSession {
+  sessionId: string;
+  workroomId: string;
+  operatorSubjectId: string;
+  allowedCommands: string[];
+}
+
+/** All operator command keys (V1 + V2 declared together for forward-compatibility). */
+export type OperatorCommandKey = 'acknowledge_needs_human' | 'mark_reviewed' | 'approve' | 'retry';
+
+export interface OperatorCommandInput {
+  session: VerifiedOperatorSession;
+  actionId: string;
+  commandKey: OperatorCommandKey;
+  /**
+   * Caller-supplied UUID — prevents double-submission.
+   * UNIQUE constraint on control_operator_audit_logs.client_idempotency_key is the
+   * DB-level backstop if concurrent requests race past the application check.
+   */
+  clientIdempotencyKey: string;
+}
+
+export type OperatorCommandResult =
+  | { ok: true }
+  | { ok: false; code: 'COMMAND_NOT_IN_V1'; httpStatus: 422 }
+  | { ok: false; code: 'COMMAND_NOT_ALLOWED'; httpStatus: 403 }
+  | { ok: false; code: 'ACTION_NOT_FOUND'; httpStatus: 404 }
+  | { ok: false; code: 'ACTION_TERMINAL'; httpStatus: 409; currentStatus: string }
+  | { ok: false; code: 'ACTION_WRONG_STATUS'; httpStatus: 409; currentStatus: string }
+  | { ok: false; code: 'DUPLICATE_IDEMPOTENCY_KEY'; httpStatus: 409 };
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+/**
+ * V1 allow-list. approve/retry are V2 — mirroring the ControlOperatorSession default
+ * in #86 (acknowledge_needs_human + mark_reviewed only).
+ */
+const V1_COMMANDS: ReadonlySet<string> = new Set(['acknowledge_needs_human', 'mark_reviewed']);
+
+/**
+ * Valid action statuses for each command.
+ * acknowledge_needs_human: action must be in needs_human state.
+ * mark_reviewed: operator can review regardless of outcome (needs_human | succeeded | failed).
+ */
+const VALID_STATUSES_FOR_COMMAND: Readonly<Record<OperatorCommandKey, readonly string[]>> = {
+  acknowledge_needs_human: ['needs_human'],
+  mark_reviewed:           ['needs_human', 'succeeded', 'failed'],
+  approve:                 ['proposed'],                     // V2 — not reachable in V1
+  retry:                   ['needs_human', 'failed'],        // V2 — not reachable in V1
+};
+
+/** Statuses that are hard terminal — no further operator commands allowed. */
+const HARD_TERMINAL_STATUSES = new Set(['canceled', 'transmission_complete']);
+
+// ─── Main helper ──────────────────────────────────────────────────────────────
+
+/**
+ * Execute a V1 operator write command atomically.
+ * Returns a typed result; callers map the result to HTTP status codes.
+ */
+export async function executeOperatorCommand(input: OperatorCommandInput): Promise<OperatorCommandResult> {
+  const { session, actionId, commandKey, clientIdempotencyKey } = input;
+
+  // ── Guard 1: V1 gate ──
+  // approve/retry are V2 and should not reach here until #97 implements their mutations.
+  if (!V1_COMMANDS.has(commandKey)) {
+    return { ok: false, code: 'COMMAND_NOT_IN_V1', httpStatus: 422 };
+  }
+
+  // ── Guard 2: Session command scope ──
+  // session.allowedCommands is set at mint time and validated by verifyOperatorSession (#96).
+  if (!session.allowedCommands.includes(commandKey)) {
+    return { ok: false, code: 'COMMAND_NOT_ALLOWED', httpStatus: 403 };
+  }
+
+  // ── Guard 3: Load action ──
+  const action = await db.controlAction.findUnique({ where: { id: actionId } });
+  if (!action) {
+    return { ok: false, code: 'ACTION_NOT_FOUND', httpStatus: 404 };
+  }
+
+  // ── Guard 4: Status guard ──
+  const validStatuses = VALID_STATUSES_FOR_COMMAND[commandKey];
+  if (!validStatuses.includes(action.status)) {
+    if (HARD_TERMINAL_STATUSES.has(action.status)) {
+      return { ok: false, code: 'ACTION_TERMINAL', httpStatus: 409, currentStatus: action.status };
+    }
+    return { ok: false, code: 'ACTION_WRONG_STATUS', httpStatus: 409, currentStatus: action.status };
+  }
+
+  const now = new Date();
+
+  // ── Transaction: mutation + audit row ──
+  //
+  // INVARIANT: both writes succeed or both roll back.
+  //   - Mutation failure (e.g. concurrent update) → transaction rolls back → no orphan audit row.
+  //   - Audit P2002 (duplicate idempotency key) → transaction rolls back → mutation NOT applied.
+  try {
+    await db.$transaction(async (tx) => {
+      // Step 1: State mutation on control_actions
+      if (commandKey === 'acknowledge_needs_human') {
+        await tx.controlAction.update({
+          where: { id: actionId },
+          data: { operatorAcknowledgedAt: now },
+        });
+      } else if (commandKey === 'mark_reviewed') {
+        await tx.controlAction.update({
+          where: { id: actionId },
+          data: { operatorReviewedAt: now },
+        });
+      }
+      // approve / retry: V2 — V1 gate above ensures we never reach here for those commands.
+
+      // Step 2: Audit row — same transaction
+      // SECURITY: only controlled metadata. NEVER: raw token, secret, path, stack trace.
+      await tx.controlOperatorAuditLog.create({
+        data: {
+          id: randomUUID(),
+          sessionId: session.sessionId,
+          workroomId: session.workroomId,
+          actionId,
+          commandKey,
+          operatorSubjectId: session.operatorSubjectId,
+          outcome: 'succeeded',
+          clientIdempotencyKey,
+          decidedAt: now,
+        },
+      });
+    });
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+      // Unique violation on clientIdempotencyKey — duplicate submission rejected.
+      // The mutation was NOT applied (transaction rolled back).
+      return { ok: false, code: 'DUPLICATE_IDEMPOTENCY_KEY', httpStatus: 409 };
+    }
+    throw err;
+  }
+
+  // ── Post-transaction: emit event (write-before-broadcast) ──
+  // Topic: action.operator_acknowledged | action.operator_reviewed
+  // Payload: locator IDs + command enum + decided_at only. No free text, no operator identity.
+  const topic = commandKey === 'acknowledge_needs_human'
+    ? 'action.operator_acknowledged'
+    : 'action.operator_reviewed';
+
+  await publishControlEvent({
+    workroomId: session.workroomId,
+    eventId: randomUUID(),
+    topic,
+    payload: {
+      workroom_id: session.workroomId,
+      action_id: actionId,
+      command_key: commandKey,          // controlled enum
+      decided_at: now.toISOString(),
+    },
+  }).then((event) => {
+    if (!event.idempotent) {
+      workroomBroadcaster.broadcast(session.workroomId, {
+        event_id: event.eventId,
+        workroom_id: event.workroomId,
+        seq: event.seq.toString(),
+        topic: event.topic,
+        payload: event.payloadJson as Record<string, unknown>,
+        created_at: event.createdAt.toISOString(),
+      });
+    }
+  }).catch(() => { /* broadcast failure is non-fatal; client catches up via GET /events */ });
+
+  return { ok: true };
+}

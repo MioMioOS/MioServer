@@ -561,12 +561,17 @@ model ControlAction {
   updatedAt               DateTime        @updatedAt @map("updated_at")
   firedAt                 DateTime?       @map("fired_at")
 
+  // #88: operator write state — set atomically with audit row in ControlOperatorAuditLog
+  operatorAcknowledgedAt DateTime? @map("operator_acknowledged_at")
+  operatorReviewedAt     DateTime? @map("operator_reviewed_at")
+
   approvalConsumption  ControlActionApprovalConsumption?
   actionToken          ControlActionToken?
   reconciliations      ControlActionReconciliation[]
   artifacts            ControlArtifact[]
   approvals            ControlApproval[]
   credentialAccessLogs ControlCredentialAccessLog[]
+  operatorAuditLogs    ControlOperatorAuditLog[]
 
   @@index([workroomId, status])
   @@index([sessionId])
@@ -687,6 +692,36 @@ model ControlOperatorSession {
 
   @@index([workroomId])
   @@map("control_operator_sessions")
+}
+
+/// ControlOperatorAuditLog (#88) — immutable audit record for operator write commands.
+///
+/// WRITTEN IN THE SAME Prisma $transaction as the state mutation on ControlAction.
+/// Transaction failure rolls back BOTH mutation AND audit row — no orphan rows.
+///
+/// SECURITY (no-leak):
+///   - Never contains: raw token, secret, storage_ref, raw evidence, stack traces, paths.
+///   - Only controlled metadata: command enum + action/session/workroom IDs + opaque operator ID + outcome enum.
+///   - clientIdempotencyKey UNIQUE constraint is the backstop against double-submission.
+///
+/// V1 commands: acknowledge_needs_human, mark_reviewed
+/// V2 commands: approve, retry (added when #97 write endpoints are ready)
+model ControlOperatorAuditLog {
+  id                   String   @id @default(uuid()) @db.Uuid
+  sessionId            String   @map("session_id") @db.Uuid     // ControlOperatorSession.id (no Prisma FK — consistent with rest of system)
+  workroomId           String   @map("workroom_id") @db.Uuid
+  actionId             String?  @map("action_id") @db.Uuid      // nullable for future session-level commands
+  commandKey           String   @map("command_key")              // acknowledge_needs_human | mark_reviewed | approve | retry
+  operatorSubjectId    String   @map("operator_subject_id")     // opaque — copied from session; never raw token
+  outcome              String   @map("outcome")                  // succeeded | rejected_*
+  clientIdempotencyKey String   @unique @map("client_idempotency_key")
+  decidedAt            DateTime @default(now()) @map("decided_at")
+
+  action ControlAction? @relation(fields: [actionId], references: [id])
+
+  @@index([actionId])
+  @@index([sessionId])
+  @@map("control_operator_audit_logs")
 }
 
 /// Atomic fire-gate: one approval → one irreversible_no_abort action. DB-level enforcement.
