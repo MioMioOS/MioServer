@@ -25,7 +25,7 @@ import { db } from '@/storage/db';
 export const OPERATOR_SESSION_TOKEN_PREFIX = 'op_sess_';
 
 /** Commands an operator_session may be granted in V1. approve/retry are intentionally excluded. */
-export const V1_OPERATOR_COMMANDS = ['acknowledge_needs_human', 'mark_reviewed'] as const;
+export const V1_OPERATOR_COMMANDS = ['acknowledge_needs_human', 'mark_reviewed', 'send_message'] as const;
 export type V1OperatorCommand = (typeof V1_OPERATOR_COMMANDS)[number];
 
 /** Default TTL (hours) for a freshly minted operator_session, and the hard cap. */

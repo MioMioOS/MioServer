@@ -1,7 +1,7 @@
 /**
- * Message API — control plane (S1 Chunk 3, READ-ONLY)
+ * Message API — control plane (S1 Chunks 3 + 4)
  *
- * Endpoints (read; write is Chunk 4):
+ * Endpoints:
  *   GET /api/v1/workrooms/:wid/channels/:cid/messages?after_seq=<n>&limit=<=100
  *     Returns seq-ascending page of messages in a channel.
  *     Private channel non-member → 404 (uniform, anti-enumeration).
@@ -10,21 +10,29 @@
  *     Returns a single message by id (for thread parent / deep links).
  *     Private channel non-member → 404 (uniform, anti-enumeration).
  *
- * Auth: dual-read via authorizeControlRead (machine_token OR dev_control_token).
- *       machine mode: also enforces org/workroom access via requireMachineAccessToWorkroom.
- *       dev mode: authorizeControlRead already enforced allowlist + workroom scope.
+ *   POST /api/v1/workrooms/:wid/channels/:cid/messages  (Chunk 4)
+ *     Send a message. Auth: op_sess_ (command 'send_message') OR machine_token.
+ *     dev_ctl_ → 403 hard reject.
+ *     op_sess_ path: client_idempotency_key required (missing → 400).
+ *     machine path: client_idempotency_key optional (null → no unique collision per spec §4.3).
+ *     private non-member → 403.
+ *     Post-commit: publishAndBroadcast(message.created) with redacted+truncated preview.
  *
- * Pagination: after_seq is an EXCLUSIVE lower bound (seq > after_seq). Absent → most recent limit rows.
- * limit: capped at MAX_PAGE_SIZE (100). Default MAX_PAGE_SIZE.
- *
- * Spec: §4.2 (list) + §4.4 (single).
+ * Spec: §4.2 (list) + §4.3 (send) + §4.4 (single).
  */
 
 import { FastifyInstance } from 'fastify';
+import { randomUUID } from 'crypto';
 import { db } from '@/storage/db';
 import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { visibleChannels } from '@/control/channels/channelVisibility';
+import { authorizeOperatorWrite } from '@/control/operatorSessions/operatorSessionAuth';
+import { verifyMachineToken } from '@/machines/machineRoutes';
+import { sendMessageTransaction } from './sendMessageTransaction';
+import { publishControlEvent } from '@/control/events/publishControlEvent';
+import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
+import { redactControlText } from '@/control/redaction/redactControlText';
 
 const MAX_PAGE_SIZE = 100;
 
@@ -243,4 +251,226 @@ export async function messageRoutes(app: FastifyInstance) {
       channel_id: msg.channelId,
     };
   });
+
+  /**
+   * POST /api/v1/workrooms/:wid/channels/:cid/messages  (S1 Chunk 4)
+   *
+   * Send a message to a channel.
+   *
+   * Auth:
+   *   1. op_sess_ (command 'send_message', workroomId-scoped) via authorizeOperatorWrite.
+   *   2. machine_token via verifyMachineToken + requireMachineAccessToWorkroom.
+   *   dev_ctl_ → hard 403 (defense-in-depth; authorizeOperatorWrite rejects it first, but we
+   *   also catch it on the machine path because dev_ctl_ does not pass verifyMachineToken).
+   *
+   * Idempotency:
+   *   op_sess_ path: client_idempotency_key REQUIRED (absent → 400).
+   *   machine path: client_idempotency_key optional (null → no collision; two machine sends →
+   *     two distinct messages, as intended per spec §4.3 / schema @@unique behaviour for NULLs).
+   *
+   * Membership:
+   *   private/dm non-member send → 403.
+   *
+   * Post-commit broadcast:
+   *   publishAndBroadcast('message.created') with preview = redactControlText(content).slice(0,120).
+   *   Broadcast failure is non-fatal (client catches up via GET).
+   */
+  app.post('/api/v1/workrooms/:wid/channels/:cid/messages', async (request, reply) => {
+    const { wid, cid } = request.params as { wid: string; cid: string };
+
+    // ── Auth: try op_sess_ first, then machine_token. dev_ctl_ rejected by both. ──
+    let senderKind: string;
+    let senderId: string;
+
+    const authHeader = request.headers.authorization;
+
+    // Defense-in-depth: explicitly 403 dev_ctl_ before trying either auth path.
+    // (authorizeOperatorWrite also hard-rejects dev_ctl_, but we check here too so the
+    // machine fallback cannot inadvertently accept a dev token in some edge case.)
+    const rawToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (rawToken.startsWith('dev_ctl_')) {
+      return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
+    }
+
+    // Path 1: op_sess_ (operator / human)
+    const opAuth = await authorizeOperatorWrite(request, { command: 'send_message', workroomId: wid });
+
+    if (opAuth.ok) {
+      // op_sess_ path: client_idempotency_key is REQUIRED.
+      const body = request.body as {
+        content?: unknown;
+        mentions?: unknown;
+        embedded_card_type?: unknown;
+        embedded_card_id?: unknown;
+        client_idempotency_key?: unknown;
+      } | null;
+
+      if (!body?.client_idempotency_key || typeof body.client_idempotency_key !== 'string') {
+        return reply.code(400).send({
+          error: { code: 'MISSING_IDEMPOTENCY_KEY', message: 'client_idempotency_key is required for operator sends' },
+        });
+      }
+
+      if (!body.content || typeof body.content !== 'string') {
+        return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'content is required' } });
+      }
+
+      senderKind = 'user';
+      senderId = opAuth.session.operatorSubjectId;
+
+      const result = await sendMessageTransaction({
+        channelId: cid,
+        workroomId: wid,
+        senderKind,
+        senderId,
+        content: body.content,
+        mentions: Array.isArray(body.mentions) ? (body.mentions as string[]) : [],
+        embeddedCardType: typeof body.embedded_card_type === 'string' ? body.embedded_card_type : null,
+        embeddedCardId: typeof body.embedded_card_id === 'string' ? body.embedded_card_id : null,
+        clientIdempotencyKey: body.client_idempotency_key,
+      });
+
+      if (!result.ok) {
+        if (result.code === 'CHANNEL_NOT_FOUND') {
+          return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+        }
+        if (result.code === 'CHANNEL_FORBIDDEN') {
+          return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
+        }
+        return reply.code(500).send({ error: { code: 'INTERNAL_ERROR', message: 'Internal error' } });
+      }
+
+      // Post-commit write-before-broadcast:
+      //   1. publishControlEvent writes the event row to DB (awaited — guarantees event exists before response).
+      //   2. WS broadcast is fire-and-forget (non-fatal; client catches up via GET /events).
+      await writeEventAndBroadcast(result);
+
+      return reply.code(201).send({
+        id: result.id,
+        seq: result.seq.toString(),
+        created_at: result.created_at.toISOString(),
+        idempotent: result.idempotent,
+      });
+    }
+
+    // op_sess_ returned 401 (not an op_sess_ token) — fall through to machine path.
+    // op_sess_ returned 403 (wrong workroom / command) — hard reject.
+    if (opAuth.status === 403) {
+      return reply.code(403).send({ error: { code: opAuth.code, message: opAuth.message } });
+    }
+
+    // Path 2: machine_token
+    const machine = await verifyMachineToken(authHeader);
+    if (!machine) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
+    }
+
+    const access = await requireMachineAccessToWorkroom(machine, wid);
+    if (!access.ok) {
+      return reply.code(access.status).send({ error: access.error });
+    }
+
+    // machine path: parse body (client_idempotency_key is optional → null if absent)
+    const machineBody = request.body as {
+      content?: unknown;
+      mentions?: unknown;
+      embedded_card_type?: unknown;
+      embedded_card_id?: unknown;
+      client_idempotency_key?: unknown;
+    } | null;
+
+    if (!machineBody?.content || typeof machineBody.content !== 'string') {
+      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'content is required' } });
+    }
+
+    senderKind = 'agent';
+    senderId = machine.id;
+
+    const machineResult = await sendMessageTransaction({
+      channelId: cid,
+      workroomId: wid,
+      senderKind,
+      senderId,
+      content: machineBody.content,
+      mentions: Array.isArray(machineBody.mentions) ? (machineBody.mentions as string[]) : [],
+      embeddedCardType: typeof machineBody.embedded_card_type === 'string' ? machineBody.embedded_card_type : null,
+      embeddedCardId: typeof machineBody.embedded_card_id === 'string' ? machineBody.embedded_card_id : null,
+      clientIdempotencyKey: typeof machineBody.client_idempotency_key === 'string'
+        ? machineBody.client_idempotency_key
+        : null,
+    });
+
+    if (!machineResult.ok) {
+      if (machineResult.code === 'CHANNEL_NOT_FOUND') {
+        return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+      }
+      if (machineResult.code === 'CHANNEL_FORBIDDEN') {
+        return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
+      }
+      return reply.code(500).send({ error: { code: 'INTERNAL_ERROR', message: 'Internal error' } });
+    }
+
+    // Post-commit write-before-broadcast (same as op_sess_ path above).
+    await writeEventAndBroadcast(machineResult);
+
+    return reply.code(201).send({
+      id: machineResult.id,
+      seq: machineResult.seq.toString(),
+      created_at: machineResult.created_at.toISOString(),
+      idempotent: machineResult.idempotent,
+    });
+  });
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Write-before-broadcast for message.created.
+ *
+ * Step 1 (awaited by route): publishControlEvent persists the event row to DB.
+ *   This guarantees the event exists BEFORE the HTTP 201 response is returned,
+ *   satisfying the write-before-broadcast contract (spec §5, same as actionRoutes.ts:74).
+ * Step 2 (fire-and-forget): WS broadcast to subscribers. Non-fatal; clients catch up via GET.
+ *
+ * SECURITY: preview = redactControlText(content) truncated ≤120 chars (spec §5).
+ * No tokens, paths, or credentials appear in the WS payload.
+ */
+async function writeEventAndBroadcast(msg: {
+  id: string;
+  seq: bigint;
+  created_at: Date;
+  workroomId: string;
+  channelId: string;
+  senderKind: string;
+  senderId: string;
+  content: string;
+}): Promise<void> {
+  const preview = redactControlText(msg.content).slice(0, 120);
+
+  // Step 1: write event to DB (awaited — guarantees persistence before route returns 201).
+  const event = await publishControlEvent({
+    workroomId: msg.workroomId,
+    eventId: randomUUID(),
+    topic: 'message.created',
+    payload: {
+      channel_id: msg.channelId,
+      message_id: msg.id,
+      seq: msg.seq.toString(),
+      sender_kind: msg.senderKind,
+      sender_id: msg.senderId,
+      preview,
+    },
+  });
+
+  // Step 2: WS broadcast (fire-and-forget; non-fatal).
+  if (!event.idempotent) {
+    workroomBroadcaster.broadcast(msg.workroomId, {
+      event_id: event.eventId,
+      workroom_id: event.workroomId,
+      seq: event.seq.toString(),
+      topic: event.topic,
+      payload: event.payloadJson as Record<string, unknown>,
+      created_at: event.createdAt.toISOString(),
+    });
+  }
 }

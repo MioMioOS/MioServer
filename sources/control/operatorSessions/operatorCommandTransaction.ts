@@ -43,7 +43,7 @@ export interface VerifiedOperatorSession {
 }
 
 /** All operator command keys (V1 + V2 declared together for forward-compatibility). */
-export type OperatorCommandKey = 'acknowledge_needs_human' | 'mark_reviewed' | 'approve' | 'retry';
+export type OperatorCommandKey = 'acknowledge_needs_human' | 'mark_reviewed' | 'send_message' | 'approve' | 'retry';
 
 export interface OperatorCommandInput {
   session: VerifiedOperatorSession;
@@ -82,6 +82,7 @@ const V1_COMMANDS: ReadonlySet<string> = new Set(['acknowledge_needs_human', 'ma
 const VALID_STATUSES_FOR_COMMAND: Readonly<Record<OperatorCommandKey, readonly string[]>> = {
   acknowledge_needs_human: ['needs_human'],
   mark_reviewed:           ['needs_human', 'succeeded', 'failed'],
+  send_message:            [],  // does not mutate action state; never reaches executeOperatorCommand
   approve:                 ['proposed'],                     // V2 — not reachable in V1
   retry:                   ['needs_human', 'failed'],        // V2 — not reachable in V1
 };

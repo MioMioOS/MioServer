@@ -51,7 +51,7 @@ describe('#96 verifyOperatorSession — real DB', () => {
     expect(ctx!.workroomId).toBe(WORKROOM_ID);
     expect(ctx!.orgId).toBe(ORG_ID);
     expect(ctx!.operatorSubjectId).toBe(SUBJECT);
-    expect(ctx!.allowedCommands).toEqual(['acknowledge_needs_human', 'mark_reviewed']);
+    expect(ctx!.allowedCommands).toEqual(['acknowledge_needs_human', 'mark_reviewed', 'send_message']);
   });
 
   it('dev_ctl_ token → null (read-only token can never write)', async () => {
