@@ -70,7 +70,7 @@ async function provision(ttlHours: number): Promise<void> {
   // status = in_review (NOT in_progress): PM-ratified first-look bridge for the CURRENT task-status
   // proxy (attention=in_review) so a needs_human task lands in Attention before #186's action-driven
   // bucketing client lands. Defensible — a needs_human task is genuinely awaiting human decision.
-  // Once #186 (Aaron filters on attention_reasons) ships, this can revert to in_progress.
+  // Once #186 (Aaron filters on attention_reason) ships, this can revert to in_progress.
   const taskA = await db.controlTask.create({
     data: { id: randomUUID(), workroomId: WORKROOM_ID, title: `${DEMO_TITLE_PREFIX}发布 CodeLight 到 TestFlight`, description: '把当前 build 上传到 TestFlight 并等待人工确认是否分发。', status: 'in_review', ownerInstanceId: agentId },
   });

@@ -3,7 +3,7 @@
  * Run: npm run test:db:setup && npm run test:integration
  *
  * Pins the action-driven bucketing contract the attention-first Home depends on:
- *   - a task with a needs_human action  -> attention_reasons:['needs_human'], pending_attention_count≥1
+ *   - a task with a needs_human action  -> attention_reason:['needs_human'], pending_attention_count≥1
  *   - a task with only in-flight (non-terminal, non-needs_human) actions -> Active (no attention, pending_action_count>0)
  *   - a task with only terminal actions / no actions -> Recent (empty/0)
  *   - dedupe: multiple needs_human actions -> one 'needs_human' reason, count = N
@@ -49,7 +49,7 @@ async function listTasks() {
   });
   expect(res.statusCode).toBe(200);
   return (JSON.parse(res.body).tasks as Array<{
-    task_id: string; attention_reasons: string[]; pending_attention_count: number; pending_action_count: number;
+    task_id: string; attention_reason: string[]; pending_attention_count: number; pending_action_count: number;
   }>);
 }
 
@@ -82,11 +82,11 @@ afterAll(async () => {
 });
 
 describe('#186 per-task attention signal (GET /workrooms/:id/tasks)', () => {
-  it('task with a needs_human action -> Attention (attention_reasons:[needs_human])', async () => {
+  it('task with a needs_human action -> Attention (attention_reason:[needs_human])', async () => {
     const taskId = await makeTask('attn-needs-human', 'in_progress');
     await makeAction(taskId, 'needs_human');
     const t = (await listTasks()).find((x) => x.task_id === taskId)!;
-    expect(t.attention_reasons).toEqual(['needs_human']);
+    expect(t.attention_reason).toEqual(['needs_human']);
     expect(t.pending_attention_count).toBe(1);
     expect(t.pending_action_count).toBeGreaterThanOrEqual(1); // needs_human is non-terminal -> in-flight
   });
@@ -95,7 +95,7 @@ describe('#186 per-task attention signal (GET /workrooms/:id/tasks)', () => {
     const taskId = await makeTask('attn-active', 'in_progress');
     await makeAction(taskId, 'fired');
     const t = (await listTasks()).find((x) => x.task_id === taskId)!;
-    expect(t.attention_reasons).toEqual([]);
+    expect(t.attention_reason).toEqual([]);
     expect(t.pending_attention_count).toBe(0);
     expect(t.pending_action_count).toBe(1);
   });
@@ -104,7 +104,7 @@ describe('#186 per-task attention signal (GET /workrooms/:id/tasks)', () => {
     const taskId = await makeTask('attn-recent', 'in_review');
     await makeAction(taskId, 'succeeded');
     const t = (await listTasks()).find((x) => x.task_id === taskId)!;
-    expect(t.attention_reasons).toEqual([]);
+    expect(t.attention_reason).toEqual([]);
     expect(t.pending_attention_count).toBe(0);
     expect(t.pending_action_count).toBe(0); // succeeded is terminal -> not in-flight
   });
@@ -112,7 +112,7 @@ describe('#186 per-task attention signal (GET /workrooms/:id/tasks)', () => {
   it('task with NO actions -> empty/0 (no attention)', async () => {
     const taskId = await makeTask('attn-noactions', 'todo');
     const t = (await listTasks()).find((x) => x.task_id === taskId)!;
-    expect(t.attention_reasons).toEqual([]);
+    expect(t.attention_reason).toEqual([]);
     expect(t.pending_attention_count).toBe(0);
     expect(t.pending_action_count).toBe(0);
   });
@@ -122,7 +122,7 @@ describe('#186 per-task attention signal (GET /workrooms/:id/tasks)', () => {
     await makeAction(taskId, 'needs_human');
     await makeAction(taskId, 'needs_human');
     const t = (await listTasks()).find((x) => x.task_id === taskId)!;
-    expect(t.attention_reasons).toEqual(['needs_human']); // set semantics: deduped
+    expect(t.attention_reason).toEqual(['needs_human']); // set semantics: deduped
     expect(t.pending_attention_count).toBe(2);             // but counts each action
   });
 
@@ -134,7 +134,7 @@ describe('#186 per-task attention signal (GET /workrooms/:id/tasks)', () => {
     const list = await listTasks();
     const a = list.find((x) => x.task_id === attnTask)!;
     const c = list.find((x) => x.task_id === cleanTask)!;
-    expect(a.attention_reasons).toEqual(['needs_human']);
-    expect(c.attention_reasons).toEqual([]); // clean task unaffected
+    expect(a.attention_reason).toEqual(['needs_human']);
+    expect(c.attention_reason).toEqual([]); // clean task unaffected
   });
 });

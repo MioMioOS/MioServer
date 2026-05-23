@@ -48,17 +48,18 @@ const NON_CLAIMABLE_STATUSES = ['done', 'canceled'];
  *   ② 'unresolved_failure' ← P1 (needs a resolution flag; not yet modeled)
  *   ③ 'auth_config_blocked'← P1
  *   ④ 'stale'              ← P1 (client-side / capabilities-changed signal)
- * `attention_reasons` is an extensible string[] (a SET — a task may match multiple); V1 only ever
- * contains 'needs_human'. Empty array == "none" (task not in Attention).
+ * `attention_reason` is an extensible string[] (a SET — a task may match multiple values); V1 only
+ * ever contains 'needs_human'. Empty array == "none" (task not in Attention). Field name matches the
+ * cross-team frozen contract (Research §2a / PM); it is a multi-value set, hence an array.
  *
  * Client bucketing contract:
- *   Attention = attention_reasons.length > 0
- *   Active    = attention_reasons empty AND pending_action_count > 0   (in-flight, not blocking)
+ *   Attention = attention_reason.length > 0
+ *   Active    = attention_reason empty AND pending_action_count > 0   (in-flight, not blocking)
  *   Recent    = neither (all actions terminal / no actions)
  */
 const ATTENTION_REASON_NEEDS_HUMAN = 'needs_human';
 
-type TaskAttention = { attention_reasons: string[]; pending_attention_count: number; pending_action_count: number };
+type TaskAttention = { attention_reason: string[]; pending_attention_count: number; pending_action_count: number };
 
 /** Aggregate per-task attention signal in ONE query (no N+1) for the given task ids. */
 async function computeTaskAttention(workroomId: string, taskIds: string[]): Promise<Map<string, TaskAttention>> {
@@ -71,10 +72,10 @@ async function computeTaskAttention(workroomId: string, taskIds: string[]): Prom
   for (const a of actions) {
     if (!a.taskId) continue;
     let e = result.get(a.taskId);
-    if (!e) { e = { attention_reasons: [], pending_attention_count: 0, pending_action_count: 0 }; result.set(a.taskId, e); }
+    if (!e) { e = { attention_reason: [], pending_attention_count: 0, pending_action_count: 0 }; result.set(a.taskId, e); }
     // Attention dim (V1): needs_human.
     if (a.status === 'needs_human') {
-      if (!e.attention_reasons.includes(ATTENTION_REASON_NEEDS_HUMAN)) e.attention_reasons.push(ATTENTION_REASON_NEEDS_HUMAN);
+      if (!e.attention_reason.includes(ATTENTION_REASON_NEEDS_HUMAN)) e.attention_reason.push(ATTENTION_REASON_NEEDS_HUMAN);
       e.pending_attention_count += 1;
     }
     // In-flight: any non-terminal action (proposed/approved/fired/needs_human/reconciling).
@@ -181,7 +182,7 @@ export async function taskRoutes(app: FastifyInstance) {
           created_at: t.createdAt.toISOString(),
           updated_at: t.updatedAt.toISOString(),
           // #186 attention-first signal (action-driven). Empty/0 when the task has no actions.
-          attention_reasons: a?.attention_reasons ?? [],
+          attention_reason: a?.attention_reason ?? [],
           pending_attention_count: a?.pending_attention_count ?? 0,
           pending_action_count: a?.pending_action_count ?? 0,
         };
