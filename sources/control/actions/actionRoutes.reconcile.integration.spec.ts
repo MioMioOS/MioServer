@@ -285,3 +285,108 @@ describe('reconcile endpoint — runtime_warnings persistence (#59)', () => {
         expect(JSON.parse(get.body).runtime_warnings).toEqual([]);
     });
 });
+
+describe('reconcile endpoint — evidence/log persistence (#141 data source: write→read)', () => {
+    async function reconcileWithEvidence(
+        actionId: string,
+        evidenceId: string,
+        body: { output_summary?: unknown; raw_log_redacted?: unknown },
+    ) {
+        return app.inject({
+            method: 'POST',
+            url: `/api/v1/actions/${actionId}/reconcile`,
+            headers: { authorization: `Bearer ${MACHINE_RAW_TOKEN}`, 'content-type': 'application/json' },
+            payload: { reason: VALID_REASON, evidence_id: evidenceId, ...body },
+        });
+    }
+    async function getAction(actionId: string) {
+        return app.inject({
+            method: 'GET',
+            url: `/api/v1/actions/${actionId}`,
+            headers: { authorization: `Bearer ${MACHINE_RAW_TOKEN}` },
+        });
+    }
+
+    it('valid output_summary + raw_log_redacted -> 200, persisted, and GET surfaces them', async () => {
+        const actionId = await seedActionWithToken('fired');
+        const evidenceId = `ev-e-${randomUUID()}`;
+        const res = await reconcileWithEvidence(actionId, evidenceId, {
+            output_summary: '部署完成，等待人工确认是否分发。',
+            raw_log_redacted: '[runtime] upload OK\n[runtime] awaiting disposal',
+        });
+        expect(res.statusCode).toBe(200);
+        const row = await db.controlActionReconciliation.findFirst({ where: { actionId, evidenceId } });
+        expect(row?.outputSummary).toContain('部署完成');
+        expect(row?.rawLogRedacted).toContain('[runtime] upload OK');
+
+        const get = await getAction(actionId);
+        const b = JSON.parse(get.body);
+        expect(b.output_summary).toContain('部署完成');
+        expect(b.raw_log_redacted).toContain('[runtime] upload OK');
+    });
+
+    it('redact-on-write: secret/token/daemon-path are [REDACTED] IN THE DB ROW (never stored raw)', async () => {
+        const actionId = await seedActionWithToken('fired');
+        const evidenceId = `ev-redw-${randomUUID()}`;
+        const res = await reconcileWithEvidence(actionId, evidenceId, {
+            output_summary: '轮换了 token dev_ctl_LEAK1111111111111111111111111111 后清理。',
+            raw_log_redacted: '[runtime] cleaned /var/folders/zz/qm/T/mio-secret-leak-xyz done',
+        });
+        expect(res.statusCode).toBe(200);
+
+        // The DB row itself must NOT contain the raw secret/path — redaction happens on write.
+        const row = await db.controlActionReconciliation.findFirst({ where: { actionId, evidenceId } });
+        expect(row?.outputSummary).not.toMatch(/dev_ctl_[A-Za-z0-9]/);
+        expect(row?.rawLogRedacted).not.toMatch(/\/var\/folders|\/tmp\/mio-/);
+        expect(row?.outputSummary).toContain('[REDACTED]');
+        expect(row?.rawLogRedacted).toContain('[REDACTED]');
+
+        // And GET stays clean (defense-in-depth re-redaction on read).
+        const b = JSON.parse((await getAction(actionId)).body);
+        expect(b.output_summary).not.toMatch(/dev_ctl_[A-Za-z0-9]/);
+        expect(b.raw_log_redacted).not.toMatch(/\/var\/folders|\/tmp\/mio-/);
+    });
+
+    it('omitted evidence/log -> row fields null + GET null (backward compat)', async () => {
+        const actionId = await seedActionWithToken('fired');
+        const evidenceId = `ev-noev-${randomUUID()}`;
+        const res = await reconcile(actionId, evidenceId);
+        expect(res.statusCode).toBe(200);
+        const row = await db.controlActionReconciliation.findFirst({ where: { actionId, evidenceId } });
+        expect(row?.outputSummary ?? null).toBeNull();
+        expect(row?.rawLogRedacted ?? null).toBeNull();
+        const b = JSON.parse((await getAction(actionId)).body);
+        expect(b.output_summary).toBeNull();
+        expect(b.raw_log_redacted).toBeNull();
+    });
+
+    it('over-cap output_summary (>8000) -> 400, no transition, no evidence row', async () => {
+        const actionId = await seedActionWithToken('fired');
+        const res = await reconcileWithEvidence(actionId, `ev-big-${randomUUID()}`, {
+            output_summary: 'x'.repeat(8001),
+        });
+        expect(res.statusCode).toBe(400);
+        expect(JSON.parse(res.body).error.code).toBe('INVALID_OUTPUT_SUMMARY');
+        const action = await db.controlAction.findUnique({ where: { id: actionId }, select: { status: true } });
+        expect(action?.status).toBe('fired'); // validation before CAS
+        expect(await evidenceCount(actionId)).toBe(0);
+    });
+
+    it('over-cap raw_log_redacted (>40000) -> 400', async () => {
+        const actionId = await seedActionWithToken('fired');
+        const res = await reconcileWithEvidence(actionId, `ev-biglog-${randomUUID()}`, {
+            raw_log_redacted: 'y'.repeat(40001),
+        });
+        expect(res.statusCode).toBe(400);
+        expect(JSON.parse(res.body).error.code).toBe('INVALID_RAW_LOG');
+    });
+
+    it('non-string output_summary -> 400', async () => {
+        const actionId = await seedActionWithToken('fired');
+        const res = await reconcileWithEvidence(actionId, `ev-nonstr-${randomUUID()}`, {
+            output_summary: { not: 'a string' },
+        });
+        expect(res.statusCode).toBe(400);
+        expect(JSON.parse(res.body).error.code).toBe('INVALID_OUTPUT_SUMMARY');
+    });
+});

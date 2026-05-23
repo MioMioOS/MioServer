@@ -1079,10 +1079,15 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
    *   If no token row exists for the action: 403 (old data / anomaly — no reconcile allowed).
    *   machine_id is ALWAYS taken from the token row, NEVER from request body.
    *
-   * BODY: { reason: enum, evidence_id: string }
+   * BODY: { reason: enum, evidence_id: string, runtime_warnings?, output_summary?, raw_log_redacted? }
    *   reason: controlled enum — fire_response_lost_token_unrecoverable | drain_deadline_exceeded
    *   evidence_id: stable daemon-generated file ID (e.g. UUID from evidence filename)
+   *   runtime_warnings?: structured enum warnings (#59) — array, ≤50 items
+   *   output_summary? (≤8000) / raw_log_redacted? (≤40000): #141 evidence/log data source for the
+   *     Evidence / Runtime Log pushed pages. Free-form, daemon pre-redacted; we RE-redact on write
+   *     (never store a raw secret — #176 invariant) and again on read (defense-in-depth).
    *   FORBIDDEN fields: action_token, token_hash, secret, stdout, stack → 400 FORBIDDEN_FIELDS
+   *     (output_summary/raw_log_redacted are the sanctioned pre-redacted channel; raw stdout stays banned)
    *
    * IDEMPOTENCY (per-evidence): same (action_id, evidence_id) → P2002 in transaction → 200 idempotent
    *   Different evidence IDs for same action are allowed (full audit trail).
@@ -1166,6 +1171,42 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
       runtimeWarnings = valid;
     }
 
+    // ── 2c. Optional evidence/log (#141 data source) ──
+    // The daemon forwards a post-run summary (Evidence page) + the redacted runtime log
+    // (Runtime Log page). These are FREE-FORM text (unlike the enum runtime_warnings), so we
+    // (1) length-cap them and (2) re-redact server-side BEFORE persisting — the field name
+    // raw_log_redacted asserts the daemon pre-redacted, but we never trust that: the #176
+    // invariant is that no raw secret/token/daemon-secret-path is ever stored, even momentarily.
+    // FORBIDDEN_FIELDS above still rejects raw stdout/secret/stack/token outright; these two are
+    // the sanctioned, pre-redacted evidence channel.
+    const OUTPUT_SUMMARY_MAX = 8_000;
+    const RAW_LOG_MAX = 40_000;
+    let outputSummary: string | null = null;
+    let rawLogRedacted: string | null = null;
+    const rawOutputSummary = (body as { output_summary?: unknown }).output_summary;
+    if (rawOutputSummary !== undefined && rawOutputSummary !== null) {
+      if (typeof rawOutputSummary !== 'string' || rawOutputSummary.length > OUTPUT_SUMMARY_MAX) {
+        return reply.code(400).send({
+          error: { code: 'INVALID_OUTPUT_SUMMARY', message: `output_summary must be a string (max ${OUTPUT_SUMMARY_MAX} chars)` },
+        });
+      }
+      // Redact-on-write (defense-in-depth): never store a raw secret in the DB.
+      outputSummary = redactControlText(rawOutputSummary);
+    }
+    const rawLogField = (body as { raw_log_redacted?: unknown }).raw_log_redacted;
+    if (rawLogField !== undefined && rawLogField !== null) {
+      if (typeof rawLogField !== 'string' || rawLogField.length > RAW_LOG_MAX) {
+        return reply.code(400).send({
+          error: { code: 'INVALID_RAW_LOG', message: `raw_log_redacted must be a string (max ${RAW_LOG_MAX} chars)` },
+        });
+      }
+      rawLogRedacted = redactControlText(rawLogField);
+    }
+    const evidenceData: { outputSummary?: string; rawLogRedacted?: string } = {
+      ...(outputSummary !== null ? { outputSummary } : {}),
+      ...(rawLogRedacted !== null ? { rawLogRedacted } : {}),
+    };
+
     // ── 3. Fetch action ──
     const action = await db.controlAction.findUnique({ where: { id: actionId } });
     if (!action) {
@@ -1240,6 +1281,7 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
               reasonCode: reason,
               machineId: machine.id,            // bound from firing machine, NOT from body
               ...(runtimeWarnings ? { runtimeWarnings: runtimeWarnings as Prisma.InputJsonValue } : {}),
+              ...evidenceData,
             },
           });
           return { count: 1 as number, currentStatus: 'needs_human' };
@@ -1260,6 +1302,7 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
               reasonCode: reason,
               machineId: machine.id,
               ...(runtimeWarnings ? { runtimeWarnings: runtimeWarnings as Prisma.InputJsonValue } : {}),
+              ...evidenceData,
             },
           });
         }

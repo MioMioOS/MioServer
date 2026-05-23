@@ -79,7 +79,10 @@ async function provision(ttlHours: number): Promise<void> {
       clientIdempotencyKey: `${DEMO_PREFIX}${randomUUID()}`,
     },
   });
-  // #59 runtime_warnings surface (renders in TaskDetail via GET /actions/:id flatten).
+  // #59 runtime_warnings + #141 evidence/log surface (all render in TaskDetail via GET /actions/:id flatten).
+  // outputSummary → Evidence page; rawLogRedacted → Runtime Log page. Both carry a redaction sample
+  // (fake dev_ctl_ token + a daemon-secret-shaped /var/folders temp path) so the client redactor +
+  // server-side re-redaction (defense-in-depth) are both exercised on these two pushed pages.
   await db.controlActionReconciliation.create({
     data: {
       id: randomUUID(), actionId: actA.id, evidenceId: `demo-evidence-${randomUUID().slice(0, 8)}`,
@@ -87,6 +90,8 @@ async function provision(ttlHours: number): Promise<void> {
       runtimeWarnings: [
         { code: 'CLAUDE_DELEGATION_CONFIG_NOT_PROVISIONED', severity: 'warning', message: '受控委派配置未提供，已转人工复核，不静默继承上层登录。' },
       ],
+      outputSummary: '上传到 TestFlight 完成：build 1.4.1+14（6101c9c2），等待人工确认是否分发。处理过程中轮换了调试 token dev_ctl_FAKE0000000000000000000000000000（应显示为 [REDACTED]）。',
+      rawLogRedacted: '[runtime] xcrun altool upload OK\n[runtime] processing on ASC… done\n[runtime] cleaned temp credential file /var/folders/zz/qm0n/T/mio-secret-tmp-abc123\n[runtime] awaiting human disposal decision',
     },
   });
 
