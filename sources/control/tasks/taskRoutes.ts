@@ -84,6 +84,28 @@ async function computeTaskAttention(workroomId: string, taskIds: string[]): Prom
   return result;
 }
 
+/**
+ * #188① — resolve owner_instance_id (a ControlAgent id) → a human-readable display name for the
+ * task-row subtitle, so the main UI shows "Demo Ops Agent · 3m ago" instead of a bare UUID
+ * (#131§6 "Owner readable"). One batched query (no N+1). null when the owner is unset OR the agent
+ * can't be resolved → client hides the subtitle (never falls back to the raw UUID). Prefers
+ * displayName, then name; never returns the id.
+ */
+async function resolveOwnerDisplayNames(ownerIds: Array<string | null>): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  const ids = [...new Set(ownerIds.filter((x): x is string => !!x))];
+  if (ids.length === 0) return result;
+  const agents = await db.controlAgent.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, displayName: true, name: true },
+  });
+  for (const a of agents) {
+    const label = a.displayName?.trim() || a.name?.trim();
+    if (label) result.set(a.id, label);
+  }
+  return result;
+}
+
 export async function taskRoutes(app: FastifyInstance) {
   /**
    * POST /api/v1/workrooms/:workroomId/tasks
@@ -169,6 +191,8 @@ export async function taskRoutes(app: FastifyInstance) {
 
     // #186: per-task action-driven attention signal (one batched query, no N+1).
     const attention = await computeTaskAttention(workroomId, tasks.map((t) => t.id));
+    // #188①: resolve owner_instance_id → readable agent name (one batched query, no N+1).
+    const ownerNames = await resolveOwnerDisplayNames(tasks.map((t) => t.ownerInstanceId));
 
     return {
       tasks: tasks.map((t) => {
@@ -179,6 +203,8 @@ export async function taskRoutes(app: FastifyInstance) {
           status: t.status,
           owner_instance_id: t.ownerInstanceId,
           owner_role: t.ownerRole,
+          // #188①: human-readable owner for the task-row subtitle; null → client hides it (no raw UUID).
+          owner_display_name: t.ownerInstanceId ? (ownerNames.get(t.ownerInstanceId) ?? null) : null,
           created_at: t.createdAt.toISOString(),
           updated_at: t.updatedAt.toISOString(),
           // #186 attention-first signal (action-driven). Empty/0 when the task has no actions.

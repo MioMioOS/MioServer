@@ -50,6 +50,7 @@ async function listTasks() {
   expect(res.statusCode).toBe(200);
   return (JSON.parse(res.body).tasks as Array<{
     task_id: string; attention_reason: string[]; pending_attention_count: number; pending_action_count: number;
+    owner_instance_id: string | null; owner_display_name: string | null;
   }>);
 }
 
@@ -136,5 +137,27 @@ describe('#186 per-task attention signal (GET /workrooms/:id/tasks)', () => {
     const c = list.find((x) => x.task_id === cleanTask)!;
     expect(a.attention_reason).toEqual(['needs_human']);
     expect(c.attention_reason).toEqual([]); // clean task unaffected
+  });
+});
+
+describe('#188① owner_display_name resolution (GET /workrooms/:id/tasks)', () => {
+  it('owner_instance_id resolves to the agent display name (not the raw UUID)', async () => {
+    const taskId = await makeTask('own-resolved', 'in_progress'); // makeTask sets owner = AGENT_ID
+    const t = (await listTasks()).find((x) => x.task_id === taskId)!;
+    expect(t.owner_instance_id).toBe(AGENT_ID);
+    expect(t.owner_display_name).toBe('Attn Agent'); // ControlAgent.displayName, never the id
+    expect(t.owner_display_name).not.toBe(AGENT_ID);
+  });
+
+  // Note: ownerInstanceId has an FK → ControlAgent and ControlAgent.displayName is required, so a
+  // non-null owner always resolves to a name; owner_display_name is null only for an unowned task.
+  // The `?? null` in the route is defense-in-depth (e.g. future onDelete=SetNull races).
+
+  it('unowned task -> owner_display_name null', async () => {
+    const id = randomUUID();
+    await db.controlTask.create({ data: { id, workroomId: WORKROOM_ID, title: 'own-none', status: 'todo', ownerInstanceId: null } });
+    const t = (await listTasks()).find((x) => x.task_id === id)!;
+    expect(t.owner_instance_id).toBeNull();
+    expect(t.owner_display_name).toBeNull();
   });
 });

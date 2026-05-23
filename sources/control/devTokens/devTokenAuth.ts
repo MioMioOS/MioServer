@@ -67,6 +67,7 @@ export async function verifyDevControlToken(
  * Only read endpoints the human UI needs for the Task execution detail surface.
  */
 const DEV_TOKEN_GET_ALLOWLIST: RegExp[] = [
+  /^\/api\/v1\/workrooms\/[^/]+\/channels$/,
   /^\/api\/v1\/workrooms\/[^/]+\/tasks$/,
   /^\/api\/v1\/workrooms\/[^/]+\/actions$/,
   /^\/api\/v1\/actions\/[^/]+$/,

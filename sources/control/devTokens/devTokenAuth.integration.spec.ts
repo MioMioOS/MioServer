@@ -159,9 +159,10 @@ describe('dev_control_token dual-auth — real DB security matrix (#32)', () => 
         expect(apprRes.statusCode).not.toBe(200);
     });
 
-    it('allowlist predicate is default-deny: only the 3 GET paths pass; non-GET / off-list rejected', () => {
+    it('allowlist predicate is default-deny: only explicitly listed GET paths pass; non-GET / off-list rejected', () => {
         // Locks the dev-token GET allowlist (defense-in-depth: this predicate also guards the
         // 403 branch of authorizeControlRead for any FUTURE route that adds dual-auth).
+        expect(isDevTokenAllowedPath('GET', `/api/v1/workrooms/${WORKROOM_A}/channels`)).toBe(true);
         expect(isDevTokenAllowedPath('GET', `/api/v1/workrooms/${WORKROOM_A}/tasks`)).toBe(true);
         expect(isDevTokenAllowedPath('GET', `/api/v1/workrooms/${WORKROOM_A}/actions`)).toBe(true);
         expect(isDevTokenAllowedPath('GET', `/api/v1/actions/${ACTION_A}`)).toBe(true);
@@ -178,7 +179,7 @@ describe('dev_control_token dual-auth — real DB security matrix (#32)', () => 
     });
 
     // FUTURE-PROOF SAFETY GUARD (#44): exercise authorizeControlRead's allowlist-403 branch
-    // end-to-end. Current routing never reaches it (the only 3 dual-auth routes are all on the
+    // end-to-end. Current routing never reaches it (dual-auth routes are all on the
     // allowlist), so this drives authorizeControlRead directly with a fake request to lock the
     // invariant: a VALID dev token presented to a dual-auth handler whose path is NOT on the
     // allowlist (or uses a non-GET method) must be DENIED with a uniform 403. This protects
