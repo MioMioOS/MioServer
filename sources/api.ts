@@ -18,6 +18,7 @@ import { pagesRoutes } from '@/pages/pagesRoutes';
 // Control plane — machine registration + workroom/task/action/event/artifact APIs
 import { machineRoutes } from '@/machines/machineRoutes';
 import { workroomRoutes } from '@/control/workrooms/workroomRoutes';
+import { channelRoutes } from '@/control/channels/channelRoutes';
 import { taskRoutes } from '@/control/tasks/taskRoutes';
 import { actionRoutes } from '@/control/actions/actionRoutes';
 import { eventRoutes } from '@/control/events/eventRoutes';
@@ -75,6 +76,7 @@ export async function startApi() {
     // Control plane routes
     await app.register(machineRoutes);
     await app.register(workroomRoutes);
+    await app.register(channelRoutes);
     await app.register(taskRoutes);
     await app.register(actionRoutes, { credentialStore });
     await app.register(operatorWriteRoutes);
