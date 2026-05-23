@@ -168,6 +168,14 @@ describe('dev_control_token dual-auth — real DB security matrix (#32)', () => 
         expect(isDevTokenAllowedPath('GET', `/api/v1/actions/${ACTION_A}`)).toBe(true);
         // Query string is stripped before matching.
         expect(isDevTokenAllowedPath('GET', `/api/v1/workrooms/${WORKROOM_A}/actions?limit=10`)).toBe(true);
+        // S1 Chunk 5: message read endpoints now in allowlist.
+        const CHAN_ID = randomUUID();
+        const MSG_ID = randomUUID();
+        expect(isDevTokenAllowedPath('GET', `/api/v1/workrooms/${WORKROOM_A}/channels/${CHAN_ID}/messages`)).toBe(true);
+        expect(isDevTokenAllowedPath('GET', `/api/v1/workrooms/${WORKROOM_A}/channels/${CHAN_ID}/messages?after_seq=5&limit=50`)).toBe(true);
+        expect(isDevTokenAllowedPath('GET', `/api/v1/messages/${MSG_ID}`)).toBe(true);
+        // POST on the message endpoint is still hard-rejected (write-only for op_sess_/machine).
+        expect(isDevTokenAllowedPath('POST', `/api/v1/workrooms/${WORKROOM_A}/channels/${CHAN_ID}/messages`)).toBe(false);
         // Non-GET methods on an allowlisted path → denied.
         expect(isDevTokenAllowedPath('POST', `/api/v1/workrooms/${WORKROOM_A}/tasks`)).toBe(false);
         expect(isDevTokenAllowedPath('DELETE', `/api/v1/actions/${ACTION_A}`)).toBe(false);

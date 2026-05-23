@@ -73,6 +73,9 @@ const DEV_TOKEN_GET_ALLOWLIST: RegExp[] = [
   /^\/api\/v1\/actions\/[^/]+$/,
   // #164: server-assist explanation (read-only; workroom-scoped via the /workrooms/:wid/ rule).
   /^\/api\/v1\/workrooms\/[^/]+\/explanation$/,
+  // S1: message read endpoints (Chunk 5 allowlist expansion).
+  /^\/api\/v1\/workrooms\/[^/]+\/channels\/[^/]+\/messages$/,
+  /^\/api\/v1\/messages\/[^/]+$/,
 ];
 
 /** True iff (method, path) is an allowed dev-token GET endpoint. Default-deny. */

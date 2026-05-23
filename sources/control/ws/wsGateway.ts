@@ -6,7 +6,7 @@
  * new events via workroomBroadcaster after they are committed to DB.
  *
  * Protocol (client → server):
- *   { type: 'subscribe',   workroom_id: string, machine_token: string }
+ *   { type: 'subscribe',   workroom_id: string, token: string }
  *   { type: 'unsubscribe', workroom_id: string }
  *   { type: 'ping' }
  *
@@ -24,20 +24,22 @@
  *   This gateway does NOT replay history — catch-up is HTTP-only.
  *
  * Auth:
- *   machine_token sent in subscribe message; validated via SHA-256 lookup.
- *   If auth fails: error + socket disconnect.
+ *   Generic `token` field in subscribe message. Accepted token classes:
+ *     - machine_token  (machine daemon)
+ *     - dev_ctl_       (CodeLight phone, read-only)
+ *     - op_sess_       (operator session, phone write-capable)
+ *   All three are validated via tokenInWorkroom() which checks token validity
+ *   AND workroom scope. If auth fails: error + socket disconnect.
  *
  * INVARIANTS:
- * 1. Gateway only calls workroomBroadcaster.subscribe AFTER machine auth succeeds.
+ * 1. Gateway only calls workroomBroadcaster.subscribe AFTER auth succeeds.
  * 2. All subscriptions are cleaned up on disconnect (unsubscribeAll).
  * 3. This file contains NO DB writes. It is a pure fanout path.
  */
 
 import { Server as HttpServer } from 'http';
 import { Server as SocketIOServer, Socket } from 'socket.io';
-import { db } from '@/storage/db';
-import { verifyMachineToken } from '@/machines/machineRoutes';
-import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
+import { tokenInWorkroom } from '@/control/auth/workroomScopeForToken';
 import { workroomBroadcaster, WorkroomSubscriber } from './workroomBroadcaster';
 
 export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
@@ -51,36 +53,24 @@ export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
 
     // Track subscriber handle for cleanup
     const subscriber: WorkroomSubscriber = { socket, context: socket.id };
-    // Track which workrooms this connection subscribed to (for auth guard)
-    const authenticatedMachineId: { value: string | null } = { value: null };
 
     // ── subscribe ────────────────────────────────────────────────────────────
-    socket.on('subscribe', async (msg: { workroom_id?: string; machine_token?: string }) => {
-      if (!msg.workroom_id || !msg.machine_token) {
-        socket.emit('error', { code: 'MISSING_FIELDS', message: 'workroom_id and machine_token required' });
+    socket.on('subscribe', async (msg: { workroom_id?: string; token?: string }) => {
+      if (!msg.workroom_id || !msg.token) {
+        socket.emit('error', { code: 'MISSING_FIELDS', message: 'workroom_id and token required' });
         return;
       }
 
-      // Authenticate on first subscribe (or re-authenticate).
-      // verifyMachineToken expects "Bearer <token>" format.
-      const machine = await verifyMachineToken(`Bearer ${msg.machine_token}`);
-      if (!machine) {
-        socket.emit('error', { code: 'UNAUTHORIZED', message: 'Invalid or expired machine token' });
+      // Authenticate and verify workroom scope in one step.
+      // tokenInWorkroom accepts machine_token / dev_ctl_ / op_sess_ tokens.
+      const scope = await tokenInWorkroom(msg.token, msg.workroom_id);
+      if (!scope) {
+        socket.emit('error', { code: 'FORBIDDEN', message: 'Invalid token or not authorized for this workroom' });
         socket.disconnect(true);
         return;
       }
-      authenticatedMachineId.value = machine.id;
-      subscriber.context = `machine:${machine.id}`;
 
-      // Verify workroom exists AND machine is authorized to access it.
-      // requireMachineAccessToWorkroom enforces: machine must have bound org + org matches workroom.
-      const access = await requireMachineAccessToWorkroom(machine, msg.workroom_id);
-      if (!access.ok) {
-        socket.emit('error', { code: access.error.code, message: access.error.message });
-        if (access.status === 403) socket.disconnect(true);
-        return;
-      }
-
+      subscriber.context = `${scope.mode}:${socket.id}`;
       workroomBroadcaster.subscribe(msg.workroom_id, subscriber);
       socket.emit('subscribed', { workroom_id: msg.workroom_id });
       console.log(`[WS] ${subscriber.context} subscribed to workroom=${msg.workroom_id}`);
