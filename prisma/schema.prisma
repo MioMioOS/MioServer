@@ -339,6 +339,7 @@ model ControlWorkroom {
 
   goals             ControlGoal[]
   messages          ControlMessage[]
+  channels          ControlChannel[]
   sessions          ControlSession[]
   tasks             ControlTask[]
   actions           ControlAction[]
@@ -353,6 +354,38 @@ model ControlWorkroom {
   eventLogs         ControlEventLog[]
 
   @@map("control_workrooms")
+}
+
+/// Channel within a workroom (S1). type: main | standard | dm. visibility: public | private.
+/// public channels are implicitly visible to all workroom members; private/dm require ControlChannelMember.
+model ControlChannel {
+  id             String    @id @default(uuid()) @db.Uuid
+  workroomId     String    @map("workroom_id") @db.Uuid
+  name           String
+  type           String    // "main" | "standard" | "dm"
+  visibility     String    // "public" | "private"
+  description    String?
+  createdBy      String    @map("created_by")          // opaque actor id (non-uuid; e.g. 'system' / operatorSubject)
+  archivedAt     DateTime? @map("archived_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  lastActivityAt DateTime? @map("last_activity_at")
+  workroom       ControlWorkroom      @relation(fields: [workroomId], references: [id])
+  members        ControlChannelMember[]
+  messages       ControlMessage[]
+  @@index([workroomId, archivedAt])
+  @@index([workroomId, type])
+  @@map("control_channels")
+}
+
+/// Explicit member row for private/dm channels. public channels need no rows.
+model ControlChannelMember {
+  id        String   @id @default(uuid()) @db.Uuid
+  channelId String   @map("channel_id") @db.Uuid
+  memberId  String   @map("member_id")                // opaque actor id (agent/human/operatorSubject; non-uuid)
+  addedAt   DateTime @default(now()) @map("added_at")
+  channel   ControlChannel @relation(fields: [channelId], references: [id])
+  @@unique([channelId, memberId])
+  @@map("control_channel_members")
 }
 
 /// Goal for a workroom.
@@ -407,21 +440,25 @@ model ControlAgent {
 
 /// Message in a workroom timeline.
 model ControlMessage {
-  id                String          @id @default(uuid()) @db.Uuid
-  workroomId        String          @map("workroom_id") @db.Uuid
-  workroom          ControlWorkroom @relation(fields: [workroomId], references: [id])
-  senderKind        String          @map("sender_kind") // user | agent | system
-  senderId          String          @map("sender_id") @db.Uuid
-  content           String
-  mentions          String[]
-  hashRefs          Json            @default("{}") @map("hash_refs")
-  attachmentIds     String[]        @map("attachment_ids")
-  embeddedCardType  String?         @map("embedded_card_type")
-  embeddedCardId    String?         @map("embedded_card_id") @db.Uuid
-  threadReplyCount  Int             @default(0) @map("thread_reply_count")
-  lastThreadReplyAt DateTime?       @map("last_thread_reply_at")
-  createdAt         DateTime        @default(now()) @map("created_at")
+  id                   String          @id @default(uuid()) @db.Uuid
+  workroomId           String          @map("workroom_id") @db.Uuid
+  workroom             ControlWorkroom @relation(fields: [workroomId], references: [id])
+  channelId            String?         @map("channel_id") @db.Uuid  // nullable during migration; NOT NULL after backfill (Step 4)
+  seq                  BigInt          @default(0) @map("seq")       // per-channel monotone; nextChannelSeq assigns explicitly; default 0 is never relied upon
+  clientIdempotencyKey String?         @map("client_idempotency_key")
+  senderKind           String          @map("sender_kind") // user | agent | system
+  senderId             String          @map("sender_id") @db.Uuid
+  content              String
+  mentions             String[]
+  hashRefs             Json            @default("{}") @map("hash_refs")
+  attachmentIds        String[]        @map("attachment_ids")
+  embeddedCardType     String?         @map("embedded_card_type")
+  embeddedCardId       String?         @map("embedded_card_id") @db.Uuid
+  threadReplyCount     Int             @default(0) @map("thread_reply_count")
+  lastThreadReplyAt    DateTime?       @map("last_thread_reply_at")
+  createdAt            DateTime        @default(now()) @map("created_at")
 
+  channel           ControlChannel?   @relation(fields: [channelId], references: [id])
   attachments       ControlAttachment[]
   thread            ControlThread?
   workingAgreements ControlWorkingAgreement[] @relation("AgreementSourceMessage")
@@ -429,7 +466,10 @@ model ControlMessage {
   roleInsights      ControlRoleInsight[]
   routerDecisions   ControlRouterDecision[]
 
+  @@unique([channelId, seq])
+  @@unique([channelId, clientIdempotencyKey])
   @@index([workroomId, createdAt(sort: Desc)])
+  @@index([channelId, seq])
   @@map("control_messages")
 }
 
