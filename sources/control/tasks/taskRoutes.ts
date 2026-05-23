@@ -30,9 +30,58 @@ import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
 import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
+import { SUMMARY_TERMINAL_STATUSES } from '@/control/actionStatusSets';
 
 const CLAIMABLE_STATUSES = ['todo', 'in_progress', 'waiting_approval', 'in_review'];
 const NON_CLAIMABLE_STATUSES = ['done', 'canceled'];
+
+/**
+ * #186 — per-task ATTENTION signal for the attention-first Home (Option A, PM/Aaron/Nova/Research
+ * ratified). The Home buckets each task into Attention / Active / Recent. Bucketing must be
+ * ACTION-DRIVEN (not a task-status proxy): a task is in Attention if any of its actions needs human
+ * attention. Computed server-side (single source of truth; no client N+1 / join — ControlAction has
+ * no task_id over the wire, so the client cannot compute this itself).
+ *
+ * Attention admission taxonomy (Research §2a / #131§6/#136§4 — designed WIDE so P1 dims don't
+ * re-migrate). Enum values are FROZEN as the cross-team contract:
+ *   ① 'needs_human'        ← V1 (computable from action.status)
+ *   ② 'unresolved_failure' ← P1 (needs a resolution flag; not yet modeled)
+ *   ③ 'auth_config_blocked'← P1
+ *   ④ 'stale'              ← P1 (client-side / capabilities-changed signal)
+ * `attention_reasons` is an extensible string[] (a SET — a task may match multiple); V1 only ever
+ * contains 'needs_human'. Empty array == "none" (task not in Attention).
+ *
+ * Client bucketing contract:
+ *   Attention = attention_reasons.length > 0
+ *   Active    = attention_reasons empty AND pending_action_count > 0   (in-flight, not blocking)
+ *   Recent    = neither (all actions terminal / no actions)
+ */
+const ATTENTION_REASON_NEEDS_HUMAN = 'needs_human';
+
+type TaskAttention = { attention_reasons: string[]; pending_attention_count: number; pending_action_count: number };
+
+/** Aggregate per-task attention signal in ONE query (no N+1) for the given task ids. */
+async function computeTaskAttention(workroomId: string, taskIds: string[]): Promise<Map<string, TaskAttention>> {
+  const result = new Map<string, TaskAttention>();
+  if (taskIds.length === 0) return result;
+  const actions = await db.controlAction.findMany({
+    where: { workroomId, taskId: { in: taskIds } },
+    select: { taskId: true, status: true },
+  });
+  for (const a of actions) {
+    if (!a.taskId) continue;
+    let e = result.get(a.taskId);
+    if (!e) { e = { attention_reasons: [], pending_attention_count: 0, pending_action_count: 0 }; result.set(a.taskId, e); }
+    // Attention dim (V1): needs_human.
+    if (a.status === 'needs_human') {
+      if (!e.attention_reasons.includes(ATTENTION_REASON_NEEDS_HUMAN)) e.attention_reasons.push(ATTENTION_REASON_NEEDS_HUMAN);
+      e.pending_attention_count += 1;
+    }
+    // In-flight: any non-terminal action (proposed/approved/fired/needs_human/reconciling).
+    if (!SUMMARY_TERMINAL_STATUSES.has(a.status)) e.pending_action_count += 1;
+  }
+  return result;
+}
 
 export async function taskRoutes(app: FastifyInstance) {
   /**
@@ -117,16 +166,26 @@ export async function taskRoutes(app: FastifyInstance) {
       take: 100,
     });
 
+    // #186: per-task action-driven attention signal (one batched query, no N+1).
+    const attention = await computeTaskAttention(workroomId, tasks.map((t) => t.id));
+
     return {
-      tasks: tasks.map((t) => ({
-        task_id: t.id,
-        title: t.title,
-        status: t.status,
-        owner_instance_id: t.ownerInstanceId,
-        owner_role: t.ownerRole,
-        created_at: t.createdAt.toISOString(),
-        updated_at: t.updatedAt.toISOString(),
-      })),
+      tasks: tasks.map((t) => {
+        const a = attention.get(t.id);
+        return {
+          task_id: t.id,
+          title: t.title,
+          status: t.status,
+          owner_instance_id: t.ownerInstanceId,
+          owner_role: t.ownerRole,
+          created_at: t.createdAt.toISOString(),
+          updated_at: t.updatedAt.toISOString(),
+          // #186 attention-first signal (action-driven). Empty/0 when the task has no actions.
+          attention_reasons: a?.attention_reasons ?? [],
+          pending_attention_count: a?.pending_attention_count ?? 0,
+          pending_action_count: a?.pending_action_count ?? 0,
+        };
+      }),
     };
   });
 
