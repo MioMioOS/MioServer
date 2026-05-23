@@ -31,7 +31,9 @@ import { mintOperatorSession, V1_OPERATOR_COMMANDS } from '@/control/operatorSes
 const ORG_ID = randomUUID();
 const WORKROOM_ID = randomUUID();
 const MACHINE_ID = randomUUID();
-const OPERATOR_SUBJECT_ID = randomUUID(); // must be UUID (senderId is @db.Uuid)
+// Real production-style pairing subject: 'pairing:<uuid>' (NOT a bare UUID).
+// This is what operatorSubjectId looks like after a phone pairing (operatorPairingRoutes.ts:145,160).
+const OPERATOR_SUBJECT_ID = `pairing:${randomUUID()}`;
 
 // Raw tokens (set in beforeAll after DB rows are created)
 const MACHINE_RAW_TOKEN = `machine_${randomUUID().replace(/-/g, '')}`;
@@ -119,7 +121,8 @@ beforeAll(async () => {
   PRIVATE_CHANNEL_ID = privCh.id;
 
   // Mint an op_sess_ that includes send_message (via mintOperatorSession).
-  // OPERATOR_SUBJECT_ID is a UUID so senderId is valid in ControlMessage.
+  // OPERATOR_SUBJECT_ID is 'pairing:<uuid>' — the real production pairing subject format.
+  // This proves the op_sess_ send path works with a non-UUID senderId (C1 fix).
   const minted = await mintOperatorSession({
     orgId: ORG_ID,
     workroomId: WORKROOM_ID,
@@ -411,6 +414,71 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
 
     expect(s1).toBeLessThan(s2);
     expect(s2).toBeLessThan(s3);
+
+    // cleanup
+    await db.controlMessage.deleteMany({ where: { channelId: ch.id } });
+    await db.controlChannel.deleteMany({ where: { id: ch.id } });
+  });
+
+  it('op_sess_ with pairing: subject succeeds and stores the pairing senderId verbatim (C1)', async () => {
+    // Prove that the real production op_sess_ subject ('pairing:<uuid>') can be stored in
+    // control_messages.sender_id (TEXT column after C1 fix).  Previously this would fail
+    // with a Postgres "invalid input syntax for type uuid" error because the column was UUID.
+    const key = randomUUID();
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages`,
+      { content: 'Message from pairing-subject operator', client_idempotency_key: key },
+      opSessHeader(), // OP_SESS_RAW_TOKEN was minted with OPERATOR_SUBJECT_ID = 'pairing:<uuid>'
+    );
+    expect(res.statusCode).toBe(201);
+
+    const body = JSON.parse(res.body);
+    expect(body).toHaveProperty('id');
+    expect(body.idempotent).toBe(false);
+
+    // Verify the stored senderId is exactly the pairing: string (not truncated, not coerced).
+    const stored = await db.controlMessage.findUnique({
+      where: { id: body.id },
+      select: { senderId: true },
+    });
+    expect(stored).not.toBeNull();
+    expect(stored!.senderId).toBe(OPERATOR_SUBJECT_ID);  // must equal 'pairing:<uuid>'
+    expect(stored!.senderId).toMatch(/^pairing:/);        // explicit format check
+  });
+
+  it('lastActivityAt on channel advances after a send (I2)', async () => {
+    const ch = await db.controlChannel.create({
+      data: { workroomId: WORKROOM_ID, name: 'last-activity-test', type: 'standard', visibility: 'public', createdBy: 'system' },
+    });
+    // lastActivityAt is null before any message.
+    const before = await db.controlChannel.findUnique({ where: { id: ch.id }, select: { lastActivityAt: true } });
+    expect(before!.lastActivityAt).toBeNull();
+
+    const t0 = new Date();
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/channels/${ch.id}/messages`,
+      { content: 'bump last_activity_at', client_idempotency_key: randomUUID() },
+      opSessHeader(),
+    );
+    expect(res.statusCode).toBe(201);
+
+    const after = await db.controlChannel.findUnique({ where: { id: ch.id }, select: { lastActivityAt: true } });
+    expect(after!.lastActivityAt).not.toBeNull();
+    // lastActivityAt must be >= the time we started the send.
+    expect(after!.lastActivityAt!.getTime()).toBeGreaterThanOrEqual(t0.getTime());
+
+    // A second send must push lastActivityAt forward (or equal — if timestamps land in the same ms).
+    const lastBefore2nd = after!.lastActivityAt!;
+    const res2 = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/channels/${ch.id}/messages`,
+      { content: 'bump again', client_idempotency_key: randomUUID() },
+      opSessHeader(),
+    );
+    expect(res2.statusCode).toBe(201);
+
+    const after2 = await db.controlChannel.findUnique({ where: { id: ch.id }, select: { lastActivityAt: true } });
+    expect(after2!.lastActivityAt).not.toBeNull();
+    expect(after2!.lastActivityAt!.getTime()).toBeGreaterThanOrEqual(lastBefore2nd.getTime());
 
     // cleanup
     await db.controlMessage.deleteMany({ where: { channelId: ch.id } });

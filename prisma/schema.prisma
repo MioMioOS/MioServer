@@ -443,11 +443,11 @@ model ControlMessage {
   id                   String          @id @default(uuid()) @db.Uuid
   workroomId           String          @map("workroom_id") @db.Uuid
   workroom             ControlWorkroom @relation(fields: [workroomId], references: [id])
-  channelId            String?         @map("channel_id") @db.Uuid  // nullable during migration; NOT NULL after backfill (Step 4)
+  channelId            String          @map("channel_id") @db.Uuid  // NOT NULL (DB enforced by s1_channelid_notnull migration)
   seq                  BigInt          @default(0) @map("seq")       // per-channel monotone; nextChannelSeq assigns explicitly; default 0 is never relied upon
   clientIdempotencyKey String?         @map("client_idempotency_key")
   senderKind           String          @map("sender_kind") // user | agent | system
-  senderId             String          @map("sender_id") @db.Uuid
+  senderId             String          @map("sender_id")             // opaque actor id (may be 'pairing:<uuid>' for op_sess_ human sends)
   content              String
   mentions             String[]
   hashRefs             Json            @default("{}") @map("hash_refs")
@@ -458,7 +458,7 @@ model ControlMessage {
   lastThreadReplyAt    DateTime?       @map("last_thread_reply_at")
   createdAt            DateTime        @default(now()) @map("created_at")
 
-  channel           ControlChannel?   @relation(fields: [channelId], references: [id])
+  channel           ControlChannel    @relation(fields: [channelId], references: [id])
   attachments       ControlAttachment[]
   thread            ControlThread?
   workingAgreements ControlWorkingAgreement[] @relation("AgreementSourceMessage")

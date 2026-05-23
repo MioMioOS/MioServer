@@ -61,6 +61,7 @@ CONTROL_PLANE_MIGRATIONS=(
   "prisma/migrations/20260523020000_add_control_connection_credentials/migration.sql"
   "prisma/migrations/20260524000000_s1_channels_messages/migration.sql"
   "prisma/migrations/20260524010000_s1_channelid_notnull/migration.sql"
+  "prisma/migrations/20260524020000_s1_senderid_text/migration.sql"
 )
 for migration in "${CONTROL_PLANE_MIGRATIONS[@]}"; do
   echo "==> Applying ${migration}"

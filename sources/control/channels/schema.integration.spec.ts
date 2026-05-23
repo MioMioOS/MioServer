@@ -180,11 +180,16 @@ describe('S1 Chunk 1 — schema + migration', () => {
     });
 
     it('all seeded messages have non-null channelId (backfill contract)', async () => {
-        // This test represents the backfill guarantee: after backfill, no message in
-        // the workroom should have a NULL channelId.
-        const nullMessages = await db.controlMessage.findMany({
-            where: { workroomId: WORKROOM_ID, channelId: null },
+        // channelId is now non-nullable in both schema and DB (I1 fix: s1_channelid_notnull migration).
+        // Verify by counting messages for this workroom that DO have a channelId set.
+        const messages = await db.controlMessage.findMany({
+            where: { workroomId: WORKROOM_ID },
+            select: { id: true, channelId: true },
         });
-        expect(nullMessages).toHaveLength(0);
+        // Every message must have a channelId (non-null enforced at schema + DB level).
+        for (const m of messages) {
+            expect(m.channelId).not.toBeNull();
+            expect(typeof m.channelId).toBe('string');
+        }
     });
 });

@@ -85,7 +85,7 @@ function formatMessage(
     embeddedCardId: string | null;
     threadReplyCount: number;
     createdAt: Date;
-    channelId: string | null;
+    channelId: string;
   },
   senderNames: Map<string, string>,
 ) {
@@ -224,8 +224,8 @@ export async function messageRoutes(app: FastifyInstance) {
       where: { id },
     });
 
-    // 404 if message doesn't exist or has no channel (shouldn't happen post-backfill).
-    if (!msg || !msg.channelId) {
+    // 404 if message doesn't exist.
+    if (!msg) {
       return reply.code(404).send({ error: { code: 'MESSAGE_NOT_FOUND', message: 'Message not found' } });
     }
 

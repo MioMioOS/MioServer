@@ -134,6 +134,12 @@ export async function sendMessageTransaction(input: SendMessageInput): Promise<S
         select: { id: true, seq: true, createdAt: true, workroomId: true, channelId: true, senderKind: true, senderId: true, content: true },
       });
 
+      // Step 5: Bump lastActivityAt on the channel (same tx — keeps the channel list sorted).
+      await tx.controlChannel.update({
+        where: { id: channelId },
+        data: { lastActivityAt: created.createdAt },
+      });
+
       return { ...created, idempotent: false };
     });
 
@@ -144,7 +150,7 @@ export async function sendMessageTransaction(input: SendMessageInput): Promise<S
       created_at: msg.createdAt,
       idempotent: msg.idempotent,
       workroomId: msg.workroomId,
-      channelId: msg.channelId!,
+      channelId: msg.channelId,
       senderKind: msg.senderKind,
       senderId: msg.senderId,
       content: msg.content,
@@ -155,31 +161,55 @@ export async function sendMessageTransaction(input: SendMessageInput): Promise<S
       return err.result;
     }
 
-    // P2002 on (channelId, clientIdempotencyKey) unique constraint → idempotent replay.
-    // Fetch and return the existing message.
+    // P2002: only treat as idempotent replay when:
+    //   1. clientIdempotencyKey is non-null (machine null-key sends should never land here)
+    //   2. err.meta.target refers to the (channelId, clientIdempotencyKey) constraint
+    //      — not a (channelId, seq) collision or some other unique index.
     if (
       err instanceof Prisma.PrismaClientKnownRequestError &&
       err.code === 'P2002' &&
       clientIdempotencyKey != null
     ) {
+      // Confirm the violated constraint is the idempotency one, not the seq one.
+      const target = (err.meta?.target as string[] | string | undefined) ?? [];
+      const targetFields = Array.isArray(target) ? target : [target];
+      const isIdempotencyConstraint =
+        targetFields.includes('client_idempotency_key') ||
+        // Prisma may report the constraint name instead of field names on some versions.
+        targetFields.some((t) => String(t).includes('idempotency'));
+
+      if (!isIdempotencyConstraint) {
+        // Unexpected unique violation (e.g. seq collision) — surface clearly rather than masking.
+        throw new Error(
+          `Unexpected P2002 unique violation on constraint: ${JSON.stringify(target)}. ` +
+          `This is not the idempotency key constraint.`,
+        );
+      }
+
       const existing = await db.controlMessage.findFirst({
         where: { channelId, clientIdempotencyKey },
         select: { id: true, seq: true, createdAt: true, workroomId: true, channelId: true, senderKind: true, senderId: true, content: true },
       });
-      if (existing) {
-        return {
-          ok: true,
-          id: existing.id,
-          seq: existing.seq,
-          created_at: existing.createdAt,
-          idempotent: true,
-          workroomId: existing.workroomId,
-          channelId: existing.channelId!,
-          senderKind: existing.senderKind,
-          senderId: existing.senderId,
-          content: existing.content,
-        };
+
+      if (!existing) {
+        // The constraint fired but we cannot find the row — race or data anomaly.
+        throw new Error(
+          `P2002 idempotency constraint fired for key=${clientIdempotencyKey} but no existing row found.`,
+        );
       }
+
+      return {
+        ok: true,
+        id: existing.id,
+        seq: existing.seq,
+        created_at: existing.createdAt,
+        idempotent: true,
+        workroomId: existing.workroomId,
+        channelId: existing.channelId,
+        senderKind: existing.senderKind,
+        senderId: existing.senderId,
+        content: existing.content,
+      };
     }
 
     throw err;
