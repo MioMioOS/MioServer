@@ -201,14 +201,13 @@ export async function taskRoutes(app: FastifyInstance) {
         const ownerDisplayName = t.ownerInstanceId ? (ownerNames.get(t.ownerInstanceId) ?? null) : null;
         return {
           // ── S3 Slock wire shape (workroom-aggregate = iOS tasks(channelId:nil)) ──
-          // This endpoint is the global aggregate the iOS Slock Tasks tab reads. `status` is the
-          // Slock (iOS) vocab per the locked S3 contract. `server_status` preserves the original
-          // stored vocab for any server-vocab consumer (e.g. the attention-first Home). All other
-          // S3 fields are added additively; the pre-S3 attention fields below are unchanged.
+          // Added ADDITIVELY. `status` is LEFT as the server vocab below (the pre-S3
+          // attention-first Home / legacy ControlPlaneClient decodes `status` as server vocab —
+          // must not change). The Slock (iOS) vocab is exposed as `slock_status`; the iOS
+          // LiveTaskRepository reads `slock_status`.
           id: t.id,
           channel_id: t.channelId,
-          status: serverToSlockStatus(t.status),
-          server_status: t.status,
+          slock_status: serverToSlockStatus(t.status),
           assignee_id: t.ownerInstanceId,
           assignee_display_name: ownerDisplayName,
           // S3: ControlTask has no creator column. We do not have a stored creator identity, so
@@ -220,6 +219,7 @@ export async function taskRoutes(app: FastifyInstance) {
           // ── Pre-S3 attention-first Home contract (unchanged; #186 / #188①) ──
           task_id: t.id,
           title: t.title,
+          status: t.status, // server vocab — legacy ControlPlaneClient decodes this
           owner_instance_id: t.ownerInstanceId,
           owner_role: t.ownerRole,
           // #188①: human-readable owner for the task-row subtitle; null → client hides it (no raw UUID).

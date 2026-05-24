@@ -72,7 +72,8 @@ function formatTask(t: TaskRow, assigneeNames: Map<string, string>) {
     id: t.id,
     channel_id: t.channelId,
     title: t.title,
-    status: serverToSlockStatus(t.status),
+    status: serverToSlockStatus(t.status),       // Slock vocab
+    slock_status: serverToSlockStatus(t.status), // alias so iOS reads `slock_status` uniformly across endpoints
     assignee_id: t.ownerInstanceId,
     assignee_display_name: t.ownerInstanceId ? (assigneeNames.get(t.ownerInstanceId) ?? null) : null,
     // ControlTask has no stored creator identity → null (not fabricated). See taskRoutes.ts note.

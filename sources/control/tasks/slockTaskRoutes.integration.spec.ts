@@ -193,8 +193,10 @@ describe('GET /workrooms/:wid/tasks — workroom aggregate carries S3 Slock shap
     expect(t).toHaveProperty('id');
     expect(t).toHaveProperty('channel_id');
     expect(t).toHaveProperty('assignee_id');
-    // status is the Slock vocab (UPPERCASE).
-    expect(['TODO', 'IN_PROGRESS', 'IN_REVIEW', 'DONE', 'CLOSED']).toContain(t.status);
+    // Slock vocab is exposed as `slock_status` (iOS reads this). The legacy `status`
+    // field stays SERVER vocab so the attention-first Home / ControlPlaneClient is unbroken.
+    expect(['TODO', 'IN_PROGRESS', 'IN_REVIEW', 'DONE', 'CLOSED']).toContain(t.slock_status);
+    expect(['todo', 'in_progress', 'waiting_approval', 'in_review', 'done', 'canceled']).toContain(t.status);
     // pre-S3 attention contract still present.
     expect(t).toHaveProperty('attention_reason');
     expect(t).toHaveProperty('task_id');
