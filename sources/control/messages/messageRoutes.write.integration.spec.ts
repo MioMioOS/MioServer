@@ -189,6 +189,35 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(body.idempotent).toBe(false);
   });
 
+  // ── S2 Task 2.3 (C): POST returns the FULL message wire shape (not the thin
+  // {id,seq,created_at,idempotent}). iOS LiveMessageRepository.send decodes the
+  // full MessageDTO; a thin response would throw a DecodingError.
+  it('op_sess_ send: 201 returns the FULL message wire shape', async () => {
+    const key = randomUUID();
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages`,
+      { content: 'Full shape from operator', client_idempotency_key: key },
+      opSessHeader(),
+    );
+    expect(res.statusCode).toBe(201);
+    const body = JSON.parse(res.body);
+    expect(body).toHaveProperty('id');
+    expect(body).toHaveProperty('seq');
+    expect(body).toHaveProperty('created_at');
+    expect(body.idempotent).toBe(false);
+    // Full wire shape fields:
+    expect(body.sender_kind).toBe('user');
+    expect(body.sender_id).toBe(OPERATOR_SUBJECT_ID);
+    expect(body.content).toBe('Full shape from operator');
+    expect(body).toHaveProperty('sender_display_name');
+    expect(body).toHaveProperty('mentions');
+    expect(body).toHaveProperty('embedded_card_type');
+    expect(body).toHaveProperty('embedded_card_id');
+    expect(body).toHaveProperty('thread_reply_count');
+    expect(body).toHaveProperty('parent_message_id');
+    expect(body.parent_message_id).toBeNull();
+  });
+
   it('machine send: returns 201 with id, seq, created_at, idempotent:false', async () => {
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages`,
@@ -200,6 +229,27 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(body).toHaveProperty('id');
     expect(body).toHaveProperty('seq');
     expect(body.idempotent).toBe(false);
+  });
+
+  it('machine send: 201 returns the FULL message wire shape', async () => {
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages`,
+      { content: 'Full shape from machine' },
+      machineHeader(),
+    );
+    expect(res.statusCode).toBe(201);
+    const body = JSON.parse(res.body);
+    expect(body).toHaveProperty('id');
+    expect(body).toHaveProperty('seq');
+    expect(body.idempotent).toBe(false);
+    // Full wire shape fields:
+    expect(body.sender_kind).toBe('agent');
+    expect(body.sender_id).toBe(MACHINE_ID);
+    expect(body.content).toBe('Full shape from machine');
+    expect(body).toHaveProperty('sender_display_name');
+    expect(body).toHaveProperty('mentions');
+    expect(body).toHaveProperty('parent_message_id');
+    expect(body.parent_message_id).toBeNull();
   });
 
   it('dev_ctl_ → 403 hard reject', async () => {

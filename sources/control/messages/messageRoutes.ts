@@ -99,6 +99,7 @@ function formatMessage(
     threadReplyCount: number;
     createdAt: Date;
     channelId: string;
+    parentMessageId: string | null;
   },
   senderNames: Map<string, string>,
 ) {
@@ -113,8 +114,40 @@ function formatMessage(
     embedded_card_type: msg.embeddedCardType,
     embedded_card_id: msg.embeddedCardId,
     thread_reply_count: msg.threadReplyCount,
+    parent_message_id: msg.parentMessageId ?? null,
     created_at: msg.createdAt.toISOString(),
   };
+}
+
+/**
+ * Re-fetch a written message by id and return its FULL wire shape (§2 In scope C).
+ *
+ * The thin SendMessageResult returned by sendMessageTransaction lacks mentions,
+ * embedded card fields, threadReplyCount and parentMessageId, so the POST routes
+ * re-fetch the row (rather than widen the result type) to build the full response
+ * the iOS client decodes into a Message. Returns null only if the row vanished.
+ */
+async function fetchFormattedMessage(id: string) {
+  const row = await db.controlMessage.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      seq: true,
+      senderKind: true,
+      senderId: true,
+      content: true,
+      mentions: true,
+      embeddedCardType: true,
+      embeddedCardId: true,
+      threadReplyCount: true,
+      createdAt: true,
+      channelId: true,
+      parentMessageId: true,
+    },
+  });
+  if (!row) return null;
+  const names = await resolveSenderDisplayNames([{ senderId: row.senderId, senderKind: row.senderKind }]);
+  return formatMessage(row, names);
 }
 
 export async function messageRoutes(app: FastifyInstance) {
@@ -180,7 +213,8 @@ export async function messageRoutes(app: FastifyInstance) {
 
     if (afterSeq !== undefined) {
       const rows = await db.controlMessage.findMany({
-        where: { channelId: cid, seq: { gt: afterSeq } },
+        // S2 §3/§5: replies (parentMessageId set) are excluded from the main timeline.
+        where: { channelId: cid, seq: { gt: afterSeq }, parentMessageId: null },
         orderBy: { seq: 'asc' },
         take: requestedLimit + 1,
       });
@@ -190,7 +224,8 @@ export async function messageRoutes(app: FastifyInstance) {
       // No after_seq: most recent `limit` rows.
       // Fetch limit+1 desc to detect has_more; slice to limit; reverse to ascending order.
       const rows = await db.controlMessage.findMany({
-        where: { channelId: cid },
+        // S2 §3/§5: replies (parentMessageId set) are excluded from the main timeline.
+        where: { channelId: cid, parentMessageId: null },
         orderBy: { seq: 'desc' },
         take: requestedLimit + 1,
       });
@@ -358,10 +393,9 @@ export async function messageRoutes(app: FastifyInstance) {
       //   2. WS broadcast is fire-and-forget (non-fatal; client catches up via GET /events).
       await writeEventAndBroadcast(result);
 
+      // S2 §2-C: return the FULL message wire shape (re-fetched) + idempotent flag.
       return reply.code(201).send({
-        id: result.id,
-        seq: result.seq.toString(),
-        created_at: result.created_at.toISOString(),
+        ...(await fetchFormattedMessage(result.id))!,
         idempotent: result.idempotent,
       });
     }
@@ -426,10 +460,9 @@ export async function messageRoutes(app: FastifyInstance) {
     // Post-commit write-before-broadcast (same as op_sess_ path above).
     await writeEventAndBroadcast(machineResult);
 
+    // S2 §2-C: return the FULL message wire shape (re-fetched) + idempotent flag.
     return reply.code(201).send({
-      id: machineResult.id,
-      seq: machineResult.seq.toString(),
-      created_at: machineResult.created_at.toISOString(),
+      ...(await fetchFormattedMessage(machineResult.id))!,
       idempotent: machineResult.idempotent,
     });
   });

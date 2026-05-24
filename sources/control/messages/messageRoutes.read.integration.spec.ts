@@ -501,6 +501,70 @@ describe('GET /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(msg).toHaveProperty('thread_reply_count');
     expect(msg).toHaveProperty('created_at');
   });
+
+  // ── S2 Task 2.3: parent_message_id field + replies excluded from main timeline ──
+  it('top-level messages carry parent_message_id: null in the wire shape', async () => {
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages?after_seq=0&limit=1`);
+    expect(res.statusCode).toBe(200);
+    const msg = JSON.parse(res.body).messages[0];
+    expect(msg).toHaveProperty('parent_message_id');
+    expect(msg.parent_message_id).toBeNull();
+  });
+
+  it('GET channel messages excludes reply rows (parentMessageId set)', async () => {
+    // Fresh channel: one top-level message + one reply to it.
+    const ch = await db.controlChannel.create({
+      data: { workroomId: WORKROOM_ID, name: `excl-replies-${randomUUID().slice(0, 8)}`, type: 'standard', visibility: 'public', createdBy: 'system' },
+    });
+    const parentId = randomUUID();
+    await db.controlMessage.create({
+      data: { id: parentId, workroomId: WORKROOM_ID, channelId: ch.id, seq: 1n, senderKind: 'system', senderId: randomUUID(), content: 'top-level' },
+    });
+    await db.controlMessage.create({
+      data: { id: randomUUID(), workroomId: WORKROOM_ID, channelId: ch.id, seq: 2n, senderKind: 'system', senderId: randomUUID(), content: 'a reply', parentMessageId: parentId },
+    });
+
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/channels/${ch.id}/messages?after_seq=0&limit=100`);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    // Only the top-level message appears; the reply is filtered out.
+    expect(body.messages).toHaveLength(1);
+    expect(body.messages[0].id).toBe(parentId);
+    expect(body.has_more).toBe(false);
+
+    // cleanup
+    await db.controlMessage.deleteMany({ where: { channelId: ch.id } });
+    await db.controlChannel.deleteMany({ where: { id: ch.id } });
+  });
+
+  it('GET channel messages excludes replies in the no-after_seq (most-recent) branch too', async () => {
+    const ch = await db.controlChannel.create({
+      data: { workroomId: WORKROOM_ID, name: `excl-replies-recent-${randomUUID().slice(0, 8)}`, type: 'standard', visibility: 'public', createdBy: 'system' },
+    });
+    const parentId = randomUUID();
+    await db.controlMessage.create({
+      data: { id: parentId, workroomId: WORKROOM_ID, channelId: ch.id, seq: 1n, senderKind: 'system', senderId: randomUUID(), content: 'top-level' },
+    });
+    // Two replies (later seqs) — must NOT appear in the most-recent page.
+    await db.controlMessage.create({
+      data: { id: randomUUID(), workroomId: WORKROOM_ID, channelId: ch.id, seq: 2n, senderKind: 'system', senderId: randomUUID(), content: 'reply 1', parentMessageId: parentId },
+    });
+    await db.controlMessage.create({
+      data: { id: randomUUID(), workroomId: WORKROOM_ID, channelId: ch.id, seq: 3n, senderKind: 'system', senderId: randomUUID(), content: 'reply 2', parentMessageId: parentId },
+    });
+
+    // No after_seq → most-recent branch.
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/channels/${ch.id}/messages?limit=10`);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.messages).toHaveLength(1);
+    expect(body.messages[0].id).toBe(parentId);
+    expect(body.has_more).toBe(false);
+
+    // cleanup
+    await db.controlMessage.deleteMany({ where: { channelId: ch.id } });
+    await db.controlChannel.deleteMany({ where: { id: ch.id } });
+  });
 });
 
 // ── GET /api/v1/messages/:id ──────────────────────────────────────────────────
@@ -555,6 +619,9 @@ describe('GET /api/v1/messages/:id', () => {
     expect(body).toHaveProperty('embedded_card_id');
     expect(body).toHaveProperty('thread_reply_count');
     expect(body).toHaveProperty('created_at');
+    // S2 Task 2.3: parent_message_id present (null for a top-level message).
+    expect(body).toHaveProperty('parent_message_id');
+    expect(body.parent_message_id).toBeNull();
   });
 });
 
