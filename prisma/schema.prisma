@@ -548,6 +548,7 @@ model ControlTask {
   id               String          @id @default(uuid()) @db.Uuid
   workroomId       String          @map("workroom_id") @db.Uuid
   workroom         ControlWorkroom @relation(fields: [workroomId], references: [id])
+  channelId        String?         @map("channel_id") @db.Uuid // Slock (S3): channel the task belongs to. nullable → existing rows safe
   goalId           String?         @map("goal_id") @db.Uuid
   sourceMessageId  String?         @map("source_message_id") @db.Uuid
   title            String
@@ -570,6 +571,7 @@ model ControlTask {
 
   @@index([workroomId, status])
   @@index([ownerInstanceId])
+  @@index([channelId])
   @@map("control_tasks")
 }
 
