@@ -69,6 +69,8 @@ export async function verifyDevControlToken(
 const DEV_TOKEN_GET_ALLOWLIST: RegExp[] = [
   /^\/api\/v1\/workrooms\/[^/]+\/channels$/,
   /^\/api\/v1\/workrooms\/[^/]+\/tasks$/,
+  // S3 Slock: per-channel task list (the workroom-aggregate /tasks is already allowlisted above).
+  /^\/api\/v1\/workrooms\/[^/]+\/channels\/[^/]+\/tasks$/,
   /^\/api\/v1\/workrooms\/[^/]+\/actions$/,
   /^\/api\/v1\/actions\/[^/]+$/,
   // #164: server-assist explanation (read-only; workroom-scoped via the /workrooms/:wid/ rule).

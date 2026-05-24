@@ -10,7 +10,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { FastifyRequest } from 'fastify';
 import { randomUUID } from 'crypto';
 import { db } from '@/storage/db';
-import { mintOperatorSession, revokeOperatorSession } from './operatorSessionMint.js';
+import { mintOperatorSession, revokeOperatorSession, V1_OPERATOR_COMMANDS } from './operatorSessionMint.js';
 import {
   verifyOperatorSession,
   operatorSessionAllows,
@@ -51,7 +51,8 @@ describe('#96 verifyOperatorSession — real DB', () => {
     expect(ctx!.workroomId).toBe(WORKROOM_ID);
     expect(ctx!.orgId).toBe(ORG_ID);
     expect(ctx!.operatorSubjectId).toBe(SUBJECT);
-    expect(ctx!.allowedCommands).toEqual(['acknowledge_needs_human', 'mark_reviewed', 'send_message']);
+    // Default = the full V1 allow-list (kept in sync with the constant, which grew with S3 task commands).
+    expect(ctx!.allowedCommands).toEqual([...V1_OPERATOR_COMMANDS]);
   });
 
   it('dev_ctl_ token → null (read-only token can never write)', async () => {

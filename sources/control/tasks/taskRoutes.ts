@@ -31,6 +31,7 @@ import { verifyMachineToken } from '@/machines/machineRoutes';
 import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { SUMMARY_TERMINAL_STATUSES } from '@/control/actionStatusSets';
+import { serverToSlockStatus } from './slockTaskStatus';
 
 const CLAIMABLE_STATUSES = ['todo', 'in_progress', 'waiting_approval', 'in_review'];
 const NON_CLAIMABLE_STATUSES = ['done', 'canceled'];
@@ -197,14 +198,32 @@ export async function taskRoutes(app: FastifyInstance) {
     return {
       tasks: tasks.map((t) => {
         const a = attention.get(t.id);
+        const ownerDisplayName = t.ownerInstanceId ? (ownerNames.get(t.ownerInstanceId) ?? null) : null;
         return {
+          // ── S3 Slock wire shape (workroom-aggregate = iOS tasks(channelId:nil)) ──
+          // This endpoint is the global aggregate the iOS Slock Tasks tab reads. `status` is the
+          // Slock (iOS) vocab per the locked S3 contract. `server_status` preserves the original
+          // stored vocab for any server-vocab consumer (e.g. the attention-first Home). All other
+          // S3 fields are added additively; the pre-S3 attention fields below are unchanged.
+          id: t.id,
+          channel_id: t.channelId,
+          status: serverToSlockStatus(t.status),
+          server_status: t.status,
+          assignee_id: t.ownerInstanceId,
+          assignee_display_name: ownerDisplayName,
+          // S3: ControlTask has no creator column. We do not have a stored creator identity, so
+          // creator_id is null rather than a fabricated/derived value. (Adding a real creator
+          // column is a follow-up if the iOS Tasks UI needs to attribute task authorship.)
+          creator_id: null,
+          thread_id: t.threadId,
+
+          // ── Pre-S3 attention-first Home contract (unchanged; #186 / #188①) ──
           task_id: t.id,
           title: t.title,
-          status: t.status,
           owner_instance_id: t.ownerInstanceId,
           owner_role: t.ownerRole,
           // #188①: human-readable owner for the task-row subtitle; null → client hides it (no raw UUID).
-          owner_display_name: t.ownerInstanceId ? (ownerNames.get(t.ownerInstanceId) ?? null) : null,
+          owner_display_name: ownerDisplayName,
           created_at: t.createdAt.toISOString(),
           updated_at: t.updatedAt.toISOString(),
           // #186 attention-first signal (action-driven). Empty/0 when the task has no actions.

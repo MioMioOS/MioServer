@@ -22,6 +22,7 @@ import { channelRoutes } from '@/control/channels/channelRoutes';
 import { messageRoutes } from '@/control/messages/messageRoutes';
 import { memberRoutes } from '@/control/members/memberRoutes';
 import { taskRoutes } from '@/control/tasks/taskRoutes';
+import { slockTaskRoutes } from '@/control/tasks/slockTaskRoutes';
 import { actionRoutes } from '@/control/actions/actionRoutes';
 import { eventRoutes } from '@/control/events/eventRoutes';
 import { artifactRoutes } from '@/control/artifacts/artifactRoutes';
@@ -82,6 +83,7 @@ export async function startApi() {
     await app.register(messageRoutes);
     await app.register(memberRoutes);
     await app.register(taskRoutes);
+await app.register(slockTaskRoutes);
     await app.register(actionRoutes, { credentialStore });
     await app.register(operatorWriteRoutes);
     await app.register(operatorPairingRoutes);
