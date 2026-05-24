@@ -33,6 +33,9 @@ export const V1_OPERATOR_COMMANDS = [
   'create_task',
   'update_task_status',
   'assign_task',
+  // S6 channel write-ops: operator (phone) channel commands.
+  'create_channel',
+  'manage_members',
 ] as const;
 export type V1OperatorCommand = (typeof V1_OPERATOR_COMMANDS)[number];
 
