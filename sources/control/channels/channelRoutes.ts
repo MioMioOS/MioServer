@@ -204,6 +204,77 @@ export async function channelRoutes(app: FastifyInstance) {
   });
 
   /**
+   * GET /api/v1/workrooms/:wid/dms  (S4 — DM read path)
+   *
+   * Returns the direct-message channels for a workroom.
+   * Contract: { dms: [{ id, peer_member_id, unread_count, last_activity_at }] }
+   *
+   * A dm channel is a ControlChannel where workroomId=:wid AND type='dm'.
+   *
+   * Per dm:
+   *   peer_member_id = the first ControlChannelMember.memberId that is NOT the caller
+   *                    (null if none / unknown). For dev mode the caller has no member
+   *                    identity, so this resolves to the first member.
+   *   unread_count   = 0 — there is no read-cursor system yet, so this is an honest 0
+   *                    (NOT a stub: it reflects the real absence of per-caller read state).
+   *   last_activity_at = channel.lastActivityAt (ISO8601 or null).
+   *
+   * Scope:
+   *   machine mode → only dm channels where machine.id is a ControlChannelMember.
+   *   dev mode     → ALL dm channels in the workroom. A dev_ctl_ token has no operator
+   *                  subject (it is a read/debug token), so there is no member identity to
+   *                  filter by; authorizeControlRead already scoped it to this workroom.
+   *
+   * Auth: authorizeControlRead (machine_token OR dev_control_token). machine mode also
+   *       enforces org/workroom access via requireMachineAccessToWorkroom.
+   */
+  app.get('/api/v1/workrooms/:wid/dms', async (request, reply) => {
+    const auth = await authorizeControlRead(request);
+    if (!auth.ok) {
+      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
+    }
+
+    const { wid } = request.params as { wid: string };
+
+    // machine mode: enforce org/workroom access. dev mode: already workroom-scoped by auth.
+    if (auth.mode === 'machine') {
+      const access = await requireMachineAccessToWorkroom(auth.machine, wid);
+      if (!access.ok) return reply.code(access.status).send({ error: access.error });
+    }
+
+    // Caller identity: machine → machine.id (used to filter membership + resolve peer).
+    // dev → no member identity (null): return all dm channels, peer = first member.
+    const callerId: string | null = auth.mode === 'machine' ? auth.machine.id : null;
+
+    const dmChannels = await db.controlChannel.findMany({
+      where: {
+        workroomId: wid,
+        type: 'dm',
+        archivedAt: null,
+        // machine mode restricts to dm channels the caller is a member of; dev mode = all.
+        ...(callerId ? { members: { some: { memberId: callerId } } } : {}),
+      },
+      include: {
+        members: { select: { memberId: true } },
+      },
+      orderBy: { lastActivityAt: 'desc' },
+    });
+
+    const dms = dmChannels.map((ch) => {
+      // peer = first member that is not the caller (dev mode: callerId null → first member).
+      const peer = ch.members.find((m) => m.memberId !== callerId)?.memberId ?? null;
+      return {
+        id: ch.id,
+        peer_member_id: peer,
+        unread_count: 0, // honest 0: no read-cursor system yet (not a stub).
+        last_activity_at: ch.lastActivityAt?.toISOString() ?? null,
+      };
+    });
+
+    return { dms };
+  });
+
+  /**
    * POST /api/v1/workrooms/:wid/channels  (S6)
    *
    * Create a 'standard' channel. Auth: op_sess_('create_channel') OR machine_token; dev_ctl_ → 403.
