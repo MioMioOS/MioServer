@@ -15,6 +15,7 @@ import {
   revokeOperatorSession,
   OperatorSessionMintError,
   OPERATOR_SESSION_MAX_TTL_HOURS,
+  V1_OPERATOR_COMMANDS,
 } from './operatorSessionMint.js';
 
 const ORG_ID = randomUUID();
@@ -40,7 +41,8 @@ describe('#86 mintOperatorSession — real DB', () => {
   it('mints an op_sess_ token, stores only the sha256 hash (never raw), default V1 commands', async () => {
     const r = await mintOperatorSession({ orgId: ORG_ID, workroomId: WORKROOM_ID, operatorSubjectId: SUBJECT, issuedBy: ISSUED_BY });
     expect(r.rawToken.startsWith('op_sess_')).toBe(true);
-    expect(r.allowedCommands).toEqual(['acknowledge_needs_human', 'mark_reviewed', 'send_message']);
+    // Default = the full V1 allow-list (kept in sync with the constant, which grew with S3 task commands).
+    expect(r.allowedCommands).toEqual([...V1_OPERATOR_COMMANDS]);
 
     const row = await db.controlOperatorSession.findUnique({ where: { id: r.id } });
     expect(row).not.toBeNull();
