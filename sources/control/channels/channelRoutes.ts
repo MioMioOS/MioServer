@@ -54,7 +54,7 @@ type WriteActor =
  */
 async function authorizeChannelWrite(
   request: FastifyRequest,
-  command: 'create_channel' | 'manage_members',
+  command: 'create_channel' | 'manage_members' | 'stop_agents',
   workroomId: string,
 ): Promise<WriteActor> {
   const authHeader = request.headers.authorization;
@@ -99,7 +99,7 @@ async function channelMemberCount(channelId: string): Promise<number> {
  */
 async function writeChannelEventAndBroadcast(
   workroomId: string,
-  topic: 'channel.created' | 'channel.member_added' | 'channel.member_removed',
+  topic: 'channel.created' | 'channel.member_added' | 'channel.member_removed' | 'agents.stop',
   payload: Record<string, unknown>,
 ): Promise<void> {
   const event = await publishControlEvent({ workroomId, eventId: randomUUID(), topic, payload });
@@ -442,6 +442,42 @@ export async function channelRoutes(app: FastifyInstance) {
       channel_id: cid,
       member_id: memberId,
       removed_by: actor.actorId,
+    });
+
+    return reply.send({ ok: true });
+  });
+
+  /**
+   * POST /api/v1/workrooms/:wid/channels/:cid/stop-agents  (emergency stop)
+   *
+   * The channel-header "□ Stop all agents" emergency stop. A human operator (op_sess_)
+   * — or a machine — hits this; the server broadcasts an `agents.stop` event scoped to
+   * the channel. Each mio-agent autonomous loop subscribed to the workroom, on receiving
+   * the event for ITS channel, halts auto-replying until the daemon restarts.
+   *
+   * Auth: op_sess_('stop_agents') OR machine_token; dev_ctl_ → 403.
+   * Validates the channel belongs to :wid (404 otherwise — covers cross-workroom + missing).
+   * Publishes 'agents.stop' (write-before-broadcast). Returns { ok: true }.
+   *
+   * No body. Idempotent at the operator level: re-pressing stop just emits another
+   * agents.stop event (the daemon's stopped flag is already set; replays are harmless).
+   * This is a POST (a state-changing op), so it is NOT added to the dev_ctl_ GET allowlist.
+   */
+  app.post('/api/v1/workrooms/:wid/channels/:cid/stop-agents', async (request, reply) => {
+    const { wid, cid } = request.params as { wid: string; cid: string };
+
+    const actor = await authorizeChannelWrite(request, 'stop_agents', wid);
+    if (!actor.ok) return reply.code(actor.status).send(actor.body);
+
+    // Validate channel ∈ workroom (404 covers both missing channel and cross-workroom).
+    const channel = await db.controlChannel.findUnique({ where: { id: cid }, select: { workroomId: true } });
+    if (!channel || channel.workroomId !== wid) {
+      return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+    }
+
+    await writeChannelEventAndBroadcast(wid, 'agents.stop', {
+      channel_id: cid,
+      stopped_by: actor.actorId,
     });
 
     return reply.send({ ok: true });
