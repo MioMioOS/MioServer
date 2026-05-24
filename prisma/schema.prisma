@@ -434,6 +434,7 @@ model ControlAgent {
   handoffs         ControlHandoff[]                 @relation("HandoffTarget")
   roleInsights     ControlRoleInsight[]
 
+  @@unique([orgId, machineId])
   @@index([orgId, status])
   @@map("control_agents")
 }
