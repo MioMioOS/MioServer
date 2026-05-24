@@ -174,6 +174,9 @@ describe('dev_control_token dual-auth — real DB security matrix (#32)', () => 
         expect(isDevTokenAllowedPath('GET', `/api/v1/workrooms/${WORKROOM_A}/channels/${CHAN_ID}/messages`)).toBe(true);
         expect(isDevTokenAllowedPath('GET', `/api/v1/workrooms/${WORKROOM_A}/channels/${CHAN_ID}/messages?after_seq=5&limit=50`)).toBe(true);
         expect(isDevTokenAllowedPath('GET', `/api/v1/messages/${MSG_ID}`)).toBe(true);
+        // S2 Chunk 1: members endpoint now in allowlist (GET only).
+        expect(isDevTokenAllowedPath('GET', `/api/v1/workrooms/${WORKROOM_A}/members`)).toBe(true);
+        expect(isDevTokenAllowedPath('POST', `/api/v1/workrooms/${WORKROOM_A}/members`)).toBe(false);
         // POST on the message endpoint is still hard-rejected (write-only for op_sess_/machine).
         expect(isDevTokenAllowedPath('POST', `/api/v1/workrooms/${WORKROOM_A}/channels/${CHAN_ID}/messages`)).toBe(false);
         // Non-GET methods on an allowlisted path → denied.

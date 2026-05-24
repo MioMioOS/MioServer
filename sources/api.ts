@@ -20,6 +20,7 @@ import { machineRoutes } from '@/machines/machineRoutes';
 import { workroomRoutes } from '@/control/workrooms/workroomRoutes';
 import { channelRoutes } from '@/control/channels/channelRoutes';
 import { messageRoutes } from '@/control/messages/messageRoutes';
+import { memberRoutes } from '@/control/members/memberRoutes';
 import { taskRoutes } from '@/control/tasks/taskRoutes';
 import { actionRoutes } from '@/control/actions/actionRoutes';
 import { eventRoutes } from '@/control/events/eventRoutes';
@@ -79,6 +80,7 @@ export async function startApi() {
     await app.register(workroomRoutes);
     await app.register(channelRoutes);
     await app.register(messageRoutes);
+    await app.register(memberRoutes);
     await app.register(taskRoutes);
     await app.register(actionRoutes, { credentialStore });
     await app.register(operatorWriteRoutes);

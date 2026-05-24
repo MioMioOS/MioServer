@@ -76,6 +76,8 @@ const DEV_TOKEN_GET_ALLOWLIST: RegExp[] = [
   // S1: message read endpoints (Chunk 5 allowlist expansion).
   /^\/api\/v1\/workrooms\/[^/]+\/channels\/[^/]+\/messages$/,
   /^\/api\/v1\/messages\/[^/]+$/,
+  // S2: members endpoint (workroom-scope already enforced by devTokenInWorkroomScope).
+  /^\/api\/v1\/workrooms\/[^/]+\/members$/,
 ];
 
 /** True iff (method, path) is an allowed dev-token GET endpoint. Default-deny. */
