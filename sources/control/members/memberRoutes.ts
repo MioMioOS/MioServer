@@ -7,7 +7,9 @@
  *     included this period (no human display-name table; see spec §6/§8).
  *
  * Contract (§4.1 spec):
- *   { members: [{ id, kind:'agent', display_name, role, status, machine_id }] }
+ *   { members: [{ id, kind:'agent', display_name, role, status, machine_id, runtime, model }] }
+ *   (runtime + model are ADDITIVE fields for the "Create Agent" surface so a freshly
+ *    created agent's runtime/model show up in the members list immediately.)
  *
  * Auth: dual-read via authorizeControlRead (machine_token OR dev_control_token).
  *   - machine mode: also enforces org/workroom access via requireMachineAccessToWorkroom
@@ -57,7 +59,7 @@ export async function memberRoutes(app: FastifyInstance) {
 
     const agents = await db.controlAgent.findMany({
       where: { orgId: wr.orgId },
-      select: { id: true, displayName: true, name: true, role: true, status: true, machineId: true },
+      select: { id: true, displayName: true, name: true, role: true, status: true, machineId: true, runtime: true, model: true },
       orderBy: [{ displayName: 'asc' }],
     });
 
@@ -75,6 +77,8 @@ export async function memberRoutes(app: FastifyInstance) {
       role: a.role,
       status: a.status,
       machine_id: a.machineId,
+      runtime: a.runtime,
+      model: a.model,
     }));
 
     return { members };

@@ -1,0 +1,361 @@
+/**
+ * S2 "Create Agent" — GET /workrooms/:wid/computers + POST /workrooms/:wid/agents
+ * (REAL Postgres integration).
+ * Run: npm run test:db:setup && npm run test:integration
+ *
+ * FAST MODE — only meaningful tests:
+ *   GET /computers:
+ *     - machine_token (org match) → 200, only the org's machines, name + status derived
+ *     - online window: recent lastSeenAt → 'online'; stale/null → 'offline'
+ *     - dev_ctl_ in scope → 200; dev_ctl_ for a DIFFERENT workroom → 403
+ *     - cross-org machine → 403; non-existent workroom → 404; no token → 401
+ *   POST /agents:
+ *     - op_sess_('create_agent') → 201, full wire shape, status 'offline' (not running yet)
+ *     - machine_token → 201
+ *     - stores model + runtime + env (capabilities.env) and appears in GET /members
+ *     - dev_ctl_ → 403; no token → 401
+ *     - empty name → 400; machine not in org → 404
+ *     - publishes 'agent.created' event
+ *     - runtime/model defaults (runtime='claude', model=null) when omitted
+ */
+
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import fastify, { type FastifyInstance } from 'fastify';
+import { createHash, randomUUID } from 'crypto';
+import { db } from '@/storage/db';
+import { agentRoutes } from './agentRoutes';
+import { memberRoutes } from '@/control/members/memberRoutes';
+import { mintOperatorSession, V1_OPERATOR_COMMANDS } from '@/control/operatorSessions/operatorSessionMint';
+
+// ── Fixture IDs ───────────────────────────────────────────────────────────────
+
+const ORG_ID = randomUUID();
+const OTHER_ORG_ID = randomUUID();
+const WORKROOM_ID = randomUUID();        // belongs to ORG_ID
+const OTHER_WORKROOM_ID = randomUUID();  // belongs to OTHER_ORG_ID
+
+// Machines in ORG_ID
+const MACHINE_ONLINE_ID = randomUUID();  // recent lastSeenAt → online, has displayName
+const MACHINE_STALE_ID = randomUUID();   // stale lastSeenAt → offline
+const MACHINE_NEVER_ID = randomUUID();   // null lastSeenAt → offline, no displayName
+// Machine in OTHER_ORG_ID (must NOT leak / used for create-404)
+const OTHER_MACHINE_ID = randomUUID();
+
+// Dedicated ORG_ID machines for the POST tests. @@unique([orgId, machineId]) means ONE agent
+// per machine per org, so each 201-expecting create needs its own machine. Created in the POST
+// describe's beforeAll (AFTER the GET /computers count assertions) so they don't perturb those.
+const MACHINE_CREATE_OPSESS = randomUUID();
+const MACHINE_CREATE_ENV = randomUUID();
+const MACHINE_CREATE_MACHINE = randomUUID();
+const MACHINE_CREATE_EVENT = randomUUID();
+const POST_ONLY_MACHINE_IDS = [MACHINE_CREATE_OPSESS, MACHINE_CREATE_ENV, MACHINE_CREATE_MACHINE, MACHINE_CREATE_EVENT];
+
+const MACHINE_RAW_TOKEN = `machine_${randomUUID().replace(/-/g, '')}`;       // bound to ORG_ID (MACHINE_ONLINE_ID)
+const OTHER_MACHINE_RAW_TOKEN = `machine_${randomUUID().replace(/-/g, '')}`; // bound to OTHER_ORG_ID
+const DEV_CTL_RAW_TOKEN = `dev_ctl_${randomUUID().replace(/-/g, '')}`;       // scoped to WORKROOM_ID
+
+const OPERATOR_SUBJECT_ID = `pairing:${randomUUID()}`;
+let OP_SESS_RAW_TOKEN = '';
+let APP: FastifyInstance;
+
+const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
+
+const opSessHeader = () => ({ authorization: `Bearer ${OP_SESS_RAW_TOKEN}` });
+const machineHeader = () => ({ authorization: `Bearer ${MACHINE_RAW_TOKEN}` });
+const otherMachineHeader = () => ({ authorization: `Bearer ${OTHER_MACHINE_RAW_TOKEN}` });
+const devCtlHeader = () => ({ authorization: `Bearer ${DEV_CTL_RAW_TOKEN}` });
+
+function get(url: string, headers: Record<string, string> = machineHeader()) {
+  return APP.inject({ method: 'GET', url, headers });
+}
+function post(url: string, body: Record<string, unknown>, headers: Record<string, string> = opSessHeader()) {
+  return APP.inject({
+    method: 'POST',
+    url,
+    headers: { 'content-type': 'application/json', ...headers },
+    payload: JSON.stringify(body),
+  });
+}
+
+// ── Setup / teardown ──────────────────────────────────────────────────────────
+
+beforeAll(async () => {
+  APP = fastify();
+  await APP.register(agentRoutes);
+  await APP.register(memberRoutes);
+  await APP.ready();
+
+  await db.controlOrg.create({ data: { id: ORG_ID, name: 'Agents Org', slug: `agt-${randomUUID()}`, ownerUserId: randomUUID() } });
+  await db.controlOrg.create({ data: { id: OTHER_ORG_ID, name: 'Agents OtherOrg', slug: `agt-other-${randomUUID()}`, ownerUserId: randomUUID() } });
+
+  await db.controlWorkroom.create({ data: { id: WORKROOM_ID, orgId: ORG_ID, name: 'Agents WR', createdBy: randomUUID() } });
+  await db.controlWorkroom.create({ data: { id: OTHER_WORKROOM_ID, orgId: OTHER_ORG_ID, name: 'Agents OtherWR', createdBy: randomUUID() } });
+
+  const tokenExpiresAt = new Date(Date.now() + 24 * 3600_000);
+
+  // ORG_ID machines. MACHINE_ONLINE carries the auth token + a displayName.
+  await db.controlMachine.create({
+    data: {
+      id: MACHINE_ONLINE_ID, orgId: ORG_ID, displayName: "Laurent's MBP",
+      tokenHash: sha256(MACHINE_RAW_TOKEN), tokenExpiresAt,
+      platform: 'darwin', arch: 'arm64', lastSeenAt: new Date(),
+    },
+  });
+  await db.controlMachine.create({
+    data: {
+      id: MACHINE_STALE_ID, orgId: ORG_ID, displayName: 'Stale Box',
+      tokenHash: sha256(`machine_${randomUUID().replace(/-/g, '')}`), tokenExpiresAt,
+      platform: 'linux', arch: 'x64', lastSeenAt: new Date(Date.now() - 10 * 60 * 1000), // 10 min ago → offline
+    },
+  });
+  await db.controlMachine.create({
+    data: {
+      id: MACHINE_NEVER_ID, orgId: ORG_ID, displayName: null,
+      tokenHash: sha256(`machine_${randomUUID().replace(/-/g, '')}`), tokenExpiresAt,
+      platform: 'darwin', arch: 'arm64', lastSeenAt: null, // never seen → offline + generated name
+    },
+  });
+  await db.controlMachine.create({
+    data: {
+      id: OTHER_MACHINE_ID, orgId: OTHER_ORG_ID,
+      tokenHash: sha256(OTHER_MACHINE_RAW_TOKEN), tokenExpiresAt,
+      platform: 'darwin', arch: 'arm64', lastSeenAt: new Date(),
+    },
+  });
+
+  await db.controlDevToken.create({
+    data: { tokenHash: sha256(DEV_CTL_RAW_TOKEN), orgId: ORG_ID, workroomId: WORKROOM_ID, scope: 'read_only', expiresAt: tokenExpiresAt },
+  });
+
+  const minted = await mintOperatorSession({
+    orgId: ORG_ID,
+    workroomId: WORKROOM_ID,
+    operatorSubjectId: OPERATOR_SUBJECT_ID,
+    issuedBy: 'test',
+    allowedCommands: [...V1_OPERATOR_COMMANDS],
+  });
+  OP_SESS_RAW_TOKEN = minted.rawToken;
+});
+
+afterAll(async () => {
+  const wrIds = [WORKROOM_ID, OTHER_WORKROOM_ID];
+  await db.controlEventLog.deleteMany({ where: { workroomId: { in: wrIds } } });
+  await db.controlOperatorSession.deleteMany({ where: { workroomId: { in: wrIds } } });
+  await db.controlAgent.deleteMany({ where: { orgId: { in: [ORG_ID, OTHER_ORG_ID] } } });
+  await db.controlMachine.deleteMany({ where: { id: { in: [MACHINE_ONLINE_ID, MACHINE_STALE_ID, MACHINE_NEVER_ID, OTHER_MACHINE_ID, ...POST_ONLY_MACHINE_IDS] } } });
+  await db.controlDevToken.deleteMany({ where: { orgId: { in: [ORG_ID, OTHER_ORG_ID] } } });
+  await db.controlWorkroom.deleteMany({ where: { id: { in: wrIds } } });
+  await db.controlOrg.deleteMany({ where: { id: { in: [ORG_ID, OTHER_ORG_ID] } } });
+  await APP.close();
+  await db.$disconnect();
+});
+
+// ── 'create_agent' command is grantable ───────────────────────────────────────
+
+describe('V1_OPERATOR_COMMANDS includes create_agent', () => {
+  it('contains create_agent', () => {
+    expect(V1_OPERATOR_COMMANDS).toContain('create_agent');
+  });
+});
+
+// ── GET /api/v1/workrooms/:wid/computers ───────────────────────────────────────
+
+describe('GET /api/v1/workrooms/:wid/computers', () => {
+  it('machine_token (org match) → 200, only the org machines, name + status derived', async () => {
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/computers`, machineHeader());
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    const ids = body.computers.map((c: { id: string }) => c.id).sort();
+    expect(ids).toEqual([MACHINE_ONLINE_ID, MACHINE_STALE_ID, MACHINE_NEVER_ID].sort());
+    expect(ids).not.toContain(OTHER_MACHINE_ID);
+
+    const online = body.computers.find((c: { id: string }) => c.id === MACHINE_ONLINE_ID);
+    expect(online.name).toBe("Laurent's MBP");
+    expect(online.platform).toBe('darwin');
+    expect(online.arch).toBe('arm64');
+    expect(online.status).toBe('online');
+  });
+
+  it('online window: stale lastSeenAt → offline; null lastSeenAt → offline + generated name', async () => {
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/computers`, machineHeader());
+    const body = JSON.parse(res.body);
+
+    const stale = body.computers.find((c: { id: string }) => c.id === MACHINE_STALE_ID);
+    expect(stale.status).toBe('offline');
+
+    const never = body.computers.find((c: { id: string }) => c.id === MACHINE_NEVER_ID);
+    expect(never.status).toBe('offline');
+    // No displayName → 'Machine ' + id.slice(0,6).
+    expect(never.name).toBe(`Machine ${MACHINE_NEVER_ID.slice(0, 6)}`);
+  });
+
+  it('dev_ctl_ in scope → 200', async () => {
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/computers`, devCtlHeader());
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).computers.length).toBe(3);
+  });
+
+  it('dev_ctl_ for a DIFFERENT workroom → 403 (scope)', async () => {
+    const res = await get(`/api/v1/workrooms/${OTHER_WORKROOM_ID}/computers`, devCtlHeader());
+    expect(res.statusCode).toBe(403);
+  });
+
+  it('machine bound to ANOTHER org → 403 (cross-org)', async () => {
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/computers`, otherMachineHeader());
+    expect(res.statusCode).toBe(403);
+  });
+
+  it('non-existent workroom → 404', async () => {
+    const res = await get(`/api/v1/workrooms/${randomUUID()}/computers`, machineHeader());
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('no token → 401', async () => {
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/computers`, {});
+    expect(res.statusCode).toBe(401);
+  });
+});
+
+// ── POST /api/v1/workrooms/:wid/agents ─────────────────────────────────────────
+
+describe('POST /api/v1/workrooms/:wid/agents', () => {
+  beforeAll(async () => {
+    // Dedicated machines (one agent per machine per org) for the 201-expecting creates.
+    const tokenExpiresAt = new Date(Date.now() + 24 * 3600_000);
+    await db.controlMachine.createMany({
+      data: POST_ONLY_MACHINE_IDS.map((id) => ({
+        id, orgId: ORG_ID,
+        tokenHash: sha256(`machine_${id}`), tokenExpiresAt,
+        platform: 'darwin', arch: 'arm64', lastSeenAt: null,
+      })),
+    });
+  });
+
+  it('op_sess_ create: 201, full wire shape, status offline (NOT running yet)', async () => {
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/agents`,
+      { machine_id: MACHINE_CREATE_OPSESS, name: 'Builder', description: 'builds things', runtime: 'codex', model: 'opus', env: { FOO: 'bar' } },
+      opSessHeader(),
+    );
+    expect(res.statusCode).toBe(201);
+    const body = JSON.parse(res.body);
+
+    // Same wire shape as a GET /members item + runtime + model.
+    expect(body).toHaveProperty('id');
+    expect(body.kind).toBe('agent');
+    expect(body.display_name).toBe('Builder');
+    expect(body.role).toBe('other');
+    expect(body.machine_id).toBe(MACHINE_CREATE_OPSESS);
+    expect(body.runtime).toBe('codex');
+    expect(body.model).toBe('opus');
+    // Honest: the row exists but the agent is not running.
+    expect(body.status).toBe('offline');
+  });
+
+  it('stores model + runtime + env (capabilities.env); appears in GET /members', async () => {
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/agents`,
+      { machine_id: MACHINE_CREATE_ENV, name: 'EnvAgent', runtime: 'claude', model: 'sonnet', env: { KEY: 'VALUE', SECOND: 'two' } },
+      opSessHeader(),
+    );
+    expect(res.statusCode).toBe(201);
+    const created = JSON.parse(res.body);
+
+    // Persisted columns + capabilities.env.
+    const row = await db.controlAgent.findUnique({
+      where: { id: created.id },
+      select: { runtime: true, model: true, capabilities: true, description: true, permissions: true, status: true },
+    });
+    expect(row!.runtime).toBe('claude');
+    expect(row!.model).toBe('sonnet');
+    expect(row!.status).toBe('offline');
+    expect(row!.description).toBe('');
+    expect((row!.capabilities as { env: Record<string, string> }).env).toEqual({ KEY: 'VALUE', SECOND: 'two' });
+
+    // Appears in GET /members with runtime + model surfaced.
+    const members = await get(`/api/v1/workrooms/${WORKROOM_ID}/members`, machineHeader());
+    expect(members.statusCode).toBe(200);
+    const found = JSON.parse(members.body).members.find((m: { id: string }) => m.id === created.id);
+    expect(found).toBeDefined();
+    expect(found.display_name).toBe('EnvAgent');
+    expect(found.runtime).toBe('claude');
+    expect(found.model).toBe('sonnet');
+    expect(found.machine_id).toBe(MACHINE_CREATE_ENV);
+  });
+
+  it('machine_token create → 201', async () => {
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/agents`,
+      { machine_id: MACHINE_CREATE_MACHINE, name: 'MachineMade' },
+      machineHeader(),
+    );
+    expect(res.statusCode).toBe(201);
+    const body = JSON.parse(res.body);
+    // Defaults: runtime 'claude', model null when omitted.
+    expect(body.runtime).toBe('claude');
+    expect(body.model).toBeNull();
+    expect(body.machine_id).toBe(MACHINE_CREATE_MACHINE);
+  });
+
+  it('empty name → 400', async () => {
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/agents`,
+      { machine_id: MACHINE_STALE_ID, name: '   ' },
+      opSessHeader(),
+    );
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('machine not in workroom org → 404', async () => {
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/agents`,
+      { machine_id: OTHER_MACHINE_ID, name: 'CrossOrgAgent' },
+      opSessHeader(),
+    );
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('non-existent machine → 404', async () => {
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/agents`,
+      { machine_id: randomUUID(), name: 'GhostMachineAgent' },
+      opSessHeader(),
+    );
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('dev_ctl_ → 403 hard reject', async () => {
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/agents`,
+      { machine_id: MACHINE_STALE_ID, name: 'Denied' },
+      devCtlHeader(),
+    );
+    expect(res.statusCode).toBe(403);
+  });
+
+  it('no auth → 401', async () => {
+    const res = await post(`/api/v1/workrooms/${WORKROOM_ID}/agents`, { machine_id: MACHINE_STALE_ID, name: 'x' }, {});
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('publishes agent.created event', async () => {
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/agents`,
+      { machine_id: MACHINE_CREATE_EVENT, name: 'Evented', runtime: 'kimi', model: 'k2' },
+      opSessHeader(),
+    );
+    expect(res.statusCode).toBe(201);
+    const body = JSON.parse(res.body);
+
+    const event = await db.controlEventLog.findFirst({
+      where: { workroomId: WORKROOM_ID, topic: 'agent.created' },
+      orderBy: { createdAt: 'desc' },
+    });
+    expect(event).not.toBeNull();
+    const payload = event!.payloadJson as Record<string, unknown>;
+    expect(payload.agent_id).toBe(body.id);
+    expect(payload.machine_id).toBe(MACHINE_CREATE_EVENT);
+    expect(payload.runtime).toBe('kimi');
+    expect(payload.model).toBe('k2');
+  });
+});
