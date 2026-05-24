@@ -151,7 +151,9 @@ afterAll(async () => {
   await db.controlChannel.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlChannel.deleteMany({ where: { workroomId: WORKROOM_B_ID } });
   await db.controlWorkroom.deleteMany({ where: { id: { in: [WORKROOM_ID, WORKROOM_B_ID] } } });
-  await db.controlAgent.deleteMany({ where: { id: AGENT_ID } });
+  // Delete all agents in this org (covers AGENT_ID + any per-test daemon agents
+  // whose own cleanup may not have run if a test failed mid-way).
+  await db.controlAgent.deleteMany({ where: { orgId: ORG_ID } });
   await db.controlMachine.deleteMany({ where: { id: MACHINE_ID } });
   await db.controlOrg.deleteMany({ where: { id: ORG_ID } });
   await APP.close();
@@ -239,6 +241,70 @@ describe('GET /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     const msg = body.messages[0];
     expect(msg.sender_kind).toBe('agent');
     expect(msg.sender_display_name).toBe('Msg Agent');
+  });
+
+  // ── S2 §1.4: additive name resolution by machineId (daemon send) ─────────────
+  //
+  // A daemon sends as senderKind='agent', senderId = machine.id (NOT ControlAgent.id).
+  // Before S2 the resolver only matched ControlAgent.id, so daemon messages resolved
+  // to null and the iOS app rendered the raw UUID. S2 adds an OR machineId branch.
+  // This test seeds an agent with a machineId and a message whose senderId == that
+  // machineId, and asserts the display name resolves. The existing positive test above
+  // ('resolves sender_display_name for agent senders') already covers the id branch and
+  // must stay green (additive, not replaced).
+  it('resolves agent display_name by machineId (daemon send)', async () => {
+    const daemonAgentId = randomUUID();
+    const daemonMachineId = randomUUID(); // the machine.id the daemon sends as
+    await db.controlAgent.create({
+      data: {
+        id: daemonAgentId,
+        orgId: ORG_ID,
+        machineId: daemonMachineId,
+        name: 'mio-daemon',
+        displayName: 'Mio',
+        role: 'other',
+        status: 'online',
+      },
+    });
+
+    const daemonCh = await db.controlChannel.create({
+      data: {
+        workroomId: WORKROOM_ID,
+        name: `daemon-machineid-${randomUUID().slice(0, 8)}`,
+        type: 'standard',
+        visibility: 'public',
+        createdBy: 'system',
+      },
+    });
+
+    // message sent as the MACHINE id (not the agent id)
+    const msgId = randomUUID();
+    await db.controlMessage.create({
+      data: {
+        id: msgId,
+        workroomId: WORKROOM_ID,
+        channelId: daemonCh.id,
+        seq: 1n,
+        senderKind: 'agent',
+        senderId: daemonMachineId,
+        content: 'hello from the daemon',
+      },
+    });
+
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/channels/${daemonCh.id}/messages`);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.messages).toHaveLength(1);
+    const msg = body.messages[0];
+    expect(msg.sender_kind).toBe('agent');
+    expect(msg.sender_id).toBe(daemonMachineId);
+    // Resolved via the new machineId branch.
+    expect(msg.sender_display_name).toBe('Mio');
+
+    // cleanup
+    await db.controlMessage.deleteMany({ where: { channelId: daemonCh.id } });
+    await db.controlChannel.deleteMany({ where: { id: daemonCh.id } });
+    await db.controlAgent.deleteMany({ where: { id: daemonAgentId } });
   });
 
   // ── Regression: P2023 non-uuid agent senderId (commit 5ff4c39) ───────────────

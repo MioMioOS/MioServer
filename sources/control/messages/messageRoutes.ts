@@ -63,14 +63,21 @@ async function resolveSenderDisplayNames(
   ];
   if (agentIds.length === 0) return result;
 
+  // S2 §1.4 — additive (id ∪ machineId) resolution. An agent senderId may be either
+  // ControlAgent.id (agent sent as itself, S1) OR machine.id (daemon send). Match on
+  // either and key the result map by whichever id the sender actually used.
+  //   - id is @db.Uuid: agentIds are already uuid-shape-filtered above → safe to query.
+  //   - machineId is text: querying it with the same (uuid-shaped) agentIds is safe.
   const agents = await db.controlAgent.findMany({
-    where: { id: { in: agentIds } },
-    select: { id: true, displayName: true, name: true },
+    where: { OR: [{ id: { in: agentIds } }, { machineId: { in: agentIds } }] },
+    select: { id: true, machineId: true, displayName: true, name: true },
   });
 
   for (const a of agents) {
     const label = a.displayName?.trim() || a.name?.trim();
-    if (label) result.set(a.id, label);
+    if (!label) continue;
+    result.set(a.id, label);                         // agent-id senders (S1)
+    if (a.machineId) result.set(a.machineId, label); // machine-id senders (daemon)
   }
   return result;
 }
