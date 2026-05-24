@@ -421,6 +421,10 @@ model ControlAgent {
   description  String     @default("")
   capabilities Json       @default("{}")
   runtime      String? // claude | codex | opencode | kimi | other
+  // Model identifier the agent should run (e.g. "opus" | "sonnet"). Nullable: existing rows + agents
+  // that have not specified a model leave it null (daemon falls back to its runtime default). Env vars
+  // are kept in capabilities.env (Json) — there is intentionally NO env column.
+  model        String? // e.g. opus | sonnet (runtime model alias); null = runtime default
   machineId    String?    @map("machine_id")
   status       String     @default("offline") // online | offline | busy | drain
   permissions  Json       @default("{}")
