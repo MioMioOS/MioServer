@@ -35,6 +35,14 @@ export interface SendMessageInput {
   embeddedCardType?: string | null;
   embeddedCardId?: string | null;
   clientIdempotencyKey?: string | null;
+  /**
+   * S2 §4.4 — when set, this message is a thread reply to that parent message.
+   * Inside the same $transaction we upsert ControlThread (replyCount) and bump the
+   * parent's threadReplyCount/lastThreadReplyAt. null/undefined → top-level message
+   * (no thread bookkeeping). The idempotent-replay (P2002) path does NOT re-run the
+   * bookkeeping, so a duplicate reply key never double-bumps.
+   */
+  parentMessageId?: string | null;
 }
 
 export type SendMessageResult =
@@ -86,6 +94,7 @@ export async function sendMessageTransaction(input: SendMessageInput): Promise<S
     embeddedCardType = null,
     embeddedCardId = null,
     clientIdempotencyKey = null,
+    parentMessageId = null,
   } = input;
 
   try {
@@ -130,6 +139,7 @@ export async function sendMessageTransaction(input: SendMessageInput): Promise<S
           embeddedCardType,
           embeddedCardId,
           clientIdempotencyKey,
+          parentMessageId: parentMessageId ?? null,
         },
         select: { id: true, seq: true, createdAt: true, workroomId: true, channelId: true, senderKind: true, senderId: true, content: true },
       });
@@ -139,6 +149,35 @@ export async function sendMessageTransaction(input: SendMessageInput): Promise<S
         where: { id: channelId },
         data: { lastActivityAt: created.createdAt },
       });
+
+      // Step 6 (S2 §4.4): thread bookkeeping for replies — only when this is a reply.
+      // Same $transaction: upsert ControlThread + bump the parent's threadReplyCount.
+      // The nextChannelSeq FOR UPDATE above serializes concurrent first-replies, so the
+      // upsert create branch cannot double-fire. The idempotent-replay (P2002) path is in
+      // the catch below and does NOT reach this block, so a duplicate reply key never
+      // double-bumps (Task 2.2 (d)).
+      if (parentMessageId) {
+        await tx.controlThread.upsert({
+          where: { parentMessageId },
+          create: {
+            parentMessageId,
+            workroomId,
+            replyCount: 1,
+            lastReplyAt: created.createdAt,
+          },
+          update: {
+            replyCount: { increment: 1 },
+            lastReplyAt: created.createdAt,
+          },
+        });
+        await tx.controlMessage.update({
+          where: { id: parentMessageId },
+          data: {
+            threadReplyCount: { increment: 1 },
+            lastThreadReplyAt: created.createdAt,
+          },
+        });
+      }
 
       return { ...created, idempotent: false };
     });
