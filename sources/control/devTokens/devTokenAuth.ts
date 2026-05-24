@@ -86,6 +86,8 @@ const DEV_TOKEN_GET_ALLOWLIST: RegExp[] = [
   // /messages/:id (used to fetch the thread parent) is already allowlisted above.
   /^\/api\/v1\/workrooms\/[^/]+\/threads\/[^/]+$/,
   /^\/api\/v1\/workrooms\/[^/]+\/threads\/[^/]+\/replies$/,
+  // S5: workroom search (read-only; workroom-scope enforced by devTokenInWorkroomScope).
+  /^\/api\/v1\/workrooms\/[^/]+\/search$/,
 ];
 
 /** True iff (method, path) is an allowed dev-token GET endpoint. Default-deny. */
