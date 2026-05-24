@@ -29,6 +29,8 @@ export const V1_OPERATOR_COMMANDS = [
   'acknowledge_needs_human',
   'mark_reviewed',
   'send_message',
+  // S5 Saved messages: operator (phone) save/unsave command.
+  'save_message',
   // S3 Slock Tasks: operator (phone) task commands.
   'create_task',
   'update_task_status',

@@ -516,6 +516,21 @@ model ControlThread {
   @@map("control_threads")
 }
 
+/// S5: a message saved (bookmarked) by a caller subject (operator subject or machine id).
+/// No FK (control-plane self-reference convention). subjectId is opaque text
+/// (op_sess_ operatorSubjectId like 'pairing:<uuid>', or machine.id).
+model ControlSavedMessage {
+  id         String   @id @default(uuid()) @db.Uuid
+  workroomId String   @map("workroom_id") @db.Uuid
+  subjectId  String   @map("subject_id")
+  messageId  String   @map("message_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@unique([subjectId, messageId])
+  @@index([subjectId])
+  @@map("control_saved_messages")
+}
+
 /// AI/runtime session (cmux | daemon | applescript).
 model ControlSession {
   id             String          @id @default(uuid()) @db.Uuid
