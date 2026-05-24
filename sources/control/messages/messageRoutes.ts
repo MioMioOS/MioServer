@@ -871,6 +871,217 @@ export async function messageRoutes(app: FastifyInstance) {
       saved: rows.map((r) => ({ id: r.id, message_id: r.messageId })),
     };
   });
+
+  // ── S5 Activity feed ──────────────────────────────────────────────────────────
+
+  /**
+   * Resolve the caller's subject keys for the activity (mention) match.
+   *   machine mode → [machine.id] PLUS the machine's ControlAgent.id if one exists
+   *                  (a mention may target the daemon's machine.id OR its agent id).
+   *   dev mode     → null (dev_ctl_ has NO actor subject). The GET route interprets a
+   *                  null key set as the "any non-empty mention" debug view. DISCLOSED.
+   */
+  async function resolveActivityCallerKeys(
+    auth: Extract<Awaited<ReturnType<typeof authorizeControlRead>>, { ok: true }>,
+  ): Promise<string[] | null> {
+    if (auth.mode !== 'machine') return null;
+    const keys = [auth.machine.id];
+    // A ControlAgent bound to this machine → mentions to its id are also "for" this caller.
+    const agents = await db.controlAgent.findMany({
+      where: { machineId: auth.machine.id },
+      select: { id: true },
+    });
+    for (const a of agents) keys.push(a.id);
+    return keys;
+  }
+
+  /**
+   * Resolve the caller subject for a setHandled write:
+   *   op_sess_('mark_reviewed')  → subjectId = operatorSubjectId
+   *   machine_token              → subjectId = machine.id
+   *   dev_ctl_                   → hard 403 (read-only credential cannot write)
+   *
+   * Reuses the existing 'mark_reviewed' V1 operator command (no new command introduced).
+   * Mirrors the op-first → 403-on-wrong-scope → machine-fallback ordering of resolveSaveSubject.
+   */
+  async function resolveHandledSubject(
+    request: FastifyRequest,
+    wid: string,
+  ): Promise<
+    | { ok: true; subjectId: string }
+    | { ok: false; status: number; body: { error: { code: string; message: string } } }
+  > {
+    const authHeader = request.headers.authorization;
+
+    // Defense-in-depth: dev_ctl_ (read-only) can never authorize a write → 403.
+    const rawToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (rawToken.startsWith('dev_ctl_')) {
+      return { ok: false, status: 403, body: { error: { code: 'FORBIDDEN', message: 'Forbidden' } } };
+    }
+
+    // Path 1: op_sess_ (operator / human). Reuse the existing 'mark_reviewed' command.
+    const opAuth = await authorizeOperatorWrite(request, { command: 'mark_reviewed', workroomId: wid });
+    if (opAuth.ok) {
+      return { ok: true, subjectId: opAuth.session.operatorSubjectId };
+    }
+    // op_sess_ valid but wrong workroom / command → hard 403.
+    if (opAuth.status === 403) {
+      return { ok: false, status: 403, body: { error: { code: opAuth.code, message: opAuth.message } } };
+    }
+
+    // Path 2: machine_token.
+    const machine = await verifyMachineToken(authHeader);
+    if (!machine) {
+      return { ok: false, status: 401, body: { error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } } };
+    }
+    const access = await requireMachineAccessToWorkroom(machine, wid);
+    if (!access.ok) {
+      return { ok: false, status: access.status, body: { error: access.error } };
+    }
+    return { ok: true, subjectId: machine.id };
+  }
+
+  /**
+   * GET /api/v1/workrooms/:wid/activity?filter=all|unread|mentions  (S5)
+   *
+   * The caller's activity feed: top-level messages (parentMessageId IS NULL) in visible
+   * channels of :wid whose `mentions` array contains one of the caller's subject keys,
+   * newest first, limit 50. Joined with ControlActivityState (subjectId=callerKey,
+   * messageId) for the per-message `handled` flag (missing row → handled=false).
+   *
+   * Auth: authorizeControlRead (machine_token OR dev_ctl_; allowlisted + workroom-scoped).
+   *
+   * Caller keys:
+   *   machine → [machine.id, ...machine's ControlAgent.id]; mention match = hasSome(keys).
+   *   dev_ctl_ → no subject → DEBUG view: messages with ANY non-empty mentions (NotEmpty),
+   *              handled always false (no subject to join). DISCLOSED.
+   *
+   * filter:
+   *   all / mentions → the full mention set (all == mentions for MVP; no other activity
+   *                    sources yet — DISCLOSED).
+   *   unread         → only handled=false ("unread" ≈ "unhandled"; no per-message
+   *                    read-cursor this MVP — DISCLOSED).
+   *
+   * Returns { activity: [{ id: "act_<messageId>", message_id, handled }] }.
+   */
+  app.get('/api/v1/workrooms/:wid/activity', async (request, reply) => {
+    const auth = await authorizeControlRead(request);
+    if (!auth.ok) {
+      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
+    }
+
+    const { wid } = request.params as { wid: string };
+    const { filter: rawFilter } = request.query as { filter?: string };
+    const filter = rawFilter === 'unread' ? 'unread' : 'all'; // all == mentions for MVP
+
+    // machine mode: enforce org/workroom access. (dev workroom-scope already enforced upstream.)
+    if (auth.mode === 'machine') {
+      const access = await requireMachineAccessToWorkroom(auth.machine, wid);
+      if (!access.ok) return reply.code(access.status).send({ error: access.error });
+    }
+
+    // Restrict to channels the viewer can see (anti-enumeration consistent with the timeline).
+    const visible = await visibleChannels(auth, wid);
+    const visibleChannelIds = visible.map((ch) => ch.id);
+    if (visibleChannelIds.length === 0) {
+      return { activity: [] };
+    }
+
+    const callerKeys = await resolveActivityCallerKeys(auth);
+
+    // Base set: top-level messages in visible channels with a matching mention, newest first.
+    //   machine → mentions hasSome(callerKeys).
+    //   dev_ctl_ (callerKeys null) → mentions isEmpty:false (any non-empty mention; debug).
+    const mentionWhere =
+      callerKeys === null
+        ? { mentions: { isEmpty: false } }
+        : { mentions: { hasSome: callerKeys } };
+
+    const rows = await db.controlMessage.findMany({
+      where: {
+        workroomId: wid,
+        channelId: { in: visibleChannelIds },
+        parentMessageId: null,
+        ...mentionWhere,
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+      select: { id: true },
+    });
+
+    // Join ControlActivityState for the `handled` flag.
+    //   machine → join by (subjectId=machine.id, messageId). NOTE the handled state is keyed
+    //     on machine.id (the canonical subject the POST /handled route writes); agent-id-only
+    //     matches share the same machine subject for handled state.
+    //   dev_ctl_ → no subject → handled always false.
+    const handledByMessage = new Map<string, boolean>();
+    if (callerKeys !== null && rows.length > 0) {
+      const states = await db.controlActivityState.findMany({
+        where: {
+          subjectId: auth.mode === 'machine' ? auth.machine.id : '',
+          messageId: { in: rows.map((r) => r.id) },
+        },
+        select: { messageId: true, handled: true },
+      });
+      for (const s of states) handledByMessage.set(s.messageId, s.handled);
+    }
+
+    let activity = rows.map((r) => ({
+      id: `act_${r.id}`,
+      message_id: r.id,
+      handled: handledByMessage.get(r.id) ?? false,
+    }));
+
+    if (filter === 'unread') {
+      activity = activity.filter((a) => !a.handled);
+    }
+
+    return { activity };
+  });
+
+  /**
+   * POST /api/v1/workrooms/:wid/activity/:messageId/handled  body { handled: boolean }  (S5)
+   *
+   * Upsert the caller subject's handled-state for an activity (mention) item.
+   * Auth: op_sess_('mark_reviewed') OR machine_token. dev_ctl_ → 403.
+   * Validates the message exists in :wid (404 otherwise — anti-enumeration uniform 404).
+   * Idempotent upsert on (subjectId, messageId). Returns { ok: true }.
+   */
+  app.post('/api/v1/workrooms/:wid/activity/:messageId/handled', async (request, reply) => {
+    const { wid, messageId } = request.params as { wid: string; messageId: string };
+
+    const subj = await resolveHandledSubject(request, wid);
+    if (!subj.ok) return reply.code(subj.status).send(subj.body);
+
+    const body = request.body as { handled?: unknown } | null;
+    if (typeof body?.handled !== 'boolean') {
+      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'handled (boolean) is required' } });
+    }
+    const handled = body.handled;
+
+    // Validate the message exists in this workroom (404 uniform for missing / other-workroom).
+    let msg: { id: string } | null = null;
+    try {
+      msg = await db.controlMessage.findFirst({
+        where: { id: messageId, workroomId: wid },
+        select: { id: true },
+      });
+    } catch {
+      // Malformed id (not a valid uuid) → uniform 404.
+      return reply.code(404).send({ error: { code: 'MESSAGE_NOT_FOUND', message: 'Message not found' } });
+    }
+    if (!msg) {
+      return reply.code(404).send({ error: { code: 'MESSAGE_NOT_FOUND', message: 'Message not found' } });
+    }
+
+    await db.controlActivityState.upsert({
+      where: { subjectId_messageId: { subjectId: subj.subjectId, messageId } },
+      create: { subjectId: subj.subjectId, messageId, handled },
+      update: { handled },
+    });
+
+    return reply.code(200).send({ ok: true });
+  });
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
