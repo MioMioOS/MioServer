@@ -38,6 +38,8 @@ export const V1_OPERATOR_COMMANDS = [
   // S6 channel write-ops: operator (phone) channel commands.
   'create_channel',
   'manage_members',
+  // Emergency stop: operator (phone) "□ Stop all agents" channel-header action.
+  'stop_agents',
 ] as const;
 export type V1OperatorCommand = (typeof V1_OPERATOR_COMMANDS)[number];
 
