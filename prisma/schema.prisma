@@ -531,6 +531,23 @@ model ControlSavedMessage {
   @@map("control_saved_messages")
 }
 
+/// S5: per-subject handled-state for an activity (mention) item.
+/// No FK (control-plane self-reference convention). subjectId is opaque text
+/// (op_sess_ operatorSubjectId like 'pairing:<uuid>', machine.id, or a ControlAgent.id).
+/// One row per (subject, message); handled defaults false ("unhandled" ≈ "unread", no
+/// per-message read-cursor this MVP). UNIQUE(subjectId, messageId) makes upsert idempotent.
+model ControlActivityState {
+  id        String   @id @default(uuid()) @db.Uuid
+  subjectId String   @map("subject_id")
+  messageId String   @map("message_id") @db.Uuid
+  handled   Boolean  @default(false)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([subjectId, messageId])
+  @@index([subjectId])
+  @@map("control_activity_state")
+}
+
 /// AI/runtime session (cmux | daemon | applescript).
 model ControlSession {
   id             String          @id @default(uuid()) @db.Uuid
