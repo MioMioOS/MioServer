@@ -23,6 +23,7 @@
 
 import { FastifyInstance, FastifyRequest } from 'fastify';
 import { randomUUID } from 'crypto';
+import { Prisma } from '@prisma/client';
 import { db } from '@/storage/db';
 import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
@@ -706,6 +707,169 @@ export async function messageRoutes(app: FastifyInstance) {
       ...(await fetchFormattedMessage(result.id))!,
       idempotent: result.idempotent,
     });
+  });
+
+  // ── S5 Saved messages ────────────────────────────────────────────────────────
+
+  /**
+   * Resolve the caller subject for a save/unsave write:
+   *   op_sess_('save_message')  → subjectId = operatorSubjectId
+   *   machine_token             → subjectId = machine.id
+   *   dev_ctl_                  → hard 403 (read-only credential cannot write)
+   *
+   * Returns { ok: true, subjectId } on success, or a reply-status object on failure.
+   * Mirrors the op-first → 403-on-wrong-scope → machine-fallback ordering of the
+   * send/reply write routes above.
+   */
+  async function resolveSaveSubject(
+    request: FastifyRequest,
+    wid: string,
+  ): Promise<
+    | { ok: true; subjectId: string }
+    | { ok: false; status: number; body: { error: { code: string; message: string } } }
+  > {
+    const authHeader = request.headers.authorization;
+
+    // Defense-in-depth: dev_ctl_ (read-only) can never authorize a write → 403.
+    const rawToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (rawToken.startsWith('dev_ctl_')) {
+      return { ok: false, status: 403, body: { error: { code: 'FORBIDDEN', message: 'Forbidden' } } };
+    }
+
+    // Path 1: op_sess_ (operator / human).
+    const opAuth = await authorizeOperatorWrite(request, { command: 'save_message', workroomId: wid });
+    if (opAuth.ok) {
+      return { ok: true, subjectId: opAuth.session.operatorSubjectId };
+    }
+    // op_sess_ valid but wrong workroom / command → hard 403.
+    if (opAuth.status === 403) {
+      return { ok: false, status: 403, body: { error: { code: opAuth.code, message: opAuth.message } } };
+    }
+
+    // Path 2: machine_token.
+    const machine = await verifyMachineToken(authHeader);
+    if (!machine) {
+      return { ok: false, status: 401, body: { error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } } };
+    }
+    const access = await requireMachineAccessToWorkroom(machine, wid);
+    if (!access.ok) {
+      return { ok: false, status: access.status, body: { error: access.error } };
+    }
+    return { ok: true, subjectId: machine.id };
+  }
+
+  /**
+   * POST /api/v1/workrooms/:wid/messages/:id/save  (S5)
+   *
+   * Save (bookmark) a message for the caller subject.
+   * Auth: op_sess_('save_message') OR machine_token. dev_ctl_ → 403.
+   * Validates the message exists in :wid (404 otherwise — anti-enumeration uniform 404).
+   * Idempotent: a second save (P2002 on (subjectId, messageId)) → 200 no-op.
+   * Returns { ok: true }.
+   */
+  app.post('/api/v1/workrooms/:wid/messages/:id/save', async (request, reply) => {
+    const { wid, id } = request.params as { wid: string; id: string };
+
+    const subj = await resolveSaveSubject(request, wid);
+    if (!subj.ok) return reply.code(subj.status).send(subj.body);
+
+    // Validate the message exists in this workroom (404 uniform for missing / other-workroom).
+    let msg: { id: string } | null = null;
+    try {
+      msg = await db.controlMessage.findFirst({
+        where: { id, workroomId: wid },
+        select: { id: true },
+      });
+    } catch {
+      // Malformed id (not a valid uuid) → uniform 404.
+      return reply.code(404).send({ error: { code: 'MESSAGE_NOT_FOUND', message: 'Message not found' } });
+    }
+    if (!msg) {
+      return reply.code(404).send({ error: { code: 'MESSAGE_NOT_FOUND', message: 'Message not found' } });
+    }
+
+    try {
+      await db.controlSavedMessage.create({
+        data: { workroomId: wid, subjectId: subj.subjectId, messageId: id },
+      });
+    } catch (err) {
+      // Idempotent: already saved (P2002 on the (subject_id, message_id) unique index) → no-op.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        return reply.code(200).send({ ok: true });
+      }
+      throw err;
+    }
+
+    return reply.code(200).send({ ok: true });
+  });
+
+  /**
+   * DELETE /api/v1/workrooms/:wid/messages/:id/save  (S5)
+   *
+   * Unsave a message for the caller subject.
+   * Auth: op_sess_('save_message') OR machine_token. dev_ctl_ → 403.
+   * Idempotent: missing save → 200 no-op (deleteMany returns count 0).
+   * Returns { ok: true }.
+   */
+  app.delete('/api/v1/workrooms/:wid/messages/:id/save', async (request, reply) => {
+    const { wid, id } = request.params as { wid: string; id: string };
+
+    const subj = await resolveSaveSubject(request, wid);
+    if (!subj.ok) return reply.code(subj.status).send(subj.body);
+
+    try {
+      await db.controlSavedMessage.deleteMany({
+        where: { subjectId: subj.subjectId, messageId: id },
+      });
+    } catch {
+      // Malformed id → treat as no-op (uniform 200; nothing to delete).
+      return reply.code(200).send({ ok: true });
+    }
+
+    return reply.code(200).send({ ok: true });
+  });
+
+  /**
+   * GET /api/v1/workrooms/:wid/saved  (S5)
+   *
+   * List the caller subject's saved messages in the workroom, newest first.
+   * Auth: authorizeControlRead (machine_token OR dev_ctl_; allowlisted + workroom-scoped).
+   *
+   * Subject resolution:
+   *   machine mode → subjectId = machine.id (machine-scoped saves).
+   *   dev mode     → NO subject (dev_ctl_ is a debug credential with no actor identity).
+   *                  Returns ALL saved rows in the workroom (debug view). DISCLOSED:
+   *                  this is intentional — dev_ctl_ has no subject to scope by.
+   *
+   * Returns { saved: [{ id, message_id }] }.
+   */
+  app.get('/api/v1/workrooms/:wid/saved', async (request, reply) => {
+    const auth = await authorizeControlRead(request);
+    if (!auth.ok) {
+      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
+    }
+
+    const { wid } = request.params as { wid: string };
+
+    // machine mode: enforce org/workroom access + scope to machine.id subject.
+    // dev mode: no subject — return all saved in the workroom (debug; workroom-scope already
+    // enforced by authorizeControlRead's devTokenInWorkroomScope).
+    const where: { workroomId: string; subjectId?: string } = { workroomId: wid };
+    if (auth.mode === 'machine') {
+      const access = await requireMachineAccessToWorkroom(auth.machine, wid);
+      if (!access.ok) return reply.code(access.status).send({ error: access.error });
+      where.subjectId = auth.machine.id;
+    }
+
+    const rows = await db.controlSavedMessage.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, messageId: true },
+    });
+
+    return {
+      saved: rows.map((r) => ({ id: r.id, message_id: r.messageId })),
+    };
   });
 }
 

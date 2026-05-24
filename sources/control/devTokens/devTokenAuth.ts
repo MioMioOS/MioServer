@@ -88,6 +88,8 @@ const DEV_TOKEN_GET_ALLOWLIST: RegExp[] = [
   /^\/api\/v1\/workrooms\/[^/]+\/threads\/[^/]+\/replies$/,
   // S5: workroom search (read-only; workroom-scope enforced by devTokenInWorkroomScope).
   /^\/api\/v1\/workrooms\/[^/]+\/search$/,
+  // S5: saved-messages list (read-only; workroom-scope enforced by devTokenInWorkroomScope).
+  /^\/api\/v1\/workrooms\/[^/]+\/saved$/,
 ];
 
 /** True iff (method, path) is an allowed dev-token GET endpoint. Default-deny. */
