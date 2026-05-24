@@ -48,11 +48,17 @@ async function resolveSenderDisplayNames(
   senders: Array<{ senderId: string; senderKind: string }>,
 ): Promise<Map<string, string>> {
   const result = new Map<string, string>();
+  // ControlAgent.id is @db.Uuid; senderId is opaque text (may be a non-uuid like
+  // 'kris' or 'pairing:<uuid>'). Filter to uuid-shaped ids before querying, else
+  // Prisma throws P2023 (Inconsistent column data) on the uuid column. Non-uuid
+  // agent senderIds simply resolve to no display name (caller falls back).
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const agentIds = [
     ...new Set(
       senders
         .filter((s) => s.senderKind === 'agent')
-        .map((s) => s.senderId),
+        .map((s) => s.senderId)
+        .filter((id) => uuidRe.test(id)),
     ),
   ];
   if (agentIds.length === 0) return result;
