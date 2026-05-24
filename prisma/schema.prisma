@@ -457,6 +457,7 @@ model ControlMessage {
   embeddedCardId       String?         @map("embedded_card_id") @db.Uuid
   threadReplyCount     Int             @default(0) @map("thread_reply_count")
   lastThreadReplyAt    DateTime?       @map("last_thread_reply_at")
+  parentMessageId      String?         @map("parent_message_id") @db.Uuid  // S2: null=top-level, non-null=reply to that parent message (no FK; control-plane self-ref convention)
   createdAt            DateTime        @default(now()) @map("created_at")
 
   channel           ControlChannel    @relation(fields: [channelId], references: [id])
@@ -471,6 +472,7 @@ model ControlMessage {
   @@unique([channelId, clientIdempotencyKey])
   @@index([workroomId, createdAt(sort: Desc)])
   @@index([channelId, seq])
+  @@index([parentMessageId])
   @@map("control_messages")
 }
 

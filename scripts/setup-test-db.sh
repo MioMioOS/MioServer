@@ -63,6 +63,7 @@ CONTROL_PLANE_MIGRATIONS=(
   "prisma/migrations/20260524010000_s1_channelid_notnull/migration.sql"
   "prisma/migrations/20260524020000_s1_senderid_text/migration.sql"
   "prisma/migrations/20260524030000_s2_agent_machine_unique/migration.sql"
+  "prisma/migrations/20260524040000_s2_message_parent/migration.sql"
 )
 for migration in "${CONTROL_PLANE_MIGRATIONS[@]}"; do
   echo "==> Applying ${migration}"
