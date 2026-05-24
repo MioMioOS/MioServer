@@ -241,6 +241,162 @@ describe('GET /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(msg.sender_display_name).toBe('Msg Agent');
   });
 
+  // ── Regression: P2023 non-uuid agent senderId (commit 5ff4c39) ───────────────
+  //
+  // Bug: resolveSenderDisplayNames passed all agent senderIds straight into
+  // db.controlAgent.findMany({ where: { id: { in: agentIds } } }).  ControlAgent.id
+  // is @db.Uuid, but senderId is opaque TEXT (e.g. 'kris', 'pairing:<uuid>').
+  // A non-uuid senderId caused Prisma P2023 (Inconsistent column data / invalid
+  // UUID) → 500 on GET /messages.
+  //
+  // Fix: filter agentIds through a uuid-shape regex before the query.
+  // These two tests assert:
+  //   1. non-uuid senderId 'kris'          → HTTP 200, message present, display_name null
+  //   2. non-uuid senderId 'pairing:<uuid>'→ HTTP 200, message present, display_name null
+  //   3. uuid agentId matching ControlAgent → HTTP 200, display_name resolved (existing test
+  //      above, kept as the positive counterpart)
+  //
+  // To verify the tests would FAIL without the fix: temporarily remove the
+  // .filter((id) => uuidRe.test(id)) line in resolveSenderDisplayNames; the
+  // requests below return 500 instead of 200.
+  it('[regression P2023] non-uuid senderId "kris" → 200, message returned, display_name null', async () => {
+    const nonUuidCh = await db.controlChannel.create({
+      data: {
+        workroomId: WORKROOM_ID,
+        name: `regression-non-uuid-kris-${randomUUID().slice(0, 8)}`,
+        type: 'standard',
+        visibility: 'public',
+        createdBy: 'system',
+      },
+    });
+
+    // Seed a message whose senderKind='agent' but senderId is the bare word 'kris'
+    // (not a UUID). Before the fix this caused Prisma P2023 → 500.
+    const msgId = randomUUID();
+    await db.controlMessage.create({
+      data: {
+        id: msgId,
+        workroomId: WORKROOM_ID,
+        channelId: nonUuidCh.id,
+        seq: 1n,
+        senderKind: 'agent',
+        senderId: 'kris',
+        content: 'hello from kris',
+      },
+    });
+
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/channels/${nonUuidCh.id}/messages`);
+
+    // Must be 200, NOT 500 (P2023).
+    expect(res.statusCode).toBe(200);
+
+    const body = JSON.parse(res.body);
+    expect(body.messages).toHaveLength(1);
+
+    const msg = body.messages[0];
+    expect(msg.id).toBe(msgId);
+    expect(msg.sender_kind).toBe('agent');
+    expect(msg.sender_id).toBe('kris');
+    // No ControlAgent row for 'kris'; display name must be null (not a crash).
+    expect(msg.sender_display_name).toBeNull();
+
+    // cleanup
+    await db.controlMessage.deleteMany({ where: { channelId: nonUuidCh.id } });
+    await db.controlChannel.deleteMany({ where: { id: nonUuidCh.id } });
+  });
+
+  it('[regression P2023] non-uuid senderId "pairing:<uuid>" → 200, message returned, display_name null', async () => {
+    const pairingCh = await db.controlChannel.create({
+      data: {
+        workroomId: WORKROOM_ID,
+        name: `regression-pairing-${randomUUID().slice(0, 8)}`,
+        type: 'standard',
+        visibility: 'public',
+        createdBy: 'system',
+      },
+    });
+
+    // 'pairing:<uuid>' is a real senderId shape used by op_sess_ human sends.
+    // It starts with a UUID segment but the full string is not a bare UUID, so
+    // the pre-fix code passed it into the Uuid column and triggered P2023.
+    const pairingSenderId = `pairing:${randomUUID()}`;
+    const msgId = randomUUID();
+    await db.controlMessage.create({
+      data: {
+        id: msgId,
+        workroomId: WORKROOM_ID,
+        channelId: pairingCh.id,
+        seq: 1n,
+        senderKind: 'agent',
+        senderId: pairingSenderId,
+        content: 'pairing agent message',
+      },
+    });
+
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/channels/${pairingCh.id}/messages`);
+
+    // Must be 200, NOT 500 (P2023).
+    expect(res.statusCode).toBe(200);
+
+    const body = JSON.parse(res.body);
+    expect(body.messages).toHaveLength(1);
+
+    const msg = body.messages[0];
+    expect(msg.id).toBe(msgId);
+    expect(msg.sender_kind).toBe('agent');
+    expect(msg.sender_id).toBe(pairingSenderId);
+    // No ControlAgent row for the pairing id; display name must be null.
+    expect(msg.sender_display_name).toBeNull();
+
+    // cleanup
+    await db.controlMessage.deleteMany({ where: { channelId: pairingCh.id } });
+    await db.controlChannel.deleteMany({ where: { id: pairingCh.id } });
+  });
+
+  it('[regression P2023] uuid agent senderId with matching ControlAgent row → display_name still resolves', async () => {
+    // Positive counterpart: the uuid filter must NOT accidentally drop valid uuid senderIds.
+    // AGENT_ID is seeded in beforeAll with displayName='Msg Agent'.
+    const uuidCh = await db.controlChannel.create({
+      data: {
+        workroomId: WORKROOM_ID,
+        name: `regression-uuid-ok-${randomUUID().slice(0, 8)}`,
+        type: 'standard',
+        visibility: 'public',
+        createdBy: 'system',
+      },
+    });
+
+    const msgId = randomUUID();
+    await db.controlMessage.create({
+      data: {
+        id: msgId,
+        workroomId: WORKROOM_ID,
+        channelId: uuidCh.id,
+        seq: 1n,
+        senderKind: 'agent',
+        senderId: AGENT_ID,
+        content: 'uuid agent message',
+      },
+    });
+
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/channels/${uuidCh.id}/messages`);
+    expect(res.statusCode).toBe(200);
+
+    const body = JSON.parse(res.body);
+    expect(body.messages).toHaveLength(1);
+
+    const msg = body.messages[0];
+    expect(msg.sender_kind).toBe('agent');
+    expect(msg.sender_id).toBe(AGENT_ID);
+    // UUID sender → ControlAgent row found → display name resolved.
+    expect(msg.sender_display_name).toBe('Msg Agent');
+
+    // cleanup
+    await db.controlMessage.deleteMany({ where: { channelId: uuidCh.id } });
+    await db.controlChannel.deleteMany({ where: { id: uuidCh.id } });
+  });
+  // ── End regression P2023 ─────────────────────────────────────────────────────
+
   it('private channel non-member → 404 (uniform, anti-enumeration)', async () => {
     const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/channels/${PRIVATE_CHANNEL_ID}/messages`);
     expect(res.statusCode).toBe(404);
