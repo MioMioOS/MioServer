@@ -275,6 +275,107 @@ export async function channelRoutes(app: FastifyInstance) {
   });
 
   /**
+   * POST /api/v1/workrooms/:wid/dms  (start a direct message)
+   *
+   * Find-or-create a dm channel between the caller and a target member.
+   * No schema change: a dm is a ControlChannel(type='dm') + two ControlChannelMember rows.
+   *
+   * Auth: op_sess_('create_channel') OR machine_token; dev_ctl_ → 403 (reuses the
+   *       'create_channel' command — starting a dm IS creating a channel).
+   *   Caller id = op subject id (op mode) or machine.id (machine mode).
+   *
+   * Body: { member_id: string } — the peer to start a dm with. Empty/missing → 400.
+   *
+   * Find-or-create: look for an existing dm channel in :wid whose member set is EXACTLY
+   *   {caller, member_id}. If found, return it (idempotent). Else create a new
+   *   ControlChannel(type='dm', visibility='private', name='dm', createdBy=caller,
+   *   lastActivityAt=now) + ControlChannelMember rows for caller + member_id, and publish
+   *   'channel.created' (type dm).
+   *
+   * Returns the dm wire shape (same as a GET /dms item):
+   *   { id, peer_member_id, unread_count: 0, last_activity_at }
+   *
+   * NOTE: this is a POST (state-changing); it is NOT in the dev_ctl_ GET allowlist.
+   */
+  app.post('/api/v1/workrooms/:wid/dms', async (request, reply) => {
+    const { wid } = request.params as { wid: string };
+
+    // Reuse 'create_channel' — starting a dm is creating a channel.
+    const actor = await authorizeChannelWrite(request, 'create_channel', wid);
+    if (!actor.ok) return reply.code(actor.status).send(actor.body);
+
+    const body = request.body as { member_id?: unknown } | null;
+    const memberId = typeof body?.member_id === 'string' ? body.member_id.trim() : '';
+    if (!memberId) {
+      return reply.code(400).send({ error: { code: 'INVALID_MEMBER_ID', message: 'member_id is required' } });
+    }
+
+    const callerId = actor.actorId;
+
+    // Find-or-create: an existing dm in :wid whose member set is EXACTLY {caller, peer}.
+    // Query dm channels in the workroom that contain the peer, then check the full set
+    // matches {caller, peer} (size 2). This guards against partial-overlap dm channels.
+    const candidates = await db.controlChannel.findMany({
+      where: {
+        workroomId: wid,
+        type: 'dm',
+        archivedAt: null,
+        members: { some: { memberId } },
+      },
+      include: { members: { select: { memberId: true } } },
+    });
+    const existing = candidates.find((ch) => {
+      const set = new Set(ch.members.map((m) => m.memberId));
+      return set.size === 2 && set.has(callerId) && set.has(memberId);
+    });
+
+    if (existing) {
+      return reply.code(201).send({
+        id: existing.id,
+        peer_member_id: memberId,
+        unread_count: 0,
+        last_activity_at: existing.lastActivityAt?.toISOString() ?? null,
+      });
+    }
+
+    // Create a new dm channel + both member rows.
+    const now = new Date();
+    const channel = await db.controlChannel.create({
+      data: {
+        workroomId: wid,
+        name: 'dm',
+        type: 'dm',
+        visibility: 'private',
+        description: '',
+        createdBy: callerId,
+        lastActivityAt: now,
+      },
+    });
+
+    // skipDuplicates guards the @@unique([channelId, memberId]) when caller === peer (defensive).
+    await db.controlChannelMember.createMany({
+      data: [...new Set([callerId, memberId])].map((m) => ({ channelId: channel.id, memberId: m })),
+      skipDuplicates: true,
+    });
+
+    await writeChannelEventAndBroadcast(wid, 'channel.created', {
+      channel_id: channel.id,
+      name: channel.name,
+      type: channel.type,
+      visibility: channel.visibility,
+      created_by: callerId,
+      peer_member_id: memberId,
+    });
+
+    return reply.code(201).send({
+      id: channel.id,
+      peer_member_id: memberId,
+      unread_count: 0,
+      last_activity_at: channel.lastActivityAt?.toISOString() ?? null,
+    });
+  });
+
+  /**
    * POST /api/v1/workrooms/:wid/channels  (S6)
    *
    * Create a 'standard' channel. Auth: op_sess_('create_channel') OR machine_token; dev_ctl_ → 403.
