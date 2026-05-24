@@ -21,7 +21,7 @@
  * Spec: §4.2 (list) + §4.3 (send) + §4.4 (single).
  */
 
-import { FastifyInstance } from 'fastify';
+import { FastifyInstance, FastifyRequest } from 'fastify';
 import { randomUUID } from 'crypto';
 import { db } from '@/storage/db';
 import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
@@ -466,6 +466,247 @@ export async function messageRoutes(app: FastifyInstance) {
       idempotent: machineResult.idempotent,
     });
   });
+
+  // ── S2 Threads ─────────────────────────────────────────────────────────────
+
+  /**
+   * Resolve a thread parent for a read request: load the parent message, enforce
+   * machine org/workroom access, and verify the parent's channel is visible to the
+   * viewer. Returns the parent row on success, or a reply-status object on failure.
+   * 404 (uniform) for missing parent, parent-in-other-workroom, or invisible channel.
+   */
+  async function loadVisibleParent(
+    request: FastifyRequest,
+    wid: string,
+    parentId: string,
+  ): Promise<
+    | { ok: true; auth: Extract<Awaited<ReturnType<typeof authorizeControlRead>>, { ok: true }>; parent: { id: string; channelId: string; workroomId: string } }
+    | { ok: false; status: number; body: { error: { code: string; message: string } } }
+  > {
+    const auth = await authorizeControlRead(request);
+    if (!auth.ok) {
+      return { ok: false, status: auth.status, body: { error: { code: auth.code, message: auth.message } } };
+    }
+
+    const parent = await db.controlMessage.findUnique({
+      where: { id: parentId },
+      select: { id: true, channelId: true, workroomId: true },
+    });
+    // 404 uniform: missing parent or parent not in this workroom.
+    if (!parent || parent.workroomId !== wid) {
+      return { ok: false, status: 404, body: { error: { code: 'THREAD_NOT_FOUND', message: 'Thread not found' } } };
+    }
+
+    if (auth.mode === 'machine') {
+      const access = await requireMachineAccessToWorkroom(auth.machine, wid);
+      if (!access.ok) {
+        return { ok: false, status: access.status, body: { error: access.error } };
+      }
+    }
+
+    // Channel visibility: 404 uniform if the parent's channel is not visible (anti-enumeration).
+    const visible = await visibleChannels(auth, wid);
+    if (!visible.some((ch) => ch.id === parent.channelId)) {
+      return { ok: false, status: 404, body: { error: { code: 'THREAD_NOT_FOUND', message: 'Thread not found' } } };
+    }
+
+    return { ok: true, auth, parent };
+  }
+
+  /**
+   * GET /api/v1/workrooms/:wid/threads/:parentId  (S2 §4.2)
+   * Thread meta. No ControlThread row → reply_count 0 / last_reply_at null.
+   */
+  app.get('/api/v1/workrooms/:wid/threads/:parentId', async (request, reply) => {
+    const { wid, parentId } = request.params as { wid: string; parentId: string };
+
+    const resolved = await loadVisibleParent(request, wid, parentId);
+    if (!resolved.ok) return reply.code(resolved.status).send(resolved.body);
+
+    const thread = await db.controlThread.findUnique({
+      where: { parentMessageId: parentId },
+      select: { replyCount: true, lastReplyAt: true },
+    });
+
+    return {
+      id: parentId,
+      parent_message_id: parentId,
+      reply_count: thread?.replyCount ?? 0,
+      last_reply_at: thread?.lastReplyAt ? thread.lastReplyAt.toISOString() : null,
+      task_id: null, // reserved for S3 (task-as-thread); always null this milestone.
+    };
+  });
+
+  /**
+   * GET /api/v1/workrooms/:wid/threads/:parentId/replies  (S2 §4.3)
+   * Seq-ascending page of replies. after_seq exclusive lower bound; limit ≤ 100.
+   */
+  app.get('/api/v1/workrooms/:wid/threads/:parentId/replies', async (request, reply) => {
+    const { wid, parentId } = request.params as { wid: string; parentId: string };
+
+    const resolved = await loadVisibleParent(request, wid, parentId);
+    if (!resolved.ok) return reply.code(resolved.status).send(resolved.body);
+
+    const query = request.query as { after_seq?: string; limit?: string };
+
+    let afterSeq = 0n;
+    if (query.after_seq !== undefined) {
+      if (!/^\d+$/.test(query.after_seq)) {
+        return reply.code(400).send({ error: { code: 'INVALID_AFTER_SEQ', message: 'after_seq must be a non-negative integer' } });
+      }
+      afterSeq = BigInt(query.after_seq);
+    }
+
+    const requestedLimit = query.limit !== undefined
+      ? Math.min(Math.max(1, parseInt(query.limit, 10) || 1), MAX_PAGE_SIZE)
+      : MAX_PAGE_SIZE;
+
+    const rows = await db.controlMessage.findMany({
+      where: { parentMessageId: parentId, seq: { gt: afterSeq } },
+      orderBy: { seq: 'asc' },
+      take: requestedLimit + 1,
+      select: {
+        id: true, seq: true, senderKind: true, senderId: true, content: true,
+        mentions: true, embeddedCardType: true, embeddedCardId: true,
+        threadReplyCount: true, createdAt: true, channelId: true, parentMessageId: true,
+      },
+    });
+    const hasMore = rows.length > requestedLimit;
+    const page = rows.slice(0, requestedLimit);
+
+    const senderNames = await resolveSenderDisplayNames(
+      page.map((m) => ({ senderId: m.senderId, senderKind: m.senderKind })),
+    );
+
+    return {
+      parent_message_id: parentId,
+      messages: page.map((m) => formatMessage(m, senderNames)),
+      has_more: hasMore,
+    };
+  });
+
+  /**
+   * POST /api/v1/workrooms/:wid/threads/:parentId/reply  (S2 §4.4)
+   *
+   * Auth: op_sess_ (command 'send_message') OR machine_token. dev_ctl_ → hard 403.
+   * The reply routes through the extended sendMessageTransaction (parentMessageId set),
+   * which does the thread bookkeeping in the same $transaction. Post-commit, publishes a
+   * thread.reply event (write-before-broadcast; skipped on idempotent replay).
+   */
+  app.post('/api/v1/workrooms/:wid/threads/:parentId/reply', async (request, reply) => {
+    const { wid, parentId } = request.params as { wid: string; parentId: string };
+
+    const authHeader = request.headers.authorization;
+
+    // Defense-in-depth: explicitly 403 dev_ctl_ before either write-auth path.
+    const rawToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (rawToken.startsWith('dev_ctl_')) {
+      return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
+    }
+
+    // Resolve sender via op_sess_ first, then machine_token.
+    let senderKind: string;
+    let senderId: string;
+    let clientIdempotencyKey: string | null = null;
+    let content: string;
+    let mentions: string[] = [];
+
+    const body = request.body as {
+      content?: unknown;
+      mentions?: unknown;
+      client_idempotency_key?: unknown;
+    } | null;
+
+    const opAuth = await authorizeOperatorWrite(request, { command: 'send_message', workroomId: wid });
+
+    if (opAuth.ok) {
+      if (!body?.client_idempotency_key || typeof body.client_idempotency_key !== 'string') {
+        return reply.code(400).send({
+          error: { code: 'MISSING_IDEMPOTENCY_KEY', message: 'client_idempotency_key is required for operator sends' },
+        });
+      }
+      if (!body.content || typeof body.content !== 'string') {
+        return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'content is required' } });
+      }
+      senderKind = 'user';
+      senderId = opAuth.session.operatorSubjectId;
+      clientIdempotencyKey = body.client_idempotency_key;
+      content = body.content;
+      mentions = Array.isArray(body.mentions) ? (body.mentions as string[]) : [];
+    } else {
+      // op_sess_ returned 403 (wrong workroom / command) — hard reject.
+      if (opAuth.status === 403) {
+        return reply.code(403).send({ error: { code: opAuth.code, message: opAuth.message } });
+      }
+
+      // Path 2: machine_token (client_idempotency_key optional).
+      const machine = await verifyMachineToken(authHeader);
+      if (!machine) {
+        return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
+      }
+      const access = await requireMachineAccessToWorkroom(machine, wid);
+      if (!access.ok) {
+        return reply.code(access.status).send({ error: access.error });
+      }
+      if (!body?.content || typeof body.content !== 'string') {
+        return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'content is required' } });
+      }
+      senderKind = 'agent';
+      senderId = machine.id;
+      clientIdempotencyKey = typeof body.client_idempotency_key === 'string' ? body.client_idempotency_key : null;
+      content = body.content;
+      mentions = Array.isArray(body.mentions) ? (body.mentions as string[]) : [];
+    }
+
+    // Load the parent → derive channelId (404 if missing / not in this workroom).
+    const parent = await db.controlMessage.findUnique({
+      where: { id: parentId },
+      select: { id: true, channelId: true, workroomId: true },
+    });
+    if (!parent || parent.workroomId !== wid) {
+      return reply.code(404).send({ error: { code: 'THREAD_NOT_FOUND', message: 'Thread not found' } });
+    }
+
+    const result = await sendMessageTransaction({
+      channelId: parent.channelId,
+      workroomId: wid,
+      senderKind,
+      senderId,
+      content,
+      mentions,
+      clientIdempotencyKey,
+      parentMessageId: parentId,
+    });
+
+    if (!result.ok) {
+      if (result.code === 'CHANNEL_NOT_FOUND') {
+        return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+      }
+      if (result.code === 'CHANNEL_FORBIDDEN') {
+        return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
+      }
+      return reply.code(500).send({ error: { code: 'INTERNAL_ERROR', message: 'Internal error' } });
+    }
+
+    // Post-commit write-before-broadcast for thread.reply (skipped on idempotent replay).
+    await writeThreadReplyEventAndBroadcast({
+      workroomId: wid,
+      channelId: parent.channelId,
+      parentMessageId: parentId,
+      messageId: result.id,
+      seq: result.seq,
+      senderKind,
+      senderId,
+      content,
+      idempotent: result.idempotent,
+    });
+
+    // S2 §4.4: full message wire shape (re-fetched) + idempotent flag. 201 (mirrors S1).
+    return reply.code(201).send({
+      ...(await fetchFormattedMessage(result.id))!,
+      idempotent: result.idempotent,
+    });
+  });
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -511,6 +752,56 @@ async function writeEventAndBroadcast(msg: {
   // Step 2: WS broadcast (fire-and-forget; non-fatal).
   if (!event.idempotent) {
     workroomBroadcaster.broadcast(msg.workroomId, {
+      event_id: event.eventId,
+      workroom_id: event.workroomId,
+      seq: event.seq.toString(),
+      topic: event.topic,
+      payload: event.payloadJson as Record<string, unknown>,
+      created_at: event.createdAt.toISOString(),
+    });
+  }
+}
+
+/**
+ * Write-before-broadcast for thread.reply (S2 §4.4 / §5).
+ *
+ * Mirrors writeEventAndBroadcast but emits topic 'thread.reply' with the parent_message_id.
+ * Skipped entirely on idempotent replay (a duplicate reply key must not emit a 2nd event).
+ * preview = redactControlText(content) truncated ≤120 chars (no secrets in the WS payload).
+ */
+async function writeThreadReplyEventAndBroadcast(input: {
+  workroomId: string;
+  channelId: string;
+  parentMessageId: string;
+  messageId: string;
+  seq: bigint;
+  senderKind: string;
+  senderId: string;
+  content: string;
+  idempotent: boolean;
+}): Promise<void> {
+  // Idempotent replay → the reply already exists; do not re-publish.
+  if (input.idempotent) return;
+
+  const preview = redactControlText(input.content).slice(0, 120);
+
+  const event = await publishControlEvent({
+    workroomId: input.workroomId,
+    eventId: randomUUID(),
+    topic: 'thread.reply',
+    payload: {
+      channel_id: input.channelId,
+      parent_message_id: input.parentMessageId,
+      message_id: input.messageId,
+      seq: input.seq.toString(),
+      sender_kind: input.senderKind,
+      sender_id: input.senderId,
+      preview,
+    },
+  });
+
+  if (!event.idempotent) {
+    workroomBroadcaster.broadcast(input.workroomId, {
       event_id: event.eventId,
       workroom_id: event.workroomId,
       seq: event.seq.toString(),
