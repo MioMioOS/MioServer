@@ -69,16 +69,25 @@ async function resolveSenderDisplayNames(
   // either and key the result map by whichever id the sender actually used.
   //   - id is @db.Uuid: agentIds are already uuid-shape-filtered above → safe to query.
   //   - machineId is text: querying it with the same (uuid-shaped) agentIds is safe.
+  //
+  // MULTIPLE AGENTS PER MACHINE: the (org, machine) unique was dropped, so a machine.id
+  // can map to MANY ControlAgent rows. A daemon message uses senderId = machine.id and is
+  // therefore AMBIGUOUS — there is no single "the" agent for that machine. We pick the
+  // FIRST agent by createdAt (oldest = the default agent created at bind-org) deterministically.
+  // We order ascending and only set the machineId key once (do not overwrite), so the
+  // oldest agent's name always wins regardless of row return order.
   const agents = await db.controlAgent.findMany({
     where: { OR: [{ id: { in: agentIds } }, { machineId: { in: agentIds } }] },
     select: { id: true, machineId: true, displayName: true, name: true },
+    orderBy: { createdAt: 'asc' },
   });
 
   for (const a of agents) {
     const label = a.displayName?.trim() || a.name?.trim();
     if (!label) continue;
-    result.set(a.id, label);                         // agent-id senders (S1)
-    if (a.machineId) result.set(a.machineId, label); // machine-id senders (daemon)
+    result.set(a.id, label);                          // agent-id senders (S1): exact, unambiguous
+    // machine-id senders (daemon): first (oldest) agent for the machine wins — deterministic.
+    if (a.machineId && !result.has(a.machineId)) result.set(a.machineId, label);
   }
   return result;
 }

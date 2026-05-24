@@ -3,10 +3,12 @@
  * Run: npm run test:db:setup && npm run test:integration
  *
  * Covers the S2 §1.2 behaviour: when a machine binds to an org, the server creates
- * a ControlAgent identity row for that machine (so it appears in the members list and
- * resolves a display name on its messages). The creation is idempotent — binding the
- * same machine to the same org twice must NOT create a second ControlAgent row
- * (guarded by @@unique([orgId, machineId]) + findFirst).
+ * a DEFAULT ControlAgent identity row for that machine (so it appears in the members
+ * list and resolves a display name on its messages). The creation is idempotent —
+ * binding the same machine to the same org twice must NOT create a second DEFAULT
+ * ControlAgent row. The DB no longer enforces one-agent-per-machine (the unique was
+ * dropped so the "Create Agent" feature can add MANY agents per machine); idempotency
+ * is now enforced at the app layer (findFirst-then-create-only-if-none).
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fastify, { type FastifyInstance } from 'fastify';
@@ -83,6 +85,33 @@ describe('S2 bind-org → ControlAgent', () => {
     const agents2 = await db.controlAgent.findMany({ where: { orgId: ORG, machineId: m.id } });
     expect(agents2).toHaveLength(1);
     expect(agents2[0].id).toBe(agents1[0].id); // same row, not recreated
+  });
+
+  it('bind-org does NOT add a default when an agent already exists for the machine (multi-agent)', async () => {
+    // Simulate the post-Create-Agent world: a machine that already has an extra agent.
+    // The (org, machine) unique is gone, so MANY agents may share a machine — but bind-org
+    // must remain idempotent: finding ANY existing agent for (org, machine) means it does
+    // not create a second default. This is the app-layer guarantee that replaced the DB unique.
+    const m = await registerMachine('Multi Box');
+    createdMachineIds.push(m.id);
+
+    // First bind creates the default agent.
+    expect((await bindOrg(m.id, ORG, m.token)).statusCode).toBe(200);
+    const afterFirst = await db.controlAgent.findMany({ where: { orgId: ORG, machineId: m.id } });
+    expect(afterFirst).toHaveLength(1);
+
+    // Add a SECOND agent for the same machine directly (the Create Agent feature path).
+    // This is now allowed by the DB (no unique) — the create must succeed, not throw P2002.
+    await db.controlAgent.create({
+      data: { orgId: ORG, machineId: m.id, name: 'Extra', displayName: 'Extra', role: 'other', status: 'offline' },
+    });
+    const afterCreate = await db.controlAgent.findMany({ where: { orgId: ORG, machineId: m.id } });
+    expect(afterCreate).toHaveLength(2); // two agents share one machine — the whole point
+
+    // Bind again → still exactly TWO agents (no third default created; idempotent).
+    expect((await bindOrg(m.id, ORG, m.token)).statusCode).toBe(200);
+    const afterRebind = await db.controlAgent.findMany({ where: { orgId: ORG, machineId: m.id } });
+    expect(afterRebind).toHaveLength(2);
   });
 
   it('bind-org falls back to a default display name when the machine has none', async () => {

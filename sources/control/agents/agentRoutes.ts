@@ -30,7 +30,6 @@
 
 import { FastifyInstance, FastifyRequest } from 'fastify';
 import { randomUUID } from 'crypto';
-import { Prisma } from '@prisma/client';
 import { db } from '@/storage/db';
 import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
@@ -215,35 +214,25 @@ export async function agentRoutes(app: FastifyInstance) {
       }
     }
 
-    let agent;
-    try {
-      agent = await db.controlAgent.create({
-        data: {
-          orgId: actor.workroomOrgId,
-          machineId,
-          name,
-          displayName: name,
-          description,
-          role: 'other',
-          runtime,
-          model,
-          // status 'offline' is honest: creating the row does NOT start the agent (separate daemon change).
-          status: 'offline',
-          capabilities: { env },
-          permissions: {},
-        },
-        select: { id: true, displayName: true, role: true, status: true, machineId: true, runtime: true, model: true },
-      });
-    } catch (err) {
-      // @@unique([orgId, machineId]): one agent per machine per org. A second create on the
-      // same computer collides → 409 (not a 500), so the form can surface a clear message.
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-        return reply.code(409).send({
-          error: { code: 'AGENT_EXISTS_FOR_MACHINE', message: 'An agent already exists for this computer' },
-        });
-      }
-      throw err;
-    }
+    // A machine may host MANY agents — there is intentionally NO one-agent-per-machine
+    // limit (the DB unique was dropped). Just create the row; no pre-check, no P2002→409.
+    const agent = await db.controlAgent.create({
+      data: {
+        orgId: actor.workroomOrgId,
+        machineId,
+        name,
+        displayName: name,
+        description,
+        role: 'other',
+        runtime,
+        model,
+        // status 'offline' is honest: creating the row does NOT start the agent (separate daemon change).
+        status: 'offline',
+        capabilities: { env },
+        permissions: {},
+      },
+      select: { id: true, displayName: true, role: true, status: true, machineId: true, runtime: true, model: true },
+    });
 
     // Publish 'agent.created' (write-before-broadcast). WS fanout is fire-and-forget.
     const event = await publishControlEvent({

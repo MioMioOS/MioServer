@@ -13,6 +13,8 @@
  *     - op_sess_('create_agent') → 201, full wire shape, status 'offline' (not running yet)
  *     - machine_token → 201
  *     - stores model + runtime + env (capabilities.env) and appears in GET /members
+ *     - MANY agents per machine: two creates on the SAME machine both 201 (no 409) — the
+ *       one-agent-per-machine unique was dropped for the "Create Agent" feature.
  *     - dev_ctl_ → 403; no token → 401
  *     - empty name → 400; machine not in org → 404
  *     - publishes 'agent.created' event
@@ -41,14 +43,17 @@ const MACHINE_NEVER_ID = randomUUID();   // null lastSeenAt → offline, no disp
 // Machine in OTHER_ORG_ID (must NOT leak / used for create-404)
 const OTHER_MACHINE_ID = randomUUID();
 
-// Dedicated ORG_ID machines for the POST tests. @@unique([orgId, machineId]) means ONE agent
-// per machine per org, so each 201-expecting create needs its own machine. Created in the POST
+// Dedicated ORG_ID machines for the POST tests. The one-agent-per-machine unique was DROPPED,
+// so a machine may host MANY agents — but each create test still uses its own machine to keep
+// the GET /members assertions easy to reason about. MACHINE_CREATE_MULTI is intentionally
+// reused twice (two agents, one machine) to prove the no-more-409 behaviour. Created in the POST
 // describe's beforeAll (AFTER the GET /computers count assertions) so they don't perturb those.
 const MACHINE_CREATE_OPSESS = randomUUID();
 const MACHINE_CREATE_ENV = randomUUID();
 const MACHINE_CREATE_MACHINE = randomUUID();
 const MACHINE_CREATE_EVENT = randomUUID();
-const POST_ONLY_MACHINE_IDS = [MACHINE_CREATE_OPSESS, MACHINE_CREATE_ENV, MACHINE_CREATE_MACHINE, MACHINE_CREATE_EVENT];
+const MACHINE_CREATE_MULTI = randomUUID(); // two agents created on THIS one machine
+const POST_ONLY_MACHINE_IDS = [MACHINE_CREATE_OPSESS, MACHINE_CREATE_ENV, MACHINE_CREATE_MACHINE, MACHINE_CREATE_EVENT, MACHINE_CREATE_MULTI];
 
 const MACHINE_RAW_TOKEN = `machine_${randomUUID().replace(/-/g, '')}`;       // bound to ORG_ID (MACHINE_ONLINE_ID)
 const OTHER_MACHINE_RAW_TOKEN = `machine_${randomUUID().replace(/-/g, '')}`; // bound to OTHER_ORG_ID
@@ -295,6 +300,43 @@ describe('POST /api/v1/workrooms/:wid/agents', () => {
     expect(body.runtime).toBe('claude');
     expect(body.model).toBeNull();
     expect(body.machine_id).toBe(MACHINE_CREATE_MACHINE);
+  });
+
+  it('MANY agents per machine: two creates on the SAME machine both 201 (no 409)', async () => {
+    // The one-agent-per-machine unique was dropped. Creating a SECOND agent on a machine
+    // that already has one must succeed (201), NOT collide with the old AGENT_EXISTS_FOR_MACHINE 409.
+    const first = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/agents`,
+      { machine_id: MACHINE_CREATE_MULTI, name: 'Agent One', runtime: 'claude', model: 'opus' },
+      opSessHeader(),
+    );
+    expect(first.statusCode).toBe(201);
+    const firstBody = JSON.parse(first.body);
+
+    const second = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/agents`,
+      { machine_id: MACHINE_CREATE_MULTI, name: 'Agent Two', runtime: 'codex', model: 'sonnet' },
+      opSessHeader(),
+    );
+    expect(second.statusCode).toBe(201); // NOT 409 — multiple agents per machine are allowed
+    const secondBody = JSON.parse(second.body);
+
+    // Two DISTINCT agents, both bound to the same machine.
+    expect(secondBody.id).not.toBe(firstBody.id);
+    expect(firstBody.machine_id).toBe(MACHINE_CREATE_MULTI);
+    expect(secondBody.machine_id).toBe(MACHINE_CREATE_MULTI);
+
+    // Both persisted for that one machine.
+    const rows = await db.controlAgent.findMany({ where: { orgId: ORG_ID, machineId: MACHINE_CREATE_MULTI } });
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.displayName).sort()).toEqual(['Agent One', 'Agent Two']);
+
+    // Both surface in GET /members (no row is hidden by a dedupe-by-machine bug).
+    const members = await get(`/api/v1/workrooms/${WORKROOM_ID}/members`, machineHeader());
+    expect(members.statusCode).toBe(200);
+    const ids = JSON.parse(members.body).members.map((m: { id: string }) => m.id);
+    expect(ids).toContain(firstBody.id);
+    expect(ids).toContain(secondBody.id);
   });
 
   it('empty name → 400', async () => {

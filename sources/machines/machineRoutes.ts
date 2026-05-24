@@ -147,23 +147,32 @@ export async function machineRoutes(app: FastifyInstance) {
       data: { orgId: org_id, boundAt: new Date(), lastSeenAt: new Date() },
     });
 
-    // Ensure an agent identity exists for this machine so it appears in the
+    // Ensure a DEFAULT agent identity exists for this machine so it appears in the
     // members list and resolves a display name on its messages (S2 §1.2).
-    // Atomic + idempotent via @@unique([orgId, machineId]): a repeat (or concurrent)
-    // bind updates nothing rather than racing two creates into a P2002.
+    //
+    // The DB no longer enforces one-agent-per-machine (the "Create Agent" feature needs
+    // many agents per computer), so idempotency is enforced here: only create the default
+    // agent when NONE exists yet for (org, machine). A repeat bind finds the existing
+    // agent and creates nothing — it never produces a duplicate default. (A tiny
+    // concurrent-bind race could create two defaults; acceptable, and far cheaper than a
+    // DB constraint that would also block legitimate extra agents.)
     const displayName = machine.displayName?.trim() || 'Agent';
-    await db.controlAgent.upsert({
-      where: { orgId_machineId: { orgId: org_id, machineId: machine.id } },
-      create: {
-        orgId: org_id,
-        machineId: machine.id,
-        name: displayName,
-        displayName,
-        role: 'other',
-        status: 'online',
-      },
-      update: {}, // already exists → leave as-is (don't clobber a renamed/repurposed agent)
+    const existingAgent = await db.controlAgent.findFirst({
+      where: { orgId: org_id, machineId: machine.id },
+      select: { id: true },
     });
+    if (!existingAgent) {
+      await db.controlAgent.create({
+        data: {
+          orgId: org_id,
+          machineId: machine.id,
+          name: displayName,
+          displayName,
+          role: 'other',
+          status: 'online',
+        },
+      });
+    }
 
     return {
       machine_id: updated.id,

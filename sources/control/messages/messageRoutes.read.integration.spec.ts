@@ -307,6 +307,63 @@ describe('GET /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     await db.controlAgent.deleteMany({ where: { id: daemonAgentId } });
   });
 
+  // ── Multi-agent per machine: machine-sender name still resolves deterministically ──
+  //
+  // The (org, machine) unique was dropped → a machine.id can map to MANY ControlAgent rows.
+  // A daemon message uses senderId = machine.id, which is now AMBIGUOUS. The resolver must
+  // still return A name (not null, not a crash) and pick deterministically: the OLDEST agent
+  // (first by createdAt) — the default agent created at bind-org. This seeds two agents on one
+  // machine and asserts the older agent's display name wins.
+  it('resolves a deterministic name when MULTIPLE agents share a machine (machine send)', async () => {
+    const sharedMachineId = randomUUID(); // the machine.id the daemon sends as
+    const olderAgentId = randomUUID();
+    const newerAgentId = randomUUID();
+
+    // Older agent first (explicit createdAt to make ordering deterministic regardless of clock).
+    await db.controlAgent.create({
+      data: {
+        id: olderAgentId, orgId: ORG_ID, machineId: sharedMachineId,
+        name: 'older', displayName: 'Older Agent', role: 'other', status: 'online',
+        createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      },
+    });
+    await db.controlAgent.create({
+      data: {
+        id: newerAgentId, orgId: ORG_ID, machineId: sharedMachineId,
+        name: 'newer', displayName: 'Newer Agent', role: 'other', status: 'online',
+        createdAt: new Date('2026-02-01T00:00:00.000Z'),
+      },
+    });
+
+    const ch = await db.controlChannel.create({
+      data: {
+        workroomId: WORKROOM_ID,
+        name: `multi-agent-machine-${randomUUID().slice(0, 8)}`,
+        type: 'standard', visibility: 'public', createdBy: 'system',
+      },
+    });
+
+    // Daemon message: senderId = the shared machine.id (ambiguous across the 2 agents).
+    await db.controlMessage.create({
+      data: {
+        id: randomUUID(), workroomId: WORKROOM_ID, channelId: ch.id, seq: 1n,
+        senderKind: 'agent', senderId: sharedMachineId, content: 'from one of many agents',
+      },
+    });
+
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/channels/${ch.id}/messages`);
+    expect(res.statusCode).toBe(200);
+    const msg = JSON.parse(res.body).messages[0];
+    expect(msg.sender_id).toBe(sharedMachineId);
+    // Deterministic: oldest agent wins (default agent created at bind-org). NOT null, NOT a 500.
+    expect(msg.sender_display_name).toBe('Older Agent');
+
+    // cleanup
+    await db.controlMessage.deleteMany({ where: { channelId: ch.id } });
+    await db.controlChannel.deleteMany({ where: { id: ch.id } });
+    await db.controlAgent.deleteMany({ where: { id: { in: [olderAgentId, newerAgentId] } } });
+  });
+
   // ── Regression: P2023 non-uuid agent senderId (commit 5ff4c39) ───────────────
   //
   // Bug: resolveSenderDisplayNames passed all agent senderIds straight into

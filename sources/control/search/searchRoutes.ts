@@ -62,16 +62,20 @@ async function resolveSenderDisplayNames(
   ];
   if (agentIds.length === 0) return result;
 
+  // MULTIPLE AGENTS PER MACHINE: machine.id can now map to MANY agents (the unique was
+  // dropped). A daemon senderId = machine.id is ambiguous; pick the oldest agent
+  // deterministically (order asc, first machineId match wins). Mirrors messageRoutes.
   const agents = await db.controlAgent.findMany({
     where: { OR: [{ id: { in: agentIds } }, { machineId: { in: agentIds } }] },
     select: { id: true, machineId: true, displayName: true, name: true },
+    orderBy: { createdAt: 'asc' },
   });
 
   for (const a of agents) {
     const label = a.displayName?.trim() || a.name?.trim();
     if (!label) continue;
     result.set(a.id, label);
-    if (a.machineId) result.set(a.machineId, label);
+    if (a.machineId && !result.has(a.machineId)) result.set(a.machineId, label);
   }
   return result;
 }
