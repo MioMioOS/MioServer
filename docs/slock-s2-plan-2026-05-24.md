@@ -46,29 +46,29 @@
 
 ### Task 1.2: Create ControlAgent on machine bind-org
 
-**Files:** Modify `sources/machines/machineRoutes.ts` (the `POST /api/v1/machines/:id/bind-org` handler, ~lines 122-155). Test: `sources/machines/machineRoutes.spec.ts` (or the integration spec where bind-org is tested).
+**Files:** Modify `sources/machines/machineRoutes.ts` (the `POST /api/v1/machines/:id/bind-org` handler, ~lines 122-155). Test: **Create** `sources/machines/machineRoutes.bindOrg.integration.spec.ts` — no bind-org integration spec exists yet; `machineRoutes.spec.ts` is pure-unit (no DB/`app.inject`). Mirror `sources/machines/machineRoutes.issueOperatorSession.integration.spec.ts` (real test DB + `app.register(machineRoutes)` + `app.inject`).
 
-- [ ] **Step 1: Write the failing test** — after bind-org, a ControlAgent row exists for the machine; calling bind-org twice does not create a second row.
+- [ ] **Step 1: Write the failing test** (in the new integration spec) — after bind-org, a ControlAgent row exists for the machine; calling bind-org twice does not create a second row.
   ```ts
   it('bind-org creates a ControlAgent for the machine (idempotent)', async () => {
-    // register machine → bind-org(orgId) → assert one ControlAgent {machineId: machine.id, orgId, status:'online'}
+    // register machine → bind-org(org_id) → assert one ControlAgent {machineId: machine.id, orgId, status:'online'}
     // call bind-org again → still exactly one ControlAgent row for that machineId+orgId
   });
   ```
 - [ ] **Step 2:** Run it → FAIL (no agent created).
-- [ ] **Step 3: Implement.** In the bind-org handler, after the machine is updated with `orgId`/`boundAt`, add (inside the same logical flow; use a transaction if the handler doesn't already):
+- [ ] **Step 3: Implement.** First confirm the handler's actual variable names by reading `machineRoutes.ts:122-155`. The body field is `org_id` (snake) and the verified machine is `machine` (`db` is imported at the top). After the machine is updated with org/boundAt, add:
   ```ts
   // Ensure an agent identity exists for this machine so it appears in the
   // members list and resolves a display name on its messages.
   const existing = await db.controlAgent.findFirst({
-    where: { orgId, machineId: machine.id },
+    where: { orgId: org_id, machineId: machine.id },   // Prisma field orgId ← local var org_id
     select: { id: true },
   });
   if (!existing) {
     const displayName = machine.displayName?.trim() || 'Agent';
     await db.controlAgent.create({
       data: {
-        orgId,
+        orgId: org_id,
         machineId: machine.id,
         name: displayName,
         displayName,
@@ -78,9 +78,9 @@
     });
   }
   ```
-  (Use the exact `orgId`/`machine` variable names from the handler.)
-- [ ] **Step 4:** Run test → PASS. Run `npm test` (machines) → green.
-- [ ] **Step 5:** Commit: `git add sources/machines/machineRoutes.ts sources/machines/*.spec.ts && git commit -m "feat(s2): create ControlAgent on machine bind-org (idempotent)"`
+  (Adjust `org_id`/`machine` to the handler's real identifiers if they differ.)
+- [ ] **Step 4:** Run test → PASS. Run `npm run test:integration` (machines) → green.
+- [ ] **Step 5:** Commit: `git add sources/machines/machineRoutes.ts sources/machines/machineRoutes.bindOrg.integration.spec.ts && git commit -m "feat(s2): create ControlAgent on machine bind-org (idempotent)"`
 
 ### Task 1.3: Backfill ControlAgent for already-bound machines
 
@@ -179,10 +179,10 @@
 
 - [ ] **Step 1: Write failing tests:** (a) a reply (parentMessageId set) inserts a message with that parent; (b) first reply creates ControlThread `replyCount:1` + sets parent `threadReplyCount:1`; (c) second reply → ControlThread `replyCount:2`, parent `threadReplyCount:2`; (d) idempotent replay of a reply (same key) returns existing, does NOT double-bump.
 - [ ] **Step 2:** Run → FAIL.
-- [ ] **Step 3: Implement.**
-  - Add `parentMessageId?: string | null` to `SendMessageInput`.
-  - In `create.data`, add `parentMessageId: parentMessageId ?? null`; add `parentMessageId` to the `select`.
-  - After the message `create` (still inside the `$transaction`, only when `parentMessageId` is set):
+- [ ] **Step 3: Implement.** (Minimal threading — the POST routes re-fetch the row for the response (Task 2.3), so `SendMessageResult` does NOT need widening.)
+  - Add `parentMessageId?: string | null` to `SendMessageInput` (destructure with default `null`).
+  - In `create.data`, add `parentMessageId: parentMessageId ?? null`. (No need to add it to the `create` `select` or to `SendMessageResult`/the two return sites — the response is re-fetched.)
+  - After the message `create` (still inside the `$transaction`, only when `parentMessageId` is set), before `return`:
     ```ts
     if (parentMessageId) {
       await tx.controlThread.upsert({
@@ -196,9 +196,8 @@
       });
     }
     ```
-    (The `nextChannelSeq` FOR UPDATE earlier in the tx serializes concurrent first-replies, so the upsert create branch won't double-fire.)
-  - Add `parentMessageId` to the returned object + the `SendMessageResult` ok shape (so the route can include it).
-- [ ] **Step 4:** Run tests → PASS. `npm test` (messages) green.
+    (The `nextChannelSeq` FOR UPDATE earlier in the tx serializes concurrent first-replies, so the upsert create branch won't double-fire. The idempotent-replay P2002 path does NOT re-run this block — a duplicate reply key returns the existing row without double-bumping. ✅ matches Task 2.2 test (d).)
+- [ ] **Step 4:** Run tests → PASS. `npm test` + `npm run test:integration` (messages) green. `npx tsc --noEmit` clean.
 - [ ] **Step 5:** Commit.
 
 ### Task 2.3: formatMessage parent_message_id + GET excludes replies + full POST response
@@ -208,10 +207,25 @@
 - [ ] **Step 1: Write failing tests:** (a) GET channel messages does NOT include reply rows (parentMessageId set); (b) GET response messages include `parent_message_id: null` for top-level; (c) POST message response now returns full wire shape (`sender_kind`, `sender_id`, `content`, `parent_message_id`, …) not just `{id,seq,created_at,idempotent}`.
 - [ ] **Step 2:** Run → FAIL.
 - [ ] **Step 3: Implement.**
-  - `formatMessage`: add param field `parentMessageId: string | null` and emit `parent_message_id: msg.parentMessageId ?? null`. Add `parentMessageId` to all message `select`s feeding formatMessage (GET list, GET :id).
-  - GET channel messages query: add `parentMessageId: null` to the `where` (replies excluded). Keep `take: limit+1` has_more logic.
-  - POST message handler: build the response via `formatMessage(<the created row>, senderNames)` + `idempotent`. Resolve the sender name for the single row (reuse `resolveSenderDisplayNames` for `[{senderId, senderKind}]`). Update the S1 write integration spec assertions to the full shape (additive — existing `toHaveProperty` checks still pass).
-- [ ] **Step 4:** Run → PASS. Full `npm test && npm run test:integration` green.
+  - `formatMessage`: add `parentMessageId: string | null` to its input type and emit `parent_message_id: msg.parentMessageId ?? null`. Add `parentMessageId: true` to EVERY message `select` feeding formatMessage: the GET-list query, GET `/messages/:id`, and the new re-fetch below. (A missed select → `undefined` → runtime error.)
+  - GET channel messages query: add `parentMessageId: null` to the `where` (replies excluded from main timeline). Keep `take: limit+1` has_more logic (filter applies uniformly).
+  - **Add a small helper** in `messageRoutes.ts` to build a full response from a written id (used by both POST branches and the reply route — the thin `SendMessageResult` lacks `mentions/embeddedCard*/threadReplyCount/parentMessageId`, so re-fetch rather than widen the result type):
+    ```ts
+    async function fetchFormattedMessage(id: string) {
+      const row = await db.controlMessage.findUnique({
+        where: { id },
+        select: { id:true, seq:true, senderKind:true, senderId:true, content:true,
+                  mentions:true, embeddedCardType:true, embeddedCardId:true,
+                  threadReplyCount:true, createdAt:true, channelId:true, parentMessageId:true },
+      });
+      if (!row) return null;
+      const names = await resolveSenderDisplayNames([{ senderId: row.senderId, senderKind: row.senderKind }]);
+      return formatMessage(row, names);
+    }
+    ```
+  - **Both POST message branches** (op_sess_ ~messageRoutes.ts:354 and machine ~:422): replace `reply.code(201).send({id,seq,created_at,idempotent})` with `reply.code(201).send({ ...(await fetchFormattedMessage(result.id))!, idempotent: result.idempotent })`. (Keep 201 — mirrors S1.)
+  - Update the S1 write integration spec assertions to expect the full shape (additive — existing `toHaveProperty('id'|'seq')` checks still pass; add asserts for `sender_kind`/`sender_id`/`content`/`parent_message_id`).
+- [ ] **Step 4:** Run → PASS. Full `npm test && npm run test:integration` green; `npx tsc --noEmit` clean.
 - [ ] **Step 5:** Commit.
 
 ### Task 2.4: Thread routes (GET thread, GET replies, POST reply)
@@ -226,7 +240,7 @@
 - [ ] **Step 3: Implement** the 3 routes (mirror the existing GET/POST messages handlers):
   - Reads use `authorizeControlRead` + channel visibility via the parent's channelId (mirror `GET /messages/:id` at messageRoutes.ts:~244). GET thread reads `ControlThread` (derive reply_count 0 if absent).
   - GET replies: `controlMessage.findMany({ where:{ parentMessageId, seq:{ gt: afterSeq } }, orderBy:{seq:'asc'}, take: limit+1 })` → formatMessage each (resolve names batch).
-  - POST reply: auth try op_sess_ (`authorizeOperatorWrite(request,{command:'send_message', workroomId:wid})`) else machine_token; dev_ctl_ → 403 (mirror messageRoutes POST). Derive senderKind/senderId. Load parent → its channelId (404 if missing). Call `sendMessageTransaction({ channelId, workroomId, senderKind, senderId, content, clientIdempotencyKey, parentMessageId })`. On ok, `publishControlEvent({workroomId, eventId:randomUUID(), topic:'thread.reply', payload:{channel_id, parent_message_id, message_id, seq, sender_kind, sender_id, preview}})` + broadcast (skip if idempotent). Respond full formatMessage + idempotent.
+  - POST reply: auth try op_sess_ (`authorizeOperatorWrite(request,{command:'send_message', workroomId:wid})`) else machine_token; dev_ctl_ → 403 (mirror messageRoutes POST). Derive senderKind/senderId. Load parent → its channelId (404 if missing). Call `sendMessageTransaction({ channelId, workroomId, senderKind, senderId, content, clientIdempotencyKey, parentMessageId: parentId })`. On ok, `publishControlEvent({workroomId, eventId:randomUUID(), topic:'thread.reply', payload:{channel_id, parent_message_id: parentId, message_id: result.id, seq: result.seq.toString(), sender_kind: senderKind, sender_id: senderId, preview}})` + broadcast (skip if `result.idempotent`). Respond `reply.code(201).send({ ...(await fetchFormattedMessage(result.id))!, idempotent: result.idempotent })` (reuse the Task 2.3 helper).
   - `devTokenAuth.ts`: add `/^\/api\/v1\/workrooms\/[^/]+\/threads\/[^/]+$/` and `/^\/api\/v1\/workrooms\/[^/]+\/threads\/[^/]+\/replies$/` to the GET allowlist. (`/messages/:id` already allowlisted — do NOT re-add.)
 - [ ] **Step 4:** Run → PASS. Full `npm test && npm run test:integration` green. `npx tsc --noEmit` clean.
 - [ ] **Step 5:** Commit.
@@ -236,6 +250,10 @@
 ---
 
 ## Chunk 3: iOS Live wiring
+
+**Repo:** CodeLight is a SEPARATE git repo rooted at `/Users/ying/Documents/AI/CodeLight/` (branch `main`). All `app/...` paths below resolve under that root (e.g. `/Users/ying/Documents/AI/CodeLight/app/CodeLight/Slock/Live/...`). Build/test on the booted simulator (id `00BBD0EE-5469-4E6F-A2FD-407C6241CD9B`, or re-query `xcrun simctl list devices booted`).
+
+**Test harness note:** `StubURLProtocol.configure(...)` (in `CodeLightTests/Slock/SlockAPIClientTests.swift`) is a SINGLE global stub returning ONE response for ALL requests — it does not route by URL. Each repository method here makes exactly one HTTP call, so per-method tests work; do NOT write a test that drives a flow making 2 sequential calls expecting different bodies (it'd get the same stub twice).
 
 **File Structure:**
 - Create: `app/CodeLight/Slock/Live/LiveMemberRepository.swift`
