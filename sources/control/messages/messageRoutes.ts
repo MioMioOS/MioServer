@@ -434,14 +434,24 @@ export async function messageRoutes(app: FastifyInstance) {
       embedded_card_type?: unknown;
       embedded_card_id?: unknown;
       client_idempotency_key?: unknown;
+      agent_id?: unknown;
     } | null;
 
     if (!machineBody?.content || typeof machineBody.content !== 'string') {
       return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'content is required' } });
     }
 
+    // Multi-agent attribution (machine path): an optional agent_id lets a machine post AS one of
+    // the agents it owns (e.g. "PM"), so the message carries senderId = <agent id> and
+    // resolveSenderDisplayNames (id branch) maps it to that agent's name. Absent → legacy default
+    // (senderId = machine.id). Operator path never reaches here, so op senders ignore agent_id.
+    const machineSender = await resolveMachineSenderId(machine.id, machineBody.agent_id);
+    if (!machineSender.ok) {
+      return reply.code(403).send({ error: { code: machineSender.code, message: machineSender.message } });
+    }
+
     senderKind = 'agent';
-    senderId = machine.id;
+    senderId = machineSender.senderId;
 
     const machineResult = await sendMessageTransaction({
       channelId: cid,
@@ -625,6 +635,7 @@ export async function messageRoutes(app: FastifyInstance) {
       content?: unknown;
       mentions?: unknown;
       client_idempotency_key?: unknown;
+      agent_id?: unknown;
     } | null;
 
     const opAuth = await authorizeOperatorWrite(request, { command: 'send_message', workroomId: wid });
@@ -661,8 +672,14 @@ export async function messageRoutes(app: FastifyInstance) {
       if (!body?.content || typeof body.content !== 'string') {
         return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'content is required' } });
       }
+      // Multi-agent attribution (machine reply path): mirror the POST messages route — an
+      // optional agent_id attributes the reply to an owned agent's id; absent → machine.id default.
+      const machineSender = await resolveMachineSenderId(machine.id, body.agent_id);
+      if (!machineSender.ok) {
+        return reply.code(403).send({ error: { code: machineSender.code, message: machineSender.message } });
+      }
       senderKind = 'agent';
-      senderId = machine.id;
+      senderId = machineSender.senderId;
       clientIdempotencyKey = typeof body.client_idempotency_key === 'string' ? body.client_idempotency_key : null;
       content = body.content;
       mentions = Array.isArray(body.mentions) ? (body.mentions as string[]) : [];
@@ -1094,6 +1111,51 @@ export async function messageRoutes(app: FastifyInstance) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve the senderId for a machine-token send/reply, supporting multi-agent attribution.
+ *
+ *   - agent_id absent (or not a string): legacy default → senderId = machine.id.
+ *     (A machine that does not specify an agent posts as its default identity.)
+ *   - agent_id provided: the agent must EXIST and be OWNED by this machine
+ *     (ControlAgent.machineId === machine.id). On success → senderId = agent.id, so the
+ *     message carries the agent's id and resolveSenderDisplayNames maps it to the agent's name.
+ *     If the agent does not exist, or is owned by a different machine → AGENT_NOT_OWNED (403).
+ *
+ * agent_id is matched against ControlAgent.id (@db.Uuid). A non-uuid agent_id can never match a
+ * real row, and querying the uuid column with it would throw P2023; we catch that and treat it
+ * as "not owned" (403) — a malformed agent_id is never silently downgraded to the machine default.
+ */
+async function resolveMachineSenderId(
+  machineId: string,
+  agentId: unknown,
+): Promise<
+  | { ok: true; senderId: string }
+  | { ok: false; code: 'AGENT_NOT_OWNED'; message: string }
+> {
+  // No agent_id → legacy default (post as the machine itself).
+  if (typeof agentId !== 'string' || agentId.length === 0) {
+    return { ok: true, senderId: machineId };
+  }
+
+  let agent: { id: string; machineId: string | null } | null = null;
+  try {
+    agent = await db.controlAgent.findUnique({
+      where: { id: agentId },
+      select: { id: true, machineId: true },
+    });
+  } catch {
+    // Malformed (non-uuid) agent_id → P2023 on the uuid column → treat as not owned.
+    return { ok: false, code: 'AGENT_NOT_OWNED', message: 'Agent not found or not owned by this machine' };
+  }
+
+  // Must exist AND be owned by this machine (a machine may only post as agents it owns).
+  if (!agent || agent.machineId !== machineId) {
+    return { ok: false, code: 'AGENT_NOT_OWNED', message: 'Agent not found or not owned by this machine' };
+  }
+
+  return { ok: true, senderId: agent.id };
+}
 
 /**
  * Write-before-broadcast for message.created.
