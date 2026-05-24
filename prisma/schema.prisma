@@ -438,7 +438,10 @@ model ControlAgent {
   handoffs         ControlHandoff[]                 @relation("HandoffTarget")
   roleInsights     ControlRoleInsight[]
 
-  @@unique([orgId, machineId])
+  // NOTE: deliberately NON-unique. A machine may host MANY agents (the "Create Agent"
+  // feature), so (orgId, machineId) is an ordinary lookup index, not a uniqueness
+  // constraint. bind-org idempotency is preserved at the app layer (findFirst-then-create).
+  @@index([orgId, machineId])
   @@index([orgId, status])
   @@map("control_agents")
 }

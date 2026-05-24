@@ -68,6 +68,7 @@ CONTROL_PLANE_MIGRATIONS=(
   "prisma/migrations/20260524060000_s5_saved_message/migration.sql"
   "prisma/migrations/20260524070000_s5_activity_state/migration.sql"
   "prisma/migrations/20260524080000_s2_agent_model/migration.sql"
+  "prisma/migrations/20260524090000_s2_agent_machine_drop_unique/migration.sql"
 )
 for migration in "${CONTROL_PLANE_MIGRATIONS[@]}"; do
   echo "==> Applying ${migration}"
