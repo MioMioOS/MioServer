@@ -53,7 +53,8 @@ const MACHINE_CREATE_ENV = randomUUID();
 const MACHINE_CREATE_MACHINE = randomUUID();
 const MACHINE_CREATE_EVENT = randomUUID();
 const MACHINE_CREATE_MULTI = randomUUID(); // two agents created on THIS one machine
-const POST_ONLY_MACHINE_IDS = [MACHINE_CREATE_OPSESS, MACHINE_CREATE_ENV, MACHINE_CREATE_MACHINE, MACHINE_CREATE_EVENT, MACHINE_CREATE_MULTI];
+const MACHINE_CREATE_REASONING = randomUUID(); // codex agent created WITH reasoning_effort
+const POST_ONLY_MACHINE_IDS = [MACHINE_CREATE_OPSESS, MACHINE_CREATE_ENV, MACHINE_CREATE_MACHINE, MACHINE_CREATE_EVENT, MACHINE_CREATE_MULTI, MACHINE_CREATE_REASONING];
 
 const MACHINE_RAW_TOKEN = `machine_${randomUUID().replace(/-/g, '')}`;       // bound to ORG_ID (MACHINE_ONLINE_ID)
 const OTHER_MACHINE_RAW_TOKEN = `machine_${randomUUID().replace(/-/g, '')}`; // bound to OTHER_ORG_ID
@@ -286,6 +287,43 @@ describe('POST /api/v1/workrooms/:wid/agents', () => {
     expect(found.runtime).toBe('claude');
     expect(found.model).toBe('sonnet');
     expect(found.machine_id).toBe(MACHINE_CREATE_ENV);
+  });
+
+  it('codex agent with reasoning_effort persists it in capabilities', async () => {
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/agents`,
+      { machine_id: MACHINE_CREATE_REASONING, name: 'CodexThinker', runtime: 'codex', model: 'gpt-5.5', reasoning_effort: 'high', env: { A: '1' } },
+      opSessHeader(),
+    );
+    expect(res.statusCode).toBe(201);
+    const created = JSON.parse(res.body);
+
+    // reasoning_effort lives in capabilities (no schema change), alongside env.
+    const row = await db.controlAgent.findUnique({
+      where: { id: created.id },
+      select: { runtime: true, model: true, capabilities: true },
+    });
+    expect(row!.runtime).toBe('codex');
+    expect(row!.model).toBe('gpt-5.5');
+    const caps = row!.capabilities as { env: Record<string, string>; reasoning_effort: string | null };
+    expect(caps.reasoning_effort).toBe('high');
+    expect(caps.env).toEqual({ A: '1' });
+  });
+
+  it('agent created WITHOUT reasoning_effort stores null (claude default)', async () => {
+    const res = await post(
+      `/api/v1/workrooms/${WORKROOM_ID}/agents`,
+      { machine_id: MACHINE_CREATE_OPSESS, name: 'NoReasoning', runtime: 'claude', model: 'opus' },
+      opSessHeader(),
+    );
+    expect(res.statusCode).toBe(201);
+    const created = JSON.parse(res.body);
+    const row = await db.controlAgent.findUnique({
+      where: { id: created.id },
+      select: { capabilities: true },
+    });
+    const caps = row!.capabilities as { env: Record<string, string>; reasoning_effort: string | null };
+    expect(caps.reasoning_effort).toBeNull();
   });
 
   it('machine_token create → 201', async () => {

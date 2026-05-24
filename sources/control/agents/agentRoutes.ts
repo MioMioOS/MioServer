@@ -14,7 +14,7 @@
  *
  *   POST /api/v1/workrooms/:wid/agents
  *     Create a ControlAgent ROW from the form. Body:
- *       { machine_id, name, description?, runtime?, model?, env? }
+ *       { machine_id, name, description?, runtime?, model?, env?, reasoning_effort? }
  *     Auth: op_sess_('create_agent') OR machine_token; dev_ctl_ → 403.
  *     Validates: name non-empty (400); machine_id ∈ workroom's org (404 else).
  *     Publishes 'agent.created'. Returns the GET /members item shape + runtime + model:
@@ -159,13 +159,16 @@ export async function agentRoutes(app: FastifyInstance) {
    * Create a ControlAgent row from the Create Agent form. Auth: op_sess_('create_agent')
    * OR machine_token; dev_ctl_ → 403.
    *
-   * Body: { machine_id, name, description?, runtime?, model?, env? }
+   * Body: { machine_id, name, description?, runtime?, model?, env?, reasoning_effort? }
    *   machine_id — required; must be a ControlMachine in the workroom's org (404 else).
    *   name       — required, non-empty after trim (400 else). Used for name + displayName.
    *   description — optional, default ''.
    *   runtime    — optional, default 'claude'.
    *   model      — optional, default null (runtime default).
    *   env        — optional KEY:VALUE map; stored at capabilities.env (default {}).
+   *   reasoning_effort — optional 'low'|'medium'|'high'; stored at capabilities.reasoning_effort
+   *                      (default null). Only meaningful for codex runtime, but stored as-sent.
+   *                      Persisted for the FUTURE codex-runtime daemon — not used at runtime yet.
    *
    * role = 'other', status = 'offline' (the agent is NOT running yet — honest), permissions = {}.
    * Publishes 'agent.created'. Returns the GET /members item shape + runtime + model.
@@ -183,6 +186,7 @@ export async function agentRoutes(app: FastifyInstance) {
       runtime?: unknown;
       model?: unknown;
       env?: unknown;
+      reasoning_effort?: unknown;
     } | null;
 
     // Validate name (non-empty after trim).
@@ -214,6 +218,13 @@ export async function agentRoutes(app: FastifyInstance) {
       }
     }
 
+    // reasoning_effort ("low"|"medium"|"high") is only meaningful for the codex runtime, but we
+    // store whatever's sent (null when absent). Lives in capabilities (no schema change). NOTE:
+    // this is persisted for the future codex-runtime daemon — the daemon does NOT use it yet.
+    const reasoningEffort = typeof body?.reasoning_effort === 'string' && body.reasoning_effort.trim()
+      ? body.reasoning_effort.trim()
+      : null;
+
     // A machine may host MANY agents — there is intentionally NO one-agent-per-machine
     // limit (the DB unique was dropped). Just create the row; no pre-check, no P2002→409.
     const agent = await db.controlAgent.create({
@@ -228,7 +239,7 @@ export async function agentRoutes(app: FastifyInstance) {
         model,
         // status 'offline' is honest: creating the row does NOT start the agent (separate daemon change).
         status: 'offline',
-        capabilities: { env },
+        capabilities: { env, reasoning_effort: reasoningEffort },
         permissions: {},
       },
       select: { id: true, displayName: true, role: true, status: true, machineId: true, runtime: true, model: true },
