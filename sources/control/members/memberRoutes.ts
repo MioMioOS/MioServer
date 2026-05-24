@@ -59,7 +59,7 @@ export async function memberRoutes(app: FastifyInstance) {
 
     const agents = await db.controlAgent.findMany({
       where: { orgId: wr.orgId },
-      select: { id: true, displayName: true, name: true, role: true, status: true, machineId: true, runtime: true, model: true },
+      select: { id: true, displayName: true, name: true, role: true, status: true, machineId: true, runtime: true, model: true, description: true },
       orderBy: [{ displayName: 'asc' }],
     });
 
@@ -79,6 +79,7 @@ export async function memberRoutes(app: FastifyInstance) {
       machine_id: a.machineId,
       runtime: a.runtime,
       model: a.model,
+      description: a.description,
     }));
 
     return { members };
