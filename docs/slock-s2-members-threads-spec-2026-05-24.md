@@ -62,19 +62,22 @@ model ControlAgent {
 }
 ```
 
-迁移 `YYYYMMDDHHMMSS_s2_message_parent_and_agent_machine_unique`：
+迁移 `YYYYMMDDHHMMSS_s2_message_parent_and_agent_machine_unique`（用 `prisma migrate dev` 生成，**不手写部分索引**，见下）：
 ```sql
 ALTER TABLE "control_messages" ADD COLUMN "parent_message_id" uuid;
 CREATE INDEX "control_messages_parent_message_id_idx" ON "control_messages"("parent_message_id");
--- machineId 可空：部分唯一索引仅约束非空行（多个 machineId=NULL 的 agent 不冲突）
+-- 普通 full unique index（Prisma @@unique 生成的形态）。Postgres NULL 互不相等，
+-- 故多个 machine_id=NULL 的 agent 行不冲突，无需 partial WHERE。
 CREATE UNIQUE INDEX "control_agents_org_id_machine_id_key"
-  ON "control_agents"("org_id","machine_id") WHERE "machine_id" IS NOT NULL;
+  ON "control_agents"("org_id","machine_id");
 ```
+- **不用 partial unique index**：Prisma `@@unique` 只能生成 full unique index（无 previewFeatures），若手写 `WHERE machine_id IS NOT NULL` 的 partial index，`prisma migrate dev` 的 shadow-DB diff 会判 drift 并尝试纠正，反而破坏。改用 full unique index——Postgres 多个 NULL 互不相等，无 machineId 的 agent 行天然不撞，效果等价。迁移由 `prisma migrate dev --name s2_message_parent_and_agent_machine_unique` 自动生成（上面 SQL 是预期产物，以生成结果为准）。
 - 存量行 `parent_message_id` 默认 NULL（安全，无需回填）。
 - `parent_message_id` **无 FK**（沿用控制面"自引用不建 Prisma relation"惯例）；父消息被删会留孤儿回复——S2 范围外（控制面目前无删消息路径）。
-- 部分唯一索引（`WHERE machine_id IS NOT NULL`）避免约束到无 machineId 的 agent 行。
 
-**`SendMessageInput` 扩展**（`sendMessageTransaction.ts`）：加可选 `parentMessageId?: string`，insert 写入该列。其余（seq 分配、`(channelId, clientIdempotencyKey)` 幂等、P2002 重放）不变——回复因此与主消息走完全相同的并发安全路径。
+**`SendMessageInput` 扩展**（`sendMessageTransaction.ts`）：加可选 `parentMessageId?: string`，insert 写入该列，message `select` 加 `parentMessageId`。其余（seq 分配、`(channelId, clientIdempotencyKey)` 幂等、P2002 重放）不变——回复因此与主消息走完全相同的并发安全路径。
+
+**`formatMessage` 扩展**（`messageRoutes.ts`）：wire shape 加 `parent_message_id: msg.parentMessageId ?? null`，对应 `select` 加 `parentMessageId`。顶层消息为 null，回复为父 id。（iOS `MessageDTO` 可选加 `parentMessageId`；Swift Decodable 忽略未知键，不加也不崩。）
 
 **ControlAgent backfill**（脚本 `prisma/backfill/s2_agents_for_bound_machines.ts`）：对每个 `boundAt IS NOT NULL` 且 `orgId` 非空、且无对应 ControlAgent 的 ControlMachine，建一条 ControlAgent（`machineId=machine.id`、`orgId=machine.orgId`、`displayName=machine.displayName ?? "Agent"`、`name` 同、`role="other"`、`status="online"`）。幂等：靠新 `@@unique([orgId, machineId])` + `findFirst` 守卫。
 
