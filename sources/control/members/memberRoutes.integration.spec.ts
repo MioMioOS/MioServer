@@ -117,6 +117,15 @@ describe('GET /api/v1/workrooms/:wid/members', () => {
     expect(ids).not.toContain(OTHER_AGENT_ID);
   });
 
+  it('orders online agents first (§4.1) — online Mio before offline Zelda', async () => {
+    // Regression: lexicographic status sort would put 'offline' < 'online' (Zelda first).
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/members`, MACHINE_RAW_TOKEN);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.members[0].id).toBe(AGENT_ONLINE_ID);
+    expect(body.members[0].status).toBe('online');
+  });
+
   it('wire shape: { members: [{ id, kind:"agent", display_name, role, status, machine_id }] }', async () => {
     const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/members`, MACHINE_RAW_TOKEN);
     expect(res.statusCode).toBe(200);

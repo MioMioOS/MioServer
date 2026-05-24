@@ -149,25 +149,21 @@ export async function machineRoutes(app: FastifyInstance) {
 
     // Ensure an agent identity exists for this machine so it appears in the
     // members list and resolves a display name on its messages (S2 §1.2).
-    // Idempotent: @@unique([orgId, machineId]) + this findFirst guard means a
-    // repeat bind does not create a duplicate ControlAgent row.
-    const existingAgent = await db.controlAgent.findFirst({
-      where: { orgId: org_id, machineId: machine.id },
-      select: { id: true },
+    // Atomic + idempotent via @@unique([orgId, machineId]): a repeat (or concurrent)
+    // bind updates nothing rather than racing two creates into a P2002.
+    const displayName = machine.displayName?.trim() || 'Agent';
+    await db.controlAgent.upsert({
+      where: { orgId_machineId: { orgId: org_id, machineId: machine.id } },
+      create: {
+        orgId: org_id,
+        machineId: machine.id,
+        name: displayName,
+        displayName,
+        role: 'other',
+        status: 'online',
+      },
+      update: {}, // already exists → leave as-is (don't clobber a renamed/repurposed agent)
     });
-    if (!existingAgent) {
-      const displayName = machine.displayName?.trim() || 'Agent';
-      await db.controlAgent.create({
-        data: {
-          orgId: org_id,
-          machineId: machine.id,
-          name: displayName,
-          displayName,
-          role: 'other',
-          status: 'online',
-        },
-      });
-    }
 
     return {
       machine_id: updated.id,

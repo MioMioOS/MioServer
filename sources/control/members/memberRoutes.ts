@@ -18,14 +18,19 @@
  * org derivation: the org is resolved from the :wid workroom (NOT trusted from the token),
  * so members are always the agents of the workroom's owning org.
  *
- * Sort: status 'online' first (ascending puts 'busy'/'drain'/'offline' after 'online'
- * lexicographically — see note below), then by display_name.
+ * Sort: status 'online' first, then by display_name. (Cannot be done in a single Prisma
+ * orderBy — lexicographic status would put 'online' last, after busy/drain/offline — so we
+ * rank in JS via STATUS_RANK.)
  */
 
 import { FastifyInstance } from 'fastify';
 import { db } from '@/storage/db';
 import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
+
+// Status sort priority — 'online' first. Unknown statuses sort last.
+const STATUS_RANK: Record<string, number> = { online: 0, busy: 1, drain: 2, offline: 3 };
+const statusRank = (s: string): number => STATUS_RANK[s] ?? 99;
 
 export async function memberRoutes(app: FastifyInstance) {
   app.get('/api/v1/workrooms/:wid/members', async (request, reply) => {
@@ -53,13 +58,20 @@ export async function memberRoutes(app: FastifyInstance) {
     const agents = await db.controlAgent.findMany({
       where: { orgId: wr.orgId },
       select: { id: true, displayName: true, name: true, role: true, status: true, machineId: true },
-      orderBy: [{ status: 'asc' }, { displayName: 'asc' }],
+      orderBy: [{ displayName: 'asc' }],
+    });
+
+    // Sort online-first in JS (Prisma can't express the custom status priority), then by name.
+    agents.sort((a, b) => {
+      const r = statusRank(a.status) - statusRank(b.status);
+      if (r !== 0) return r;
+      return (a.displayName || a.name).localeCompare(b.displayName || b.name);
     });
 
     const members = agents.map((a) => ({
       id: a.id,
       kind: 'agent' as const,
-      display_name: a.displayName?.trim() || a.name,
+      display_name: a.displayName?.trim() || a.name?.trim(),
       role: a.role,
       status: a.status,
       machine_id: a.machineId,
