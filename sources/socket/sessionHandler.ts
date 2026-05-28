@@ -200,14 +200,32 @@ export function registerSessionHandler(
             }
 
             const seq = await allocateSessionSeq(data.sid);
-            const message = await db.sessionMessage.create({
-                data: {
-                    sessionId: data.sid,
-                    content: data.message,
-                    localId: data.localId,
-                    seq,
-                },
-            });
+            // Upsert (not create) when localId is present: Codex-format clients
+            // and Mac retry paths can send the same localId twice in tight
+            // succession, racing past the findUnique pre-check above and
+            // tripping the @@unique([sessionId, localId]) constraint. Each
+            // failed insert burned a Prisma pool slot until the pool (limit=20)
+            // starved and unrelated queries timed out — root cause of the
+            // pm2-restart storm. Upsert turns the duplicate into a cheap no-op
+            // that returns the existing row.
+            const message = data.localId
+                ? await db.sessionMessage.upsert({
+                    where: { sessionId_localId: { sessionId: data.sid, localId: data.localId } },
+                    create: {
+                        sessionId: data.sid,
+                        content: data.message,
+                        localId: data.localId,
+                        seq,
+                    },
+                    update: {}, // duplicate localId → return existing, don't overwrite
+                })
+                : await db.sessionMessage.create({
+                    data: {
+                        sessionId: data.sid,
+                        content: data.message,
+                        seq,
+                    },
+                });
 
             // Single session lookup that covers everything below: routing
             // (tag/path), Live Activity (metadata, deviceId), and notifications.

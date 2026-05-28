@@ -252,16 +252,34 @@ export async function sessionRoutes(app: FastifyInstance) {
 
         const startSeq = await allocateSessionSeqBatch(sessionId, newMessages.length);
 
+        // Upsert per row (not create) when localId is present: a duplicate
+        // localId in the batch — possible from client retries that overlap
+        // an earlier batch still in flight — used to fail the whole
+        // $transaction with a P2002 unique constraint error, rolling back
+        // every other (legitimate) message in the batch. Upsert with empty
+        // `update: {}` makes the duplicate a no-op that returns the existing
+        // row, so the rest of the batch lands. See sessionHandler.ts:221
+        // for the same fix on the WebSocket path.
         const created = await db.$transaction(
             newMessages.map((msg, i) =>
-                db.sessionMessage.create({
-                    data: {
-                        sessionId,
-                        content: msg.content,
-                        localId: msg.localId,
-                        seq: startSeq + i,
-                    },
-                })
+                msg.localId
+                    ? db.sessionMessage.upsert({
+                        where: { sessionId_localId: { sessionId, localId: msg.localId } },
+                        create: {
+                            sessionId,
+                            content: msg.content,
+                            localId: msg.localId,
+                            seq: startSeq + i,
+                        },
+                        update: {}, // duplicate → return existing
+                    })
+                    : db.sessionMessage.create({
+                        data: {
+                            sessionId,
+                            content: msg.content,
+                            seq: startSeq + i,
+                        },
+                    })
             )
         );
 

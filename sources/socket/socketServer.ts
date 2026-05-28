@@ -40,39 +40,52 @@ export function startSocket(server: HttpServer) {
         }
 
         // ── Subscription check ──────────────────────────────────────────
+        // Wrap the whole block in try/catch so a transient Prisma error
+        // (connection pool starvation, timeout, transient unavailable) does
+        // NOT throw out of an async socket event handler — that path turns
+        // into an unhandled promise rejection and node crashes the worker,
+        // which is exactly the "pm2 restart storm" we saw in late May 2026.
+        // Fail-closed: deny the connection cleanly, let the client retry.
         let trackedTransactionId: string | null = null;
         if (config.enforceSubscription) {
-            let access = await checkAccess(payload.deviceId);
+            try {
+                let access = await checkAccess(payload.deviceId);
 
-            // Auto-start trial for iOS devices that have no subscription yet
-            // (covers existing users who paired before subscription system was deployed)
-            if (!access.allowed && access.reason === 'no_subscription') {
-                await startTrial(payload.deviceId);
-                access = await checkAccess(payload.deviceId);
-            }
+                // Auto-start trial for iOS devices that have no subscription yet
+                // (covers existing users who paired before subscription system was deployed)
+                if (!access.allowed && access.reason === 'no_subscription') {
+                    await startTrial(payload.deviceId);
+                    access = await checkAccess(payload.deviceId);
+                }
 
-            if (!access.allowed) {
-                socket.emit('subscription-required', {
-                    reason: access.reason,
-                    status: access.status,
-                });
-                socket.disconnect();
-                return;
-            }
-
-            // Concurrent device limit (only for paid users with a subscription)
-            const sub = await getDeviceSubscription(payload.deviceId);
-            if (sub?.originalTransactionId) {
-                if (!concurrencyGuard.canConnect(sub.originalTransactionId, socket.id)) {
-                    socket.emit('device-limit-reached', {
-                        max: config.maxConcurrentDevices,
-                        currentDevices: concurrencyGuard.getActiveCount(sub.originalTransactionId),
+                if (!access.allowed) {
+                    socket.emit('subscription-required', {
+                        reason: access.reason,
+                        status: access.status,
                     });
                     socket.disconnect();
                     return;
                 }
-                concurrencyGuard.addConnection(sub.originalTransactionId, socket.id);
-                trackedTransactionId = sub.originalTransactionId;
+
+                // Concurrent device limit (only for paid users with a subscription)
+                const sub = await getDeviceSubscription(payload.deviceId);
+                if (sub?.originalTransactionId) {
+                    if (!concurrencyGuard.canConnect(sub.originalTransactionId, socket.id)) {
+                        socket.emit('device-limit-reached', {
+                            max: config.maxConcurrentDevices,
+                            currentDevices: concurrencyGuard.getActiveCount(sub.originalTransactionId),
+                        });
+                        socket.disconnect();
+                        return;
+                    }
+                    concurrencyGuard.addConnection(sub.originalTransactionId, socket.id);
+                    trackedTransactionId = sub.originalTransactionId;
+                }
+            } catch (err) {
+                console.error(`[socketServer] subscription check failed for device ${payload.deviceId}:`, err);
+                socket.emit('subscription-check-error', { reason: 'temporary' });
+                socket.disconnect();
+                return;
             }
         }
         // ── End subscription check ───────────────────────────────────────
