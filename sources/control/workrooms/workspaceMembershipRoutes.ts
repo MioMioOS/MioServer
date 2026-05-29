@@ -63,12 +63,25 @@ export const workspaceMembershipRoutes: FastifyPluginAsync = async (app) => {
         where: { userId_workroomId: { userId, workroomId } },
       });
 
-      // If no owner members remain, archive the orphan workroom (no cascade delete).
-      const remainingOwners = await tx.userWorkroomMembership.count({
-        where: { workroomId, role: 'owner' },
-      });
+      // Repoint the user's default workspace if it pointed at the one just left
+      // (else GET /me / the client would surface a workroom the user no longer belongs to).
+      const me = await tx.user.findUnique({ where: { id: userId }, select: { defaultWorkroomId: true } });
+      if (me?.defaultWorkroomId === workroomId) {
+        const next = await tx.userWorkroomMembership.findFirst({
+          where: { userId },
+          select: { workroomId: true },
+          orderBy: { createdAt: 'asc' },
+        });
+        await tx.user.update({ where: { id: userId }, data: { defaultWorkroomId: next?.workroomId ?? null } });
+      }
+
+      // Archive ONLY when NO members of ANY role remain (truly empty). Counting just owners
+      // would archive a SHARED workroom out from under invited 'member's (R4) — silently
+      // locking them out of a room they still belong to. An owner-less but non-empty workroom
+      // keeps members' access (ownership transfer is future work). No cascade delete.
+      const remaining = await tx.userWorkroomMembership.count({ where: { workroomId } });
       let archived = false;
-      if (remainingOwners === 0) {
+      if (remaining === 0) {
         const workroom = await tx.controlWorkroom.findUnique({
           where: { id: workroomId },
           select: { archivedAt: true },
@@ -78,8 +91,8 @@ export const workspaceMembershipRoutes: FastifyPluginAsync = async (app) => {
             where: { id: workroomId },
             data: { archivedAt: new Date() },
           });
+          archived = true;
         }
-        archived = true;
       }
       return { ok: true as const, archived };
     });

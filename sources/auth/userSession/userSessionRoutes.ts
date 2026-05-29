@@ -20,6 +20,7 @@
  *    Solo-owned workrooms are LEFT ORPHANED in this slice — see file footer.
  */
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify';
+import { Prisma } from '@prisma/client';
 import { db } from '@/storage/db';
 import { verifyPassword, DUMMY_PASSWORD_HASH } from './passwordHash';
 import {
@@ -334,8 +335,14 @@ export const userSessionRoutes: FastifyPluginAsync = async (app) => {
                 data: updateData,
                 select: { id: true, email: true, displayName: true, defaultWorkroomId: true },
             });
-        } catch {
-            return reply.code(401).send({ error: { code: 'INVALID_SESSION' } });
+        } catch (err) {
+            // Only the user-vanished race (P2025) maps to 401; any other DB error must
+            // surface as 500, not be masked as an auth failure (which would log the user out
+            // and hide a real server fault).
+            if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
+                return reply.code(401).send({ error: { code: 'INVALID_SESSION' } });
+            }
+            throw err;
         }
 
         const workrooms = await loadWorkrooms(updated.id);
