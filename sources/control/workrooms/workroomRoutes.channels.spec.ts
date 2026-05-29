@@ -30,9 +30,11 @@ vi.mock('@/storage/db', () => ({
   db: {
     controlWorkroom: { findUnique: vi.fn() },
     controlChannel: { findMany: vi.fn() },
-    controlChannelMember: { groupBy: vi.fn() },
+    controlChannelMember: { groupBy: vi.fn(), findMany: vi.fn().mockResolvedValue([]) },
     controlAction: { count: vi.fn() },
     controlApproval: { count: vi.fn() },
+    controlAgent: { findMany: vi.fn().mockResolvedValue([]) },
+    user: { findMany: vi.fn().mockResolvedValue([]) },
     userWorkroomMembership: { findUnique: vi.fn() },
   },
 }));
