@@ -37,8 +37,39 @@ import { verifyMachineToken } from '@/machines/machineRoutes';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 
 // Status sort priority — 'online' first. Unknown statuses sort last.
-const STATUS_RANK: Record<string, number> = { online: 0, busy: 1, drain: 2, offline: 3 };
+const STATUS_RANK: Record<string, number> = { online: 0, busy: 1, drain: 2, paused: 3, offline: 4 };
 const statusRank = (s: string): number => STATUS_RANK[s] ?? 99;
+
+/**
+ * An agent's machine is "online" if seen within this window. The mio-agent
+ * daemon refreshes the roster every 30s (and bumps lastSeenAt via
+ * verifyMachineToken), so a 2-minute window (== the COMPUTER picker's
+ * ONLINE_WINDOW_MS in agentRoutes) reliably reflects a live daemon without
+ * flapping between refreshes.
+ */
+const MACHINE_ONLINE_WINDOW_MS = 2 * 60 * 1000;
+
+/**
+ * Derive an agent's REAL status. This deliberately does NOT trust the stored
+ * control_agents.status column as a liveness signal — that column was a
+ * manually-written flag (set at create / pause / resume) with no connection to
+ * whether the agent's daemon is actually running, which is why agents that were
+ * happily replying in channel still showed "offline".
+ *
+ * Truth model:
+ *   - 'paused'  → a real, user-expressed intent (the Stop button). The daemon
+ *                 honors it and stops ticking, so we surface it verbatim.
+ *   - otherwise → derived from the host machine's heartbeat: a live daemon
+ *                 keeps lastSeenAt fresh, so bound + fresh ⇒ 'online', else
+ *                 'offline'. Fine-grained per-turn state (starting/thinking)
+ *                 rides on top via the ephemeral WS `agent.status` presence the
+ *                 client already consumes — it is not persisted here.
+ */
+function deriveAgentStatus(storedStatus: string, machineLastSeenAt: Date | null | undefined): string {
+  if (storedStatus === 'paused') return 'paused';
+  if (!machineLastSeenAt) return 'offline';
+  return Date.now() - machineLastSeenAt.getTime() <= MACHINE_ONLINE_WINDOW_MS ? 'online' : 'offline';
+}
 
 export async function memberRoutes(app: FastifyInstance) {
   app.get('/api/v1/workrooms/:wid/members', async (request, reply) => {
@@ -87,14 +118,31 @@ export async function memberRoutes(app: FastifyInstance) {
       orderBy: [{ displayName: 'asc' }],
     });
 
-    // Sort online-first in JS (Prisma can't express the custom status priority), then by name.
-    agents.sort((a, b) => {
-      const r = statusRank(a.status) - statusRank(b.status);
+    // Resolve the heartbeat (lastSeenAt) of every machine these agents are bound
+    // to, so status can be DERIVED from real liveness instead of the stale
+    // stored column. One batched query keyed by the distinct machine ids.
+    const machineIds = [...new Set(agents.map((a) => a.machineId).filter((m): m is string => !!m))];
+    const machines = machineIds.length
+      ? await db.controlMachine.findMany({
+          where: { id: { in: machineIds } },
+          select: { id: true, lastSeenAt: true },
+        })
+      : [];
+    const lastSeenByMachine = new Map(machines.map((m) => [m.id, m.lastSeenAt]));
+
+    // Compute the derived status once per agent, then sort online-first by it
+    // (Prisma can't express the custom status priority), then by name.
+    const withStatus = agents.map((a) => ({
+      a,
+      derivedStatus: deriveAgentStatus(a.status, a.machineId ? lastSeenByMachine.get(a.machineId) : null),
+    }));
+    withStatus.sort((x, y) => {
+      const r = statusRank(x.derivedStatus) - statusRank(y.derivedStatus);
       if (r !== 0) return r;
-      return (a.displayName || a.name).localeCompare(b.displayName || b.name);
+      return (x.a.displayName || x.a.name).localeCompare(y.a.displayName || y.a.name);
     });
 
-    const members = agents.map((a) => {
+    const members = withStatus.map(({ a, derivedStatus }) => {
       const caps = (a.capabilities && typeof a.capabilities === 'object' && !Array.isArray(a.capabilities))
         ? (a.capabilities as Record<string, unknown>) : {};
       return {
@@ -103,7 +151,7 @@ export async function memberRoutes(app: FastifyInstance) {
         display_name: a.displayName?.trim() || a.name?.trim(),
         handle: a.name.startsWith('@') ? a.name : '@' + a.name,
         role: a.role,
-        status: a.status,
+        status: derivedStatus,
         machine_id: a.machineId,
         runtime: a.runtime,
         model: a.model,
