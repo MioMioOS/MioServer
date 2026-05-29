@@ -1,15 +1,15 @@
 /**
- * S4 DM — read path. GET /api/v1/workrooms/:wid/dms (REAL Postgres integration).
+ * DM read path — GET /api/v1/workrooms/:wid/dms (REAL Postgres integration).
  *
- * Unit coverage (channelRoutes.dms.spec.ts) mocks Prisma. This spec proves the REAL query
- * against Postgres: the `type='dm'` + `members.some(memberId=caller)` WHERE clause, the
- * peer resolution, and the dev-token "all dm channels" scope. Without this, a wrong Prisma
- * filter (e.g. forgetting the membership join) would pass the mocked unit test but break live.
+ * Slice 7 B2-c: userOrMachine read — user_sess_ (workroom member) OR machine_token.
+ * Scoping: every caller (user OR machine) sees only dm channels where their viewer id
+ * is an explicit ControlChannelMember. The previous anonymous-read "all dm channels"
+ * branch is gone (no anonymous read tokens exist after Slice 7).
  *
  * FAST MODE — only meaningful tests:
- *   - machine: returns ONLY dm channels the machine is a member of, with peer = other member;
- *              excludes standard/main channels AND dm channels the machine is not in.
- *   - dev_ctl_: returns ALL dm channels in the workroom (no member filter).
+ *   - machine: returns ONLY dm channels the machine is a member of, peer = other member;
+ *              excludes standard channels AND dm channels the machine is not in.
+ *   - user-owner: only sees dm channels where user.id is a member (not all dms).
  *
  * Run: npm run test:db:setup && npm run test:integration
  */
@@ -19,6 +19,8 @@ import fastify, { type FastifyInstance } from 'fastify';
 import { createHash, randomUUID } from 'crypto';
 import { db } from '@/storage/db';
 import { channelRoutes } from './channelRoutes';
+import { hashPassword } from '@/auth/userSession/passwordHash';
+import { mintUserSessionToken, hashUserSessionToken } from '@/auth/userSession/tokenMint';
 
 const ORG_ID = randomUUID();
 const WORKROOM_ID = randomUUID();
@@ -27,12 +29,14 @@ const PEER_ID = `pairing:${randomUUID()}`;
 const OTHER_AGENT = `pairing:${randomUUID()}`;
 
 const MACHINE_RAW_TOKEN = `machine_${randomUUID().replace(/-/g, '')}`;
-const DEV_CTL_RAW_TOKEN = `dev_ctl_${randomUUID().replace(/-/g, '')}`;
 
-const DM_WITH_MACHINE = randomUUID();   // dm: [MACHINE_ID, PEER_ID]
-const DM_WITHOUT_MACHINE = randomUUID(); // dm: [OTHER_AGENT, PEER_ID]  (machine not a member)
-const STANDARD_CH = randomUUID();        // type='standard' (must be excluded)
+const DM_WITH_MACHINE = randomUUID();
+const DM_WITHOUT_MACHINE = randomUUID();
+const DM_WITH_USER = randomUUID();
+const STANDARD_CH = randomUUID();
 
+let OWNER_USER_ID = '';
+let OWNER_USER_TOKEN = '';
 let APP: FastifyInstance;
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
@@ -57,18 +61,20 @@ beforeAll(async () => {
       arch: 'arm64',
     },
   });
-  await db.controlDevToken.create({
-    data: {
-      id: randomUUID(),
-      orgId: ORG_ID,
-      workroomId: WORKROOM_ID,
-      tokenHash: sha256(DEV_CTL_RAW_TOKEN),
-      scope: 'read_only',
-      expiresAt: new Date(Date.now() + 24 * 3600_000),
-    },
-  });
   await db.controlWorkroom.create({
     data: { id: WORKROOM_ID, orgId: ORG_ID, name: 'DmReadSpec WR', createdBy: randomUUID() },
+  });
+
+  const owner = await db.user.create({
+    data: { email: `dm-read-owner-${randomUUID()}@example.test`, passwordHash: await hashPassword('p') },
+  });
+  OWNER_USER_ID = owner.id;
+  OWNER_USER_TOKEN = mintUserSessionToken();
+  await db.userSession.create({
+    data: { userId: OWNER_USER_ID, tokenHash: hashUserSessionToken(OWNER_USER_TOKEN), expiresAt: new Date(Date.now() + 86_400_000) },
+  });
+  await db.userWorkroomMembership.create({
+    data: { userId: OWNER_USER_ID, workroomId: WORKROOM_ID, role: 'owner' },
   });
 
   // dm channel the machine IS a member of.
@@ -90,7 +96,7 @@ beforeAll(async () => {
     ],
   });
 
-  // dm channel the machine is NOT a member of.
+  // dm channel the machine is NOT a member of (also user not a member).
   await db.controlChannel.create({
     data: {
       id: DM_WITHOUT_MACHINE,
@@ -106,6 +112,25 @@ beforeAll(async () => {
     data: [
       { channelId: DM_WITHOUT_MACHINE, memberId: OTHER_AGENT },
       { channelId: DM_WITHOUT_MACHINE, memberId: PEER_ID },
+    ],
+  });
+
+  // dm channel the user IS a member of (machine is not).
+  await db.controlChannel.create({
+    data: {
+      id: DM_WITH_USER,
+      workroomId: WORKROOM_ID,
+      name: 'dm-with-user',
+      type: 'dm',
+      visibility: 'private',
+      createdBy: 'system',
+      lastActivityAt: new Date('2026-05-21T00:00:00.000Z'),
+    },
+  });
+  await db.controlChannelMember.createMany({
+    data: [
+      { channelId: DM_WITH_USER, memberId: OWNER_USER_ID },
+      { channelId: DM_WITH_USER, memberId: PEER_ID },
     ],
   });
 
@@ -127,8 +152,10 @@ beforeAll(async () => {
 afterAll(async () => {
   await db.controlChannelMember.deleteMany({ where: { channel: { workroomId: WORKROOM_ID } } });
   await db.controlChannel.deleteMany({ where: { workroomId: WORKROOM_ID } });
+  await db.userWorkroomMembership.deleteMany({ where: { userId: OWNER_USER_ID } });
+  await db.userSession.deleteMany({ where: { userId: OWNER_USER_ID } });
+  await db.user.deleteMany({ where: { id: OWNER_USER_ID } });
   await db.controlWorkroom.deleteMany({ where: { id: WORKROOM_ID } });
-  await db.controlDevToken.deleteMany({ where: { orgId: ORG_ID } });
   await db.controlMachine.deleteMany({ where: { id: MACHINE_ID } });
   await db.controlOrg.deleteMany({ where: { id: ORG_ID } });
   await APP.close();
@@ -150,16 +177,17 @@ describe('GET /api/v1/workrooms/:wid/dms (real DB)', () => {
     });
   });
 
-  it('dev_ctl_: returns ALL dm channels in the workroom (no member filter), excludes standard', async () => {
-    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/dms`, DEV_CTL_RAW_TOKEN);
+  it('user-owner: returns only dm channels where user.id is a member', async () => {
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/dms`, OWNER_USER_TOKEN);
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
 
-    const ids = body.dms.map((d: { id: string }) => d.id).sort();
-    expect(ids).toEqual([DM_WITH_MACHINE, DM_WITHOUT_MACHINE].sort());
-    // standard channel never appears.
-    expect(ids).not.toContain(STANDARD_CH);
-    // every entry has the honest unread_count = 0.
-    for (const d of body.dms) expect(d.unread_count).toBe(0);
+    expect(body.dms).toHaveLength(1);
+    expect(body.dms[0]).toEqual({
+      id: DM_WITH_USER,
+      peer_member_id: PEER_ID,
+      unread_count: 0,
+      last_activity_at: '2026-05-21T00:00:00.000Z',
+    });
   });
 });

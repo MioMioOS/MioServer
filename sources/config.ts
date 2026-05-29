@@ -41,4 +41,9 @@ export const config = {
     // Unset provider → no store provisioned → consume route fail-safe to needs_human.
     credentialStoreProvider: (process.env.CREDENTIAL_STORE_PROVIDER ?? '').trim(),
     credentialStoreAesFilePath: (process.env.CREDENTIAL_STORE_AESFILE_PATH ?? '').trim(),
+    // Slice 7 boot seed (§4.4). Both can be undefined; seedUserIfEmpty() only
+    // throws when User table is empty AND these are unset. Once a User row
+    // exists the seed is a no-op and these can be removed from the deploy env.
+    SEED_USER_EMAIL: process.env.SEED_USER_EMAIL,
+    SEED_USER_PASSWORD_HASH: process.env.SEED_USER_PASSWORD_HASH,
 } as const;

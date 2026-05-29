@@ -9,26 +9,26 @@
  *   { messages: [<full message wire shape + channel_name>], channels: [<channel wire shape>],
  *     members: [<member wire shape>] }
  *
- * Auth: dual-read via authorizeControlRead (machine_token OR dev_control_token).
- *   - machine mode: also enforces org/workroom access via requireMachineAccessToWorkroom.
- *   - dev mode: authorizeControlRead already enforced the GET allowlist + workroom scope.
+ * Auth (Slice 7 B2-a): userOrMachine via resolveActor — accepts user_sess_ OR machine_token.
+ *   - user actor: workroom membership enforced inside resolveActor.
+ *   - machine actor: machine.orgId must match workroom.orgId (enforced inside resolveActor).
+ *   - Any failure (no token, bad token, non-member, cross-org) → uniform 401 (anti-enumeration).
  *
  * NO SCHEMA CHANGE: all filters are ILIKE / WHERE on existing tables (no migration).
  *
  * KNOWN SIMPLIFICATIONS (S5 protocol limits — disclosed, not silent):
  *   - scope=CHANNEL behaves identically to ALL server-side: the protocol passes no channel
  *     id, so the server cannot restrict to a single channel. Returned as-is.
- *   - scope=MY_MESSAGES for dev_ctl_ tokens behaves as ALL: a dev token has no operator
- *     subject (no sender identity), so "my messages" cannot be resolved → falls back to ALL.
- *     For machine tokens, MY_MESSAGES filters senderId = machine.id.
+ *   - scope=MY_MESSAGES filters senderId = viewerId (machine.id for machine actors,
+ *     user.id for user actors). User-authored top-level messages don't exist in this
+ *     slice → user-actor MY_MESSAGES typically returns empty (correct semantic).
  *   - time buckets are last-N-days approximations: TODAY=last 24h, THIS_WEEK=last 7d,
  *     THIS_MONTH=last 30d, ANY_TIME=no filter.
  */
 
 import { FastifyInstance } from 'fastify';
 import { db } from '@/storage/db';
-import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
-import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
+import { resolveActor, viewerIdFromActor } from '@/auth/userOrMachine/resolveActor';
 import { visibleChannels } from '@/control/channels/channelVisibility';
 
 const MESSAGE_LIMIT = 50;
@@ -41,9 +41,10 @@ const statusRank = (s: string): number => STATUS_RANK[s] ?? 99;
 
 /**
  * Resolve sender display names in a batch (no N+1).
- * Mirrors messageRoutes.resolveSenderDisplayNames (intentional small duplication — house
- * convention: search builds its own enriched message shape; the canonical resolver is not
- * exported). For `agent` senderKind, looks up ControlAgent by id OR machineId (daemon sends).
+ * Mirrors the canonical resolver in messageFormatting.ts (now exported, reused by messageRoutes
+ * and agentApiRoutes). searchRoutes keeps its own copy because its formatMessage variant takes an
+ * extra channel_name argument for the enriched search-result shape; consolidate if the shapes
+ * converge. For `agent` senderKind, looks up ControlAgent by id OR machineId (daemon sends).
  */
 async function resolveSenderDisplayNames(
   senders: Array<{ senderId: string; senderKind: string }>,
@@ -89,6 +90,7 @@ function formatMessage(
     senderId: string;
     content: string;
     mentions: string[];
+    attachmentIds: string[];
     embeddedCardType: string | null;
     embeddedCardId: string | null;
     threadReplyCount: number;
@@ -107,6 +109,7 @@ function formatMessage(
     sender_display_name: senderNames.get(msg.senderId) ?? null,
     content: msg.content,
     mentions: msg.mentions,
+    attachment_ids: msg.attachmentIds,
     embedded_card_type: msg.embeddedCardType,
     embedded_card_id: msg.embeddedCardId,
     thread_reply_count: msg.threadReplyCount,
@@ -143,17 +146,15 @@ export async function searchRoutes(app: FastifyInstance) {
    * Empty/blank q → { messages: [], channels: [], members: [] } (no DB work).
    */
   app.get('/api/v1/workrooms/:wid/search', async (request, reply) => {
-    const auth = await authorizeControlRead(request);
-    if (!auth.ok) {
-      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
-    }
-
     const { wid } = request.params as { wid: string };
 
-    // machine mode: enforce org/workroom access. dev mode: already workroom-scoped by auth.
-    if (auth.mode === 'machine') {
-      const access = await requireMachineAccessToWorkroom(auth.machine, wid);
-      if (!access.ok) return reply.code(access.status).send({ error: access.error });
+    // Slice 7 B2-a: userOrMachine. Workroom scope (user membership / machine org)
+    // is enforced inside resolveActor when workroomId is passed. Uniform 401 on
+    // any failure → uniform 401 (anti-enumeration: user vs machine vs
+    // membership-miss vs cross-org all look identical to the caller).
+    const actor = await resolveActor(request, { workroomId: wid });
+    if (!actor) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
     }
 
     const query = request.query as { q?: string; scope?: string; time?: string };
@@ -169,7 +170,9 @@ export async function searchRoutes(app: FastifyInstance) {
 
     // Channels visible to the caller — used to (a) restrict message hits and (b) build the
     // channel result list. Both must respect visibility (no leaking private channels).
-    const visible = await visibleChannels(auth, wid);
+    // Viewer id: user.id for user actors, machine.id for machine actors.
+    const viewerId = viewerIdFromActor(actor);
+    const visible = await visibleChannels({ viewerId, viewerKind: actor.kind }, wid);
     const visibleIds = visible.map((c) => c.id);
     const visibleNameById = new Map(visible.map((c) => [c.id, c.name] as const));
 
@@ -177,10 +180,13 @@ export async function searchRoutes(app: FastifyInstance) {
     // content ILIKE %q%, top-level only (parentMessageId IS NULL), within visible channels,
     // optional time filter, optional MY_MESSAGES sender filter (machine only). Limit 50.
     //
-    // MY_MESSAGES: only machine tokens have a sender identity (machine.id). dev tokens have
-    // no subject → treat MY_MESSAGES as ALL (disclosed).
+    // MY_MESSAGES: filters by the caller's subject. For machines this is machine.id
+    // (matches the existing "my agent sent it" semantic). For users we use user.id —
+    // top-level user-authored messages are not yet a thing in Slock (humans don't
+    // post directly in this slice), so this filter will typically return empty for
+    // user actors, which is the right "nothing of mine matches" behaviour.
     const senderFilter =
-      scope === 'MY_MESSAGES' && auth.mode === 'machine' ? { senderId: auth.machine.id } : {};
+      scope === 'MY_MESSAGES' ? { senderId: viewerId } : {};
 
     let messages: ReturnType<typeof formatMessage>[] = [];
     if (visibleIds.length > 0) {
@@ -202,6 +208,7 @@ export async function searchRoutes(app: FastifyInstance) {
           senderId: true,
           content: true,
           mentions: true,
+          attachmentIds: true,
           embeddedCardType: true,
           embeddedCardId: true,
           threadReplyCount: true,

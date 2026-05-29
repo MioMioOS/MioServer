@@ -28,12 +28,12 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
-import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
+import { resolveActor } from '@/auth/userOrMachine/resolveActor';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { SUMMARY_TERMINAL_STATUSES } from '@/control/actionStatusSets';
 import { serverToSlockStatus } from './slockTaskStatus';
+import { claimControlTaskCas } from './claimControlTaskCas';
 
-const CLAIMABLE_STATUSES = ['todo', 'in_progress', 'waiting_approval', 'in_review'];
 const NON_CLAIMABLE_STATUSES = ['done', 'canceled'];
 
 /**
@@ -92,9 +92,9 @@ async function computeTaskAttention(workroomId: string, taskIds: string[]): Prom
  * can't be resolved → client hides the subtitle (never falls back to the raw UUID). Prefers
  * displayName, then name; never returns the id.
  */
-async function resolveOwnerDisplayNames(ownerIds: Array<string | null>): Promise<Map<string, string>> {
+async function resolveAgentDisplayNames(agentIds: Array<string | null>): Promise<Map<string, string>> {
   const result = new Map<string, string>();
-  const ids = [...new Set(ownerIds.filter((x): x is string => !!x))];
+  const ids = [...new Set(agentIds.filter((x): x is string => !!x))];
   if (ids.length === 0) return result;
   const agents = await db.controlAgent.findMany({
     where: { id: { in: ids } },
@@ -163,19 +163,11 @@ export async function taskRoutes(app: FastifyInstance) {
    * List tasks. Filter by status and/or owner_instance_id.
    */
   app.get('/api/v1/workrooms/:workroomId/tasks', async (request, reply) => {
-    // Dual-auth: machine_token (full) OR dev_control_token (read-only, allowlist + workroom-scope).
-    const auth = await authorizeControlRead(request);
-    if (!auth.ok) {
-      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
-    }
-
     const { workroomId } = request.params as { workroomId: string };
-
-    // machine mode: enforce org/workroom access. dev mode: path workroomId already
-    // matched against token.workroomId in authorizeControlRead.
-    if (auth.mode === 'machine') {
-      const access = await requireMachineAccessToWorkroom(auth.machine, workroomId);
-      if (!access.ok) return reply.code(access.status).send({ error: access.error });
+    // Slice 7: dual-actor read — user_sess_ (member of workroom) OR machine_token (scope-checked).
+    const actor = await resolveActor(request, { workroomId });
+    if (!actor) {
+      return reply.code(401).send({ error: { code: 'INVALID_SESSION', message: 'Invalid or missing credentials' } });
     }
 
     const query = request.query as { status?: string; owner_instance_id?: string };
@@ -193,12 +185,16 @@ export async function taskRoutes(app: FastifyInstance) {
     // #186: per-task action-driven attention signal (one batched query, no N+1).
     const attention = await computeTaskAttention(workroomId, tasks.map((t) => t.id));
     // #188①: resolve owner_instance_id → readable agent name (one batched query, no N+1).
-    const ownerNames = await resolveOwnerDisplayNames(tasks.map((t) => t.ownerInstanceId));
+    const agentNames = await resolveAgentDisplayNames([
+      ...tasks.map((t) => t.ownerInstanceId),
+      ...tasks.map((t) => t.creatorInstanceId),
+    ]);
 
     return {
       tasks: tasks.map((t) => {
         const a = attention.get(t.id);
-        const ownerDisplayName = t.ownerInstanceId ? (ownerNames.get(t.ownerInstanceId) ?? null) : null;
+        const ownerDisplayName = t.ownerInstanceId ? (agentNames.get(t.ownerInstanceId) ?? null) : null;
+        const creatorDisplayName = t.creatorInstanceId ? (agentNames.get(t.creatorInstanceId) ?? null) : null;
         return {
           // ── S3 Slock wire shape (workroom-aggregate = iOS tasks(channelId:nil)) ──
           // Added ADDITIVELY. `status` is LEFT as the server vocab below (the pre-S3
@@ -210,10 +206,8 @@ export async function taskRoutes(app: FastifyInstance) {
           slock_status: serverToSlockStatus(t.status),
           assignee_id: t.ownerInstanceId,
           assignee_display_name: ownerDisplayName,
-          // S3: ControlTask has no creator column. We do not have a stored creator identity, so
-          // creator_id is null rather than a fabricated/derived value. (Adding a real creator
-          // column is a follow-up if the iOS Tasks UI needs to attribute task authorship.)
-          creator_id: null,
+          creator_id: t.creatorInstanceId,
+          creator_display_name: creatorDisplayName,
           thread_id: t.threadId,
 
           // ── Pre-S3 attention-first Home contract (unchanged; #186 / #188①) ──
@@ -224,6 +218,7 @@ export async function taskRoutes(app: FastifyInstance) {
           owner_role: t.ownerRole,
           // #188①: human-readable owner for the task-row subtitle; null → client hides it (no raw UUID).
           owner_display_name: ownerDisplayName,
+          creator_instance_id: t.creatorInstanceId,
           created_at: t.createdAt.toISOString(),
           updated_at: t.updatedAt.toISOString(),
           // #186 attention-first signal (action-driven). Empty/0 when the task has no actions.
@@ -256,6 +251,7 @@ export async function taskRoutes(app: FastifyInstance) {
 
     const access = await requireMachineAccessToWorkroom(machine, task.workroomId, { orgId: task.workroom.orgId });
     if (!access.ok) return reply.code(access.status).send({ error: access.error });
+    const agentNames = await resolveAgentDisplayNames([task.ownerInstanceId, task.creatorInstanceId]);
 
     return {
       task_id: task.id,
@@ -264,6 +260,9 @@ export async function taskRoutes(app: FastifyInstance) {
       description: task.description,
       status: task.status,
       owner_instance_id: task.ownerInstanceId,
+      owner_display_name: task.ownerInstanceId ? (agentNames.get(task.ownerInstanceId) ?? null) : null,
+      creator_instance_id: task.creatorInstanceId,
+      creator_display_name: task.creatorInstanceId ? (agentNames.get(task.creatorInstanceId) ?? null) : null,
       owner_role: task.ownerRole,
       goal_id: task.goalId,
       source_message_id: task.sourceMessageId,
@@ -368,52 +367,42 @@ export async function taskRoutes(app: FastifyInstance) {
     const access = await requireMachineAccessToWorkroom(machine, taskForAuth.workroomId, { orgId: taskForAuth.workroom.orgId });
     if (!access.ok) return reply.code(access.status).send({ error: access.error });
 
-    // *** CAS CLAIM — single atomic DB statement ***
-    // WHERE owner_instance_id IS NULL ensures only one winner.
-    // WHERE status NOT IN ('done','canceled') prevents stale claims.
-    const result = await db.controlTask.updateMany({
-      where: {
-        id: taskId,
-        ownerInstanceId: null,                // CAS: must be unclaimed
-        status: { notIn: NON_CLAIMABLE_STATUSES }, // must be claimable
-      },
-      data: {
-        ownerInstanceId: agent_instance_id,
-        status: 'in_progress',
-      },
-    });
+    // *** CAS CLAIM — delegated to shared primitive ***
+    // claimControlTaskCas performs the atomic updateMany WHERE owner_instance_id IS NULL.
+    // It carries back the freshly-read task on every non-not_found outcome, so we map
+    // to the existing HTTP codes WITHOUT a second findUnique (contract unchanged).
+    const casResult = await claimControlTaskCas(taskId, agent_instance_id);
 
-    if (result.count === 0) {
-      // Either already claimed, task doesn't exist, or task is done/canceled.
-      // Differentiate for caller.
-      const task = await db.controlTask.findUnique({ where: { id: taskId } });
-      if (!task) {
+    if (!casResult.ok) {
+      if (casResult.reason === 'not_found') {
         return reply.code(404).send({ error: { code: 'TASK_NOT_FOUND', message: 'Task not found' } });
       }
-      if (NON_CLAIMABLE_STATUSES.includes(task.status)) {
+      if (casResult.reason === 'terminal') {
+        // Current status comes from the result's carried task (no extra read).
         return reply.code(409).send({
           error: {
             code: 'TASK_TERMINAL',
-            message: `Task is ${task.status} and cannot be claimed`,
+            message: `Task is ${casResult.task.status} and cannot be claimed`,
           },
         });
       }
-      // Already has an owner
+      // owned_by_other — current owner comes from the carried task (no extra read).
       return reply.code(409).send({
         error: {
           code: 'TASK_ALREADY_CLAIMED',
           message: 'Task is already claimed by another agent',
-          current_owner_instance_id: task.ownerInstanceId,
+          current_owner_instance_id: casResult.task.ownerInstanceId,
         },
       });
     }
 
-    const task = await db.controlTask.findUnique({ where: { id: taskId } });
+    // ok success: fresh claim → status is the 'in_progress' CONSTANT (no read needed);
+    // alreadyOwn → use the carried task's status. Either way, no second findUnique.
     return {
       task_id: taskId,
       claimed: true,
       owner_instance_id: agent_instance_id,
-      status: task?.status ?? 'in_progress',
+      status: casResult.alreadyOwn ? casResult.task.status : 'in_progress',
       claimed_at: new Date().toISOString(),
     };
   });

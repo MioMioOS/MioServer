@@ -1,47 +1,46 @@
 /**
- * S4 DM — read path. GET /api/v1/workrooms/:wid/dms.
+ * Unit test for GET /api/v1/workrooms/:wid/dms — mocked Prisma + mocked auth helpers.
+ * Complements the REAL-DB channelRoutes.dms.integration.spec.ts.
  *
- * Contract:
- *   { dms: [{ id, peer_member_id, unread_count, last_activity_at }] }
- *
- *   - dm channel = ControlChannel where workroomId=:wid AND type='dm'
- *   - peer_member_id = first ControlChannelMember.memberId NOT equal to the caller
- *                      (null if none/unknown)
- *   - unread_count = 0 (no read-cursor system yet — honest 0)
- *   - last_activity_at = channel.lastActivityAt (ISO8601 or null)
- *
- * Scope:
- *   machine mode → only dm channels where the machine (machine.id) is a member.
- *   dev mode     → ALL dm channels in the workroom (dev token has no member identity;
- *                  it is a read/debug token, already workroom-scoped by authorizeControlRead).
+ * Slice 7 B2-c auth: user_sess_ (workroom member) OR machine_token. Both paths must
+ * filter DMs by the caller's viewerId (no more anonymous-token "show everything").
  *
  * FAST MODE — only meaningful tests:
  *   - returns dm-type channels only (not standard/main)
  *   - maps peer_member_id to the OTHER member (machine mode)
- *   - dev_ctl_ scope: returns all dm channels (no member filtering)
+ *   - peer_member_id null when caller is the only member
  *   - empty when no dm channels
  *   - auth failure short-circuits before any DB read
+ *   - user mode filters by user.id (not machine.id)
  */
 
 import fastify from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { channelRoutes } from '@/control/channels/channelRoutes';
 import { db } from '@/storage/db';
-import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
+import { resolveUserSession } from '@/auth/userSession/resolveUserSession';
+import { verifyMachineToken } from '@/machines/machineRoutes';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
+import { USER_SESSION_TOKEN_PREFIX } from '@/auth/userSession/tokenMint';
 
 const DM1 = 'aaaaaaaa-1111-1111-1111-111111111111';
-const DM2 = 'bbbbbbbb-2222-2222-2222-222222222222';
+const USER_TOKEN = `${USER_SESSION_TOKEN_PREFIX}fake-user`;
+const MACHINE_TOKEN = 'machine_fake';
 
 vi.mock('@/storage/db', () => ({
   db: {
     controlWorkroom: { findUnique: vi.fn() },
     controlChannel: { findMany: vi.fn() },
+    userWorkroomMembership: { findUnique: vi.fn() },
   },
 }));
 
-vi.mock('@/control/devTokens/devTokenAuth', () => ({
-  authorizeControlRead: vi.fn(),
+vi.mock('@/auth/userSession/resolveUserSession', () => ({
+  resolveUserSession: vi.fn(),
+}));
+
+vi.mock('@/machines/machineRoutes', () => ({
+  verifyMachineToken: vi.fn(),
 }));
 
 vi.mock('@/control/auth/machineAccess', () => ({
@@ -54,23 +53,29 @@ async function buildApp() {
   return app;
 }
 
-const mockedAuth = vi.mocked(authorizeControlRead);
+const mockedResolveUserSession = vi.mocked(resolveUserSession);
+const mockedVerifyMachine = vi.mocked(verifyMachineToken);
 const mockedAccess = vi.mocked(requireMachineAccessToWorkroom);
 const mockedDb = db as unknown as {
   controlWorkroom: { findUnique: ReturnType<typeof vi.fn> };
   controlChannel: { findMany: ReturnType<typeof vi.fn> };
+  userWorkroomMembership: { findUnique: ReturnType<typeof vi.fn> };
 };
+
+function machineHeader(): Record<string, string> {
+  return { authorization: `Bearer ${MACHINE_TOKEN}` };
+}
+function userHeader(): Record<string, string> {
+  return { authorization: `Bearer ${USER_TOKEN}` };
+}
 
 describe('GET /api/v1/workrooms/:wid/dms', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockedAuth.mockResolvedValue({
-      ok: true,
-      mode: 'machine',
-      machine: { id: 'machine-1', orgId: 'org-1' } as never,
-    });
+    // Default: machine path.
+    mockedVerifyMachine.mockResolvedValue({ id: 'machine-1', orgId: 'org-1' } as never);
     mockedAccess.mockResolvedValue({ ok: true, workroomOrgId: 'org-1' });
-    mockedDb.controlWorkroom.findUnique.mockResolvedValue({ id: 'workroom-1', archivedAt: null });
+    mockedResolveUserSession.mockResolvedValue(null); // disable user path by default
     mockedDb.controlChannel.findMany.mockResolvedValue([]);
   });
 
@@ -85,7 +90,11 @@ describe('GET /api/v1/workrooms/:wid/dms', () => {
     ]);
 
     const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/dms' });
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/workrooms/workroom-1/dms',
+      headers: machineHeader(),
+    });
 
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
@@ -98,13 +107,22 @@ describe('GET /api/v1/workrooms/:wid/dms', () => {
     });
   });
 
-  it('queries only type=dm channels for the workroom', async () => {
+  it('queries only type=dm channels for the workroom, scoped to the caller (machine)', async () => {
     const app = await buildApp();
-    await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/dms' });
+    await app.inject({
+      method: 'GET',
+      url: '/api/v1/workrooms/workroom-1/dms',
+      headers: machineHeader(),
+    });
 
     expect(mockedDb.controlChannel.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({ workroomId: 'workroom-1', type: 'dm', archivedAt: null }),
+        where: expect.objectContaining({
+          workroomId: 'workroom-1',
+          type: 'dm',
+          archivedAt: null,
+          members: { some: { memberId: 'machine-1' } },
+        }),
       }),
     );
   });
@@ -115,54 +133,63 @@ describe('GET /api/v1/workrooms/:wid/dms', () => {
     ]);
 
     const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/dms' });
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/workrooms/workroom-1/dms',
+      headers: machineHeader(),
+    });
 
     const body = JSON.parse(res.body);
     expect(body.dms[0].peer_member_id).toBeNull();
     expect(body.dms[0].last_activity_at).toBeNull();
   });
 
-  it('dev_ctl_ mode returns all dm channels with peer = first member (no member identity)', async () => {
-    mockedAuth.mockResolvedValue({
-      ok: true,
-      mode: 'dev',
-      devToken: { id: 'dev-1', orgId: 'org-1', workroomId: 'workroom-1', scope: 'read_only' },
-    });
-    mockedDb.controlChannel.findMany.mockResolvedValue([
-      { id: DM1, type: 'dm', lastActivityAt: null, members: [{ memberId: 'agent-a' }, { memberId: 'agent-b' }] },
-      { id: DM2, type: 'dm', lastActivityAt: null, members: [{ memberId: 'agent-c' }] },
-    ]);
+  it('user mode filters by user.id (not machine.id)', async () => {
+    mockedResolveUserSession.mockResolvedValue({ id: 'sess-1', userId: 'user-1' } as never);
+    mockedDb.controlWorkroom.findUnique.mockResolvedValue({ id: 'workroom-1', archivedAt: null });
+    mockedDb.userWorkroomMembership.findUnique.mockResolvedValue({ role: 'owner' } as never);
 
     const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/dms' });
+    await app.inject({
+      method: 'GET',
+      url: '/api/v1/workrooms/workroom-1/dms',
+      headers: userHeader(),
+    });
 
-    expect(res.statusCode).toBe(200);
-    // dev mode does not invoke the machine access guard.
-    expect(mockedAccess).not.toHaveBeenCalled();
-    const body = JSON.parse(res.body);
-    expect(body.dms).toHaveLength(2);
-    // dev token id is not a member → peer is the first member.
-    expect(body.dms[0].peer_member_id).toBe('agent-a');
-    expect(body.dms[1].peer_member_id).toBe('agent-c');
+    expect(mockedDb.controlChannel.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          members: { some: { memberId: 'user-1' } },
+        }),
+      }),
+    );
   });
 
   it('returns an empty list when there are no dm channels', async () => {
     mockedDb.controlChannel.findMany.mockResolvedValue([]);
 
     const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/dms' });
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/workrooms/workroom-1/dms',
+      headers: machineHeader(),
+    });
 
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ dms: [] });
   });
 
-  it('denies before reading data when auth fails', async () => {
-    mockedAuth.mockResolvedValue({ ok: false, status: 403, code: 'FORBIDDEN', message: 'Forbidden' });
+  it('denies before reading data when machine token is invalid', async () => {
+    mockedVerifyMachine.mockResolvedValue(null);
 
     const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/dms' });
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/workrooms/workroom-1/dms',
+      headers: machineHeader(),
+    });
 
-    expect(res.statusCode).toBe(403);
+    expect(res.statusCode).toBe(401);
     expect(mockedDb.controlChannel.findMany).not.toHaveBeenCalled();
   });
 });

@@ -1,84 +1,124 @@
 /**
- * Channel API — control plane (S1 Chunk 2)
+ * Channel API — control plane.
  *
  * Endpoints:
- *   GET /api/v1/workrooms/:wid/channels
- *     Returns the real ControlChannel list for a workroom, replacing the synthetic
- *     'main' placeholder in workroomRoutes.ts.
+ *   GET    /api/v1/workrooms/:wid/channels
+ *   GET    /api/v1/workrooms/:wid/dms
+ *   POST   /api/v1/workrooms/:wid/dms
+ *   POST   /api/v1/workrooms/:wid/channels
+ *   POST   /api/v1/workrooms/:wid/channels/:cid/members
+ *   DELETE /api/v1/workrooms/:wid/channels/:cid/members/:memberId
+ *   POST   /api/v1/workrooms/:wid/channels/:cid/stop-agents
  *
- * Contract (§4.1 spec):
- *   { workroom_id, channels: [{ id, name, type, visibility, last_activity_at,
- *                                unread_count, attention_count, member_count }] }
+ * Auth (Slice 7 B2-c — user_sess_/machine unification):
+ *   Reads (GET):  userOrMachine — user_sess_ (workroom MEMBER) OR machine_token.
+ *     Inline resolution preserves the route-specific status-code matrix
+ *     (no-bearer → 401, invalid session → 401, user non-member → 403,
+ *     machine cross-org → 403, workroom missing → 404). Mirrors memberRoutes.
+ *   Writes:       authorizeChannelWrite — user_sess_ (workroom OWNER) OR machine_token.
+ *     Non-owner user → 403; missing/invalid → 401. Mirrors authorizeTaskWrite (B2-b).
  *
- * Visibility: public channels are visible to all; private/dm only to members.
- * unread_count: always 0 in S1 (real read-cursor arrives in S5).
- * attention_count: needs_human actions + pending approvals, scoped to workroom
- *   (per-channel is fine since only main exists in S1; channel-level scoping is wired
- *    correctly here so S6 multi-channel work needs only a WHERE clause change).
- * member_count: count of ControlChannelMember rows for the channel.
+ * Visibility (GET /channels): public channels visible to all members; private/dm only to
+ * those with an explicit ControlChannelMember row. visibleChannels is called with the
+ * `{ viewerId }` overload — viewerId = user.id for user actors, machine.id for machine actors
+ * (additive overload added in B2-a; legacy ControlReadAuth overload remains until messageRoutes
+ * is also converted in B2-d).
  *
- * Auth: dual-read via authorizeControlRead (machine_token OR dev_control_token).
- *       machine mode: also enforces org/workroom access via requireMachineAccessToWorkroom.
- *       dev mode: authorizeControlRead already enforced allowlist + workroom scope.
+ * DMs scoping (GET /dms): user actors see dm channels they're an explicit member of (by user.id);
+ * machine actors see dm channels they're a member of (by machine.id). The previous "dev mode = all"
+ * branch is gone — there are no anonymous read tokens any more.
+ *
+ * Spec: docs/superpowers/specs/2026-05-26-slock-clone-slice7-user-auth-unification-design.md §6.2
  */
 
 import { FastifyInstance, FastifyRequest } from 'fastify';
-import { randomUUID } from 'crypto';
-import { Prisma } from '@prisma/client';
 import { db } from '@/storage/db';
-import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
+import { resolveActor } from '@/auth/userOrMachine/resolveActor';
+import { resolveUserSession } from '@/auth/userSession/resolveUserSession';
+import { USER_SESSION_TOKEN_PREFIX } from '@/auth/userSession/tokenMint';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { visibleChannels } from '@/control/channels/channelVisibility';
-import { authorizeOperatorWrite } from '@/control/operatorSessions/operatorSessionAuth';
 import { verifyMachineToken } from '@/machines/machineRoutes';
-import { publishControlEvent } from '@/control/events/publishControlEvent';
-import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
+import {
+  createChannelCore,
+  addMemberCore,
+  broadcastChannelEvents,
+  writeChannelEventAndBroadcast,
+  lookupMemberKind,
+} from '@/control/channels/channelCore';
 
 /**
- * Resolved actor for a channel WRITE: who is doing the write, and the workroom
- * confirmed in-scope. dev_ctl_ is hard-rejected (403) by callers before this runs.
+ * Resolved actor for a channel WRITE: who is doing the write (the opaque id used as
+ * createdBy / member id / etc.). Kept as `{ ok: true; actorId }` to stay binary-compatible
+ * with existing callers (preparedActionOperatorRoutes + this file's 5 write handlers).
  */
-type WriteActor =
+export type WriteActor =
   | { ok: true; actorId: string }
   | { ok: false; status: number; body: { error: { code: string; message: string } } };
 
 /**
- * Authorize a channel WRITE request: op_sess_(command) OR machine_token. dev_ctl_ → 403.
+ * Authorize a channel WRITE request (Slice 7 B2-c):
+ *   1. user_sess_  → must be a workroom OWNER (per §6.2). Non-owner → 403; non-member → 403.
+ *   2. machine_token → must have org access to the workroom.
+ *   3. anything else / missing bearer → 401.
  *
- * Mirrors messageRoutes.ts ordering:
- *   1. dev_ctl_ prefix → hard 403 (defense-in-depth; op-auth also rejects it).
- *   2. op_sess_ with the required command + workroom scope → actorId = operatorSubjectId.
- *   3. op_sess_ valid-but-wrong-scope (403) → hard reject (do NOT fall through to machine).
- *   4. machine_token + requireMachineAccessToWorkroom → actorId = machine.id.
- *   5. neither → 401.
+ * `command` is preserved for API compatibility and future per-command auditing but is not
+ * gated against an allowlist (granular per-command grants died with Slice 7 — mirrors
+ * authorizeTaskWrite / authorizeAgentWrite in B2-b).
  */
-async function authorizeChannelWrite(
+export async function authorizeChannelWrite(
   request: FastifyRequest,
   command: 'create_channel' | 'manage_members' | 'stop_agents',
   workroomId: string,
 ): Promise<WriteActor> {
+  void command; // reserved for future audit; user/machine path does not gate by command
+
   const authHeader = request.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return {
+      ok: false,
+      status: 401,
+      body: { error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } },
+    };
+  }
+  const token = authHeader.slice(7);
 
-  // 1. dev_ctl_ → hard 403.
-  const rawToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
-  if (rawToken.startsWith('dev_ctl_')) {
-    return { ok: false, status: 403, body: { error: { code: 'FORBIDDEN', message: 'Forbidden' } } };
+  // ── Path 1: user_sess_ ──
+  if (token.startsWith(USER_SESSION_TOKEN_PREFIX)) {
+    const session = await resolveUserSession(authHeader);
+    if (!session) {
+      return {
+        ok: false,
+        status: 401,
+        body: { error: { code: 'INVALID_SESSION', message: 'Invalid or expired session' } },
+      };
+    }
+    const actor = await resolveActor(request, { workroomId });
+    if (!actor || actor.kind !== 'user') {
+      return {
+        ok: false,
+        status: 403,
+        body: { error: { code: 'FORBIDDEN', message: 'Forbidden' } },
+      };
+    }
+    if (actor.workroomRole !== 'owner') {
+      return {
+        ok: false,
+        status: 403,
+        body: { error: { code: 'FORBIDDEN', message: 'Forbidden' } },
+      };
+    }
+    return { ok: true, actorId: actor.userId };
   }
 
-  // 2/3. op_sess_ path.
-  const opAuth = await authorizeOperatorWrite(request, { command, workroomId });
-  if (opAuth.ok) {
-    return { ok: true, actorId: opAuth.session.operatorSubjectId };
-  }
-  // valid op_sess_ token, wrong command/workroom → hard 403 (do not fall through).
-  if (opAuth.status === 403) {
-    return { ok: false, status: 403, body: { error: { code: opAuth.code, message: opAuth.message } } };
-  }
-
-  // 4. machine_token path.
+  // ── Path 2: machine_token ──
   const machine = await verifyMachineToken(authHeader);
   if (!machine) {
-    return { ok: false, status: 401, body: { error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } } };
+    return {
+      ok: false,
+      status: 401,
+      body: { error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } },
+    };
   }
   const access = await requireMachineAccessToWorkroom(machine, workroomId);
   if (!access.ok) {
@@ -87,32 +127,74 @@ async function authorizeChannelWrite(
   return { ok: true, actorId: machine.id };
 }
 
-/** member_count for a single channel (used to mirror the GET-channels item shape). */
-async function channelMemberCount(channelId: string): Promise<number> {
-  return db.controlChannelMember.count({ where: { channelId } });
-}
+// ── Read-auth resolver (user_sess_ member OR machine_token) ──────────────────────
+//
+// Inline path that preserves the route-specific status-code matrix (401/403/404),
+// mirroring memberRoutes / slockTaskRoutes (B2-a/b precedent). resolveActor exists
+// but uniformly collapses failures to null — using it would lose the existing
+// 401-vs-403-vs-404 disambiguation tested today.
 
-/**
- * Persist + broadcast a control-plane channel event (write-before-broadcast).
- * Step 1 (awaited): publishControlEvent writes the event row.
- * Step 2 (fire-and-forget): WS broadcast. Non-fatal; clients catch up via GET /events.
- */
-async function writeChannelEventAndBroadcast(
+type ChannelReadResult =
+  | { ok: true; viewerId: string; viewerKind: 'user' | 'machine' }
+  | { ok: false; status: number; error: { code: string; message: string } };
+
+async function resolveChannelReadActor(
+  req: FastifyRequest,
   workroomId: string,
-  topic: 'channel.created' | 'channel.member_added' | 'channel.member_removed' | 'agents.stop',
-  payload: Record<string, unknown>,
-): Promise<void> {
-  const event = await publishControlEvent({ workroomId, eventId: randomUUID(), topic, payload });
-  if (!event.idempotent) {
-    workroomBroadcaster.broadcast(workroomId, {
-      event_id: event.eventId,
-      workroom_id: event.workroomId,
-      seq: event.seq.toString(),
-      topic: event.topic,
-      payload: event.payloadJson as Record<string, unknown>,
-      created_at: event.createdAt.toISOString(),
-    });
+): Promise<ChannelReadResult> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return {
+      ok: false,
+      status: 401,
+      error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' },
+    };
   }
+  const token = authHeader.slice(7);
+
+  // ── Path 1: user_sess_ ──
+  if (token.startsWith(USER_SESSION_TOKEN_PREFIX)) {
+    const session = await resolveUserSession(authHeader);
+    if (!session) {
+      return {
+        ok: false,
+        status: 401,
+        error: { code: 'INVALID_SESSION', message: 'Invalid or expired session' },
+      };
+    }
+    // 404 if workroom missing (anti-enumeration, mirrors memberRoutes).
+    const wr = await db.controlWorkroom.findUnique({
+      where: { id: workroomId },
+      select: { id: true, archivedAt: true },
+    });
+    if (!wr) {
+      return {
+        ok: false,
+        status: 404,
+        error: { code: 'WORKROOM_NOT_FOUND', message: 'Workroom not found' },
+      };
+    }
+    const mem = await db.userWorkroomMembership.findUnique({
+      where: { userId_workroomId: { userId: session.userId, workroomId } },
+    });
+    if (!mem) {
+      return { ok: false, status: 403, error: { code: 'FORBIDDEN', message: 'Forbidden' } };
+    }
+    return { ok: true, viewerId: session.userId, viewerKind: 'user' };
+  }
+
+  // ── Path 2: machine_token ──
+  const machine = await verifyMachineToken(authHeader);
+  if (!machine) {
+    return {
+      ok: false,
+      status: 401,
+      error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' },
+    };
+  }
+  const access = await requireMachineAccessToWorkroom(machine, workroomId);
+  if (!access.ok) return { ok: false, status: access.status, error: access.error };
+  return { ok: true, viewerId: machine.id, viewerKind: 'machine' };
 }
 
 export async function channelRoutes(app: FastifyInstance) {
@@ -123,36 +205,30 @@ export async function channelRoutes(app: FastifyInstance) {
    * Per-channel derived fields: last_activity_at, unread_count (0), attention_count,
    * member_count.
    *
-   * #192 replacement: the synthetic 'main' channel handler is REMOVED from workroomRoutes.ts
-   * and this handler takes over.
+   * Auth: userOrMachine — user_sess_ workroom member OR machine_token org-scoped.
    */
   app.get('/api/v1/workrooms/:wid/channels', async (request, reply) => {
-    // Dual-auth: machine_token (full) OR dev_control_token (read-only, allowlist + workroom-scope).
-    const auth = await authorizeControlRead(request);
-    if (!auth.ok) {
-      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
-    }
-
     const { wid } = request.params as { wid: string };
 
-    // machine mode: enforce org/workroom access.
-    // dev mode: path was already scoped by authorizeControlRead (workroom_id in token = :wid).
-    if (auth.mode === 'machine') {
-      const access = await requireMachineAccessToWorkroom(auth.machine, wid);
-      if (!access.ok) return reply.code(access.status).send({ error: access.error });
-    }
+    const guard = await resolveChannelReadActor(request, wid);
+    if (!guard.ok) return reply.code(guard.status).send({ error: guard.error });
 
-    // Verify the workroom exists and is not archived.
+    // Verify the workroom is not archived. (resolveChannelReadActor already returned 404
+    // for missing workroom on the user path; for machine path the workroom is the access
+    // check's source of truth and so cannot be missing here. But we still gate archived.)
     const workroom = await db.controlWorkroom.findUnique({
       where: { id: wid },
       select: { id: true, archivedAt: true },
     });
     if (!workroom || workroom.archivedAt !== null) {
-      return reply.code(404).send({ error: { code: 'WORKROOM_NOT_FOUND', message: 'Workroom not found' } });
+      return reply
+        .code(404)
+        .send({ error: { code: 'WORKROOM_NOT_FOUND', message: 'Workroom not found' } });
     }
 
-    // Fetch channels visible to this viewer.
-    const channels = await visibleChannels(auth, wid);
+    // Visible channels — Slice 7.5: machine viewers also see channels where their
+    // owned agents are members (daemon auths as machine but agents own membership).
+    const channels = await visibleChannels({ viewerId: guard.viewerId, viewerKind: guard.viewerKind }, wid);
 
     if (channels.length === 0) {
       return { workroom_id: wid, channels: [] };
@@ -160,11 +236,6 @@ export async function channelRoutes(app: FastifyInstance) {
 
     const channelIds = channels.map((c) => c.id);
 
-    // Compute attention_count and member_count for each channel in batch.
-    // attention_count = needs_human actions + pending approvals (per channel's workroom scope).
-    // In S1 only the main channel exists, so all workroom-level counts map to channel_id=main.
-    // For correctness we scope by workroomId (all channels in the workroom share the same
-    // workroom-level actions/approvals in S1); per-message/per-channel scoping is S3+.
     const [needsHumanActions, pendingApprovals, memberCounts] = await Promise.all([
       db.controlAction.count({ where: { workroomId: wid, status: 'needs_human' } }),
       db.controlApproval.count({ where: { workroomId: wid, status: 'pending' } }),
@@ -175,15 +246,9 @@ export async function channelRoutes(app: FastifyInstance) {
       }),
     ]);
 
-    // Build a lookup from channelId → member_count.
     const memberCountMap = new Map<string, number>(
       memberCounts.map((row) => [row.channelId, row._count.channelId]),
     );
-
-    // Build a lookup from channelId → attention_count.
-    // S1: all attention comes from workroom level; attribute it all to whichever channel
-    // the attention items logically belong to. Since only main exists in S1 this is fine.
-    // For multi-channel (S3+) this will be replaced with per-channel queries.
     const totalAttention = needsHumanActions + pendingApprovals;
 
     const responseChannels = channels.map((ch) => ({
@@ -204,55 +269,35 @@ export async function channelRoutes(app: FastifyInstance) {
   });
 
   /**
-   * GET /api/v1/workrooms/:wid/dms  (S4 — DM read path)
+   * GET /api/v1/workrooms/:wid/dms
    *
-   * Returns the direct-message channels for a workroom.
-   * Contract: { dms: [{ id, peer_member_id, unread_count, last_activity_at }] }
-   *
-   * A dm channel is a ControlChannel where workroomId=:wid AND type='dm'.
-   *
-   * Per dm:
+   * Returns the direct-message channels for a workroom. Per dm:
    *   peer_member_id = the first ControlChannelMember.memberId that is NOT the caller
-   *                    (null if none / unknown). For dev mode the caller has no member
-   *                    identity, so this resolves to the first member.
-   *   unread_count   = 0 — there is no read-cursor system yet, so this is an honest 0
-   *                    (NOT a stub: it reflects the real absence of per-caller read state).
+   *                    (null if none).
+   *   unread_count   = 0 (no read-cursor system yet — honest 0).
    *   last_activity_at = channel.lastActivityAt (ISO8601 or null).
    *
-   * Scope:
-   *   machine mode → only dm channels where machine.id is a ControlChannelMember.
-   *   dev mode     → ALL dm channels in the workroom. A dev_ctl_ token has no operator
-   *                  subject (it is a read/debug token), so there is no member identity to
-   *                  filter by; authorizeControlRead already scoped it to this workroom.
-   *
-   * Auth: authorizeControlRead (machine_token OR dev_control_token). machine mode also
-   *       enforces org/workroom access via requireMachineAccessToWorkroom.
+   * Scope (B2-c):
+   *   user actor    → dm channels where user.id is a ControlChannelMember.
+   *   machine actor → dm channels where machine.id is a ControlChannelMember.
+   * The previous "dev mode = ALL dm channels" branch is gone (no anonymous read tokens
+   * exist after Slice 7); leaving it would have been a privacy regression (would have
+   * exposed every dm in the workroom to any anonymous reader).
    */
   app.get('/api/v1/workrooms/:wid/dms', async (request, reply) => {
-    const auth = await authorizeControlRead(request);
-    if (!auth.ok) {
-      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
-    }
-
     const { wid } = request.params as { wid: string };
 
-    // machine mode: enforce org/workroom access. dev mode: already workroom-scoped by auth.
-    if (auth.mode === 'machine') {
-      const access = await requireMachineAccessToWorkroom(auth.machine, wid);
-      if (!access.ok) return reply.code(access.status).send({ error: access.error });
-    }
+    const guard = await resolveChannelReadActor(request, wid);
+    if (!guard.ok) return reply.code(guard.status).send({ error: guard.error });
 
-    // Caller identity: machine → machine.id (used to filter membership + resolve peer).
-    // dev → no member identity (null): return all dm channels, peer = first member.
-    const callerId: string | null = auth.mode === 'machine' ? auth.machine.id : null;
+    const callerId = guard.viewerId;
 
     const dmChannels = await db.controlChannel.findMany({
       where: {
         workroomId: wid,
         type: 'dm',
         archivedAt: null,
-        // machine mode restricts to dm channels the caller is a member of; dev mode = all.
-        ...(callerId ? { members: { some: { memberId: callerId } } } : {}),
+        members: { some: { memberId: callerId } },
       },
       include: {
         members: { select: { memberId: true } },
@@ -261,12 +306,11 @@ export async function channelRoutes(app: FastifyInstance) {
     });
 
     const dms = dmChannels.map((ch) => {
-      // peer = first member that is not the caller (dev mode: callerId null → first member).
       const peer = ch.members.find((m) => m.memberId !== callerId)?.memberId ?? null;
       return {
         id: ch.id,
         peer_member_id: peer,
-        unread_count: 0, // honest 0: no read-cursor system yet (not a stub).
+        unread_count: 0,
         last_activity_at: ch.lastActivityAt?.toISOString() ?? null,
       };
     });
@@ -278,43 +322,29 @@ export async function channelRoutes(app: FastifyInstance) {
    * POST /api/v1/workrooms/:wid/dms  (start a direct message)
    *
    * Find-or-create a dm channel between the caller and a target member.
-   * No schema change: a dm is a ControlChannel(type='dm') + two ControlChannelMember rows.
+   * Auth: user_sess_ (workroom OWNER) OR machine_token (via authorizeChannelWrite).
+   * Body: { member_id: string }.
    *
-   * Auth: op_sess_('create_channel') OR machine_token; dev_ctl_ → 403 (reuses the
-   *       'create_channel' command — starting a dm IS creating a channel).
-   *   Caller id = op subject id (op mode) or machine.id (machine mode).
-   *
-   * Body: { member_id: string } — the peer to start a dm with. Empty/missing → 400.
-   *
-   * Find-or-create: look for an existing dm channel in :wid whose member set is EXACTLY
-   *   {caller, member_id}. If found, return it (idempotent). Else create a new
-   *   ControlChannel(type='dm', visibility='private', name='dm', createdBy=caller,
-   *   lastActivityAt=now) + ControlChannelMember rows for caller + member_id, and publish
-   *   'channel.created' (type dm).
-   *
-   * Returns the dm wire shape (same as a GET /dms item):
-   *   { id, peer_member_id, unread_count: 0, last_activity_at }
-   *
-   * NOTE: this is a POST (state-changing); it is NOT in the dev_ctl_ GET allowlist.
+   * Find-or-create looks for an existing dm whose member set is EXACTLY {caller, member_id};
+   * if found, returns it (idempotent), else creates new dm + member rows + publishes
+   * channel.created.
    */
   app.post('/api/v1/workrooms/:wid/dms', async (request, reply) => {
     const { wid } = request.params as { wid: string };
 
-    // Reuse 'create_channel' — starting a dm is creating a channel.
     const actor = await authorizeChannelWrite(request, 'create_channel', wid);
     if (!actor.ok) return reply.code(actor.status).send(actor.body);
 
     const body = request.body as { member_id?: unknown } | null;
     const memberId = typeof body?.member_id === 'string' ? body.member_id.trim() : '';
     if (!memberId) {
-      return reply.code(400).send({ error: { code: 'INVALID_MEMBER_ID', message: 'member_id is required' } });
+      return reply
+        .code(400)
+        .send({ error: { code: 'INVALID_MEMBER_ID', message: 'member_id is required' } });
     }
 
     const callerId = actor.actorId;
 
-    // Find-or-create: an existing dm in :wid whose member set is EXACTLY {caller, peer}.
-    // Query dm channels in the workroom that contain the peer, then check the full set
-    // matches {caller, peer} (size 2). This guards against partial-overlap dm channels.
     const candidates = await db.controlChannel.findMany({
       where: {
         workroomId: wid,
@@ -338,7 +368,6 @@ export async function channelRoutes(app: FastifyInstance) {
       });
     }
 
-    // Create a new dm channel + both member rows.
     const now = new Date();
     const channel = await db.controlChannel.create({
       data: {
@@ -352,9 +381,11 @@ export async function channelRoutes(app: FastifyInstance) {
       },
     });
 
-    // skipDuplicates guards the @@unique([channelId, memberId]) when caller === peer (defensive).
     await db.controlChannelMember.createMany({
-      data: [...new Set([callerId, memberId])].map((m) => ({ channelId: channel.id, memberId: m })),
+      data: [...new Set([callerId, memberId])].map((m) => ({
+        channelId: channel.id,
+        memberId: m,
+      })),
       skipDuplicates: true,
     });
 
@@ -367,6 +398,16 @@ export async function channelRoutes(app: FastifyInstance) {
       peer_member_id: memberId,
     });
 
+    // roster.* mirrors (M1) — one per unique member of the new DM.
+    for (const mid of new Set([callerId, memberId])) {
+      const kind = await lookupMemberKind(mid);
+      await writeChannelEventAndBroadcast(wid, 'roster.member_added', {
+        channel_id: channel.id,
+        member_id: mid,
+        member_kind: kind,
+      });
+    }
+
     return reply.code(201).send({
       id: channel.id,
       peer_member_id: memberId,
@@ -376,21 +417,10 @@ export async function channelRoutes(app: FastifyInstance) {
   });
 
   /**
-   * POST /api/v1/workrooms/:wid/channels  (S6)
+   * POST /api/v1/workrooms/:wid/channels  (create a standard channel)
    *
-   * Create a 'standard' channel. Auth: op_sess_('create_channel') OR machine_token; dev_ctl_ → 403.
-   *
-   * Body: { name: string, description?: string, visibility: 'public'|'private', member_ids?: string[] }
-   *   name        — required, non-empty (trimmed). Empty → 400.
-   *   description — optional, default ''.
-   *   visibility  — 'public' | 'private' (anything else → 400).
-   *   member_ids  — optional extra members; the creator is ALWAYS added too.
-   *
-   * Members: createdBy (op subject or machine id) + each member_id, deduped. Dupes are
-   * skipped via the @@unique([channelId, memberId]) (createMany skipDuplicates).
-   *
-   * Publishes 'channel.created'. Returns the SAME wire shape as a GET /channels item
-   * (id, name, type, visibility, last_activity_at, unread_count, attention_count, member_count).
+   * Auth: user_sess_ (workroom OWNER) OR machine_token (via authorizeChannelWrite).
+   * Body: { name: string, description?: string, visibility: 'public'|'private', member_ids?: string[] }.
    */
   app.post('/api/v1/workrooms/:wid/channels', async (request, reply) => {
     const { wid } = request.params as { wid: string };
@@ -405,57 +435,41 @@ export async function channelRoutes(app: FastifyInstance) {
       member_ids?: unknown;
     } | null;
 
-    // Validate name (non-empty after trim).
     const name = typeof body?.name === 'string' ? body.name.trim() : '';
     if (!name) {
-      return reply.code(400).send({ error: { code: 'INVALID_NAME', message: 'name is required' } });
+      return reply
+        .code(400)
+        .send({ error: { code: 'INVALID_NAME', message: 'name is required' } });
     }
 
-    // Validate visibility.
     const visibility = body?.visibility;
     if (visibility !== 'public' && visibility !== 'private') {
-      return reply.code(400).send({ error: { code: 'INVALID_VISIBILITY', message: "visibility must be 'public' or 'private'" } });
+      return reply.code(400).send({
+        error: {
+          code: 'INVALID_VISIBILITY',
+          message: "visibility must be 'public' or 'private'",
+        },
+      });
     }
 
     const description = typeof body?.description === 'string' ? body.description : '';
 
-    // Build the deduped member set: creator + provided member_ids.
     const memberIds = Array.isArray(body?.member_ids)
-      ? (body!.member_ids as unknown[]).filter((m): m is string => typeof m === 'string' && m.length > 0)
+      ? (body!.member_ids as unknown[]).filter(
+          (m): m is string => typeof m === 'string' && m.length > 0,
+        )
       : [];
-    const memberSet = new Set<string>([actor.actorId, ...memberIds]);
 
-    const now = new Date();
-    const channel = await db.controlChannel.create({
-      data: {
-        workroomId: wid,
-        name,
-        type: 'standard',
-        visibility,
-        description,
-        createdBy: actor.actorId,
-        lastActivityAt: now,
-      },
+    const { channel, memberCount, events } = await createChannelCore({
+      workroomId: wid,
+      actorId: actor.actorId,
+      name,
+      visibility,
+      description,
+      memberIds,
     });
+    broadcastChannelEvents(events);
 
-    // Add member rows. skipDuplicates guards the @@unique (defensive; the Set already deduped).
-    await db.controlChannelMember.createMany({
-      data: [...memberSet].map((memberId) => ({ channelId: channel.id, memberId })),
-      skipDuplicates: true,
-    });
-
-    const memberCount = await channelMemberCount(channel.id);
-
-    await writeChannelEventAndBroadcast(wid, 'channel.created', {
-      channel_id: channel.id,
-      name: channel.name,
-      type: channel.type,
-      visibility: channel.visibility,
-      created_by: actor.actorId,
-      member_count: memberCount,
-    });
-
-    // Mirror the GET /channels item wire shape.
     return reply.code(201).send({
       id: channel.id,
       name: channel.name,
@@ -469,12 +483,9 @@ export async function channelRoutes(app: FastifyInstance) {
   });
 
   /**
-   * POST /api/v1/workrooms/:wid/channels/:cid/members  (S6)
-   *
-   * Add a member (idempotent). Auth: op_sess_('manage_members') OR machine; dev_ctl_ → 403.
-   * Validates the channel belongs to :wid (404 otherwise — covers cross-workroom + missing).
-   * If the member row already exists → 200 no-op (no duplicate event).
-   * Publishes 'channel.member_added' on a real insert. Returns { ok: true }.
+   * POST /api/v1/workrooms/:wid/channels/:cid/members
+   * Add a member (idempotent). Auth: user_sess_ owner OR machine.
+   * Channel must be in :wid (404 otherwise). Publishes channel.member_added on real insert.
    */
   app.post('/api/v1/workrooms/:wid/channels/:cid/members', async (request, reply) => {
     const { wid, cid } = request.params as { wid: string; cid: string };
@@ -485,64 +496,382 @@ export async function channelRoutes(app: FastifyInstance) {
     const body = request.body as { member_id?: unknown } | null;
     const memberId = typeof body?.member_id === 'string' ? body.member_id.trim() : '';
     if (!memberId) {
-      return reply.code(400).send({ error: { code: 'INVALID_MEMBER_ID', message: 'member_id is required' } });
+      return reply
+        .code(400)
+        .send({ error: { code: 'INVALID_MEMBER_ID', message: 'member_id is required' } });
     }
 
-    // Validate channel ∈ workroom (404 covers both missing channel and cross-workroom).
-    const channel = await db.controlChannel.findUnique({ where: { id: cid }, select: { workroomId: true } });
-    if (!channel || channel.workroomId !== wid) {
-      return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
-    }
-
-    // Idempotent insert: P2002 (unique) → already a member → no-op, no event.
-    try {
-      await db.controlChannelMember.create({ data: { channelId: cid, memberId } });
-    } catch (err) {
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-        return reply.send({ ok: true });
-      }
-      throw err;
-    }
-
-    await writeChannelEventAndBroadcast(wid, 'channel.member_added', {
-      channel_id: cid,
-      member_id: memberId,
-      added_by: actor.actorId,
+    const r = await addMemberCore({
+      workroomId: wid,
+      channelId: cid,
+      memberId,
+      actorId: actor.actorId,
     });
+    if (r.notFound) {
+      return reply
+        .code(404)
+        .send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+    }
 
+    broadcastChannelEvents(r.events);
     return reply.send({ ok: true });
   });
 
   /**
-   * DELETE /api/v1/workrooms/:wid/channels/:cid/members/:memberId  (S6)
-   *
-   * Remove a member (idempotent). Auth: op_sess_('manage_members') OR machine; dev_ctl_ → 403.
-   * Validates the channel belongs to :wid (404 otherwise).
-   * Missing member row → 200 no-op (no event). Publishes 'channel.member_removed' on a real delete.
-   * Returns { ok: true }.
+   * DELETE /api/v1/workrooms/:wid/channels/:cid/members/:memberId
+   * Remove a member (idempotent). Auth: user_sess_ owner OR machine.
+   * Channel must be in :wid (404 otherwise). Publishes channel.member_removed on real delete.
    */
-  app.delete('/api/v1/workrooms/:wid/channels/:cid/members/:memberId', async (request, reply) => {
-    const { wid, cid, memberId } = request.params as { wid: string; cid: string; memberId: string };
+  app.delete(
+    '/api/v1/workrooms/:wid/channels/:cid/members/:memberId',
+    async (request, reply) => {
+      const { wid, cid, memberId } = request.params as {
+        wid: string;
+        cid: string;
+        memberId: string;
+      };
+
+      const actor = await authorizeChannelWrite(request, 'manage_members', wid);
+      if (!actor.ok) return reply.code(actor.status).send(actor.body);
+
+      const channel = await db.controlChannel.findUnique({
+        where: { id: cid },
+        select: { workroomId: true },
+      });
+      if (!channel || channel.workroomId !== wid) {
+        return reply
+          .code(404)
+          .send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+      }
+
+      const result = await db.controlChannelMember.deleteMany({
+        where: { channelId: cid, memberId },
+      });
+      if (result.count === 0) {
+        return reply.send({ ok: true });
+      }
+
+      await writeChannelEventAndBroadcast(wid, 'channel.member_removed', {
+        channel_id: cid,
+        member_id: memberId,
+        removed_by: actor.actorId,
+      });
+      // roster.* mirror (M1)
+      await writeChannelEventAndBroadcast(wid, 'roster.member_removed', {
+        channel_id: cid,
+        member_id: memberId,
+      });
+
+      return reply.send({ ok: true });
+    },
+  );
+
+  /**
+   * GET /api/v1/workrooms/:wid/channels/:cid/members
+   *
+   * List member IDs of a channel. Returns `{ channel_id, members: [{ member_id }] }`.
+   * Auth: same read-auth as GET /channels (user_sess_ workroom member OR machine).
+   * Used by the iOS member sheet so it can show who is currently in the channel
+   * (the GET /channels list response does not include member IDs).
+   */
+  app.get('/api/v1/workrooms/:wid/channels/:cid/members', async (request, reply) => {
+    const { wid, cid } = request.params as { wid: string; cid: string };
+
+    const guard = await resolveChannelReadActor(request, wid);
+    if (!guard.ok) return reply.code(guard.status).send({ error: guard.error });
+
+    const channel = await db.controlChannel.findUnique({
+      where: { id: cid },
+      select: { workroomId: true, archivedAt: true },
+    });
+    if (!channel || channel.workroomId !== wid || channel.archivedAt !== null) {
+      return reply
+        .code(404)
+        .send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+    }
+
+    const rows = await db.controlChannelMember.findMany({
+      where: { channelId: cid },
+      select: { memberId: true },
+    });
+
+    return {
+      channel_id: cid,
+      members: rows.map((r) => ({ member_id: r.memberId })),
+    };
+  });
+
+  /**
+   * PATCH /api/v1/workrooms/:wid/channels/:cid
+   *
+   * Update mutable channel fields. Body may include `name?: string` and/or
+   * `visibility?: 'public'|'private'`. At least one must be present. Auth:
+   * user_sess_ workroom OWNER OR machine (mirrors POST /channels).
+   * Returns the updated channel in the same wire shape as the list item.
+   */
+  app.patch('/api/v1/workrooms/:wid/channels/:cid', async (request, reply) => {
+    const { wid, cid } = request.params as { wid: string; cid: string };
 
     const actor = await authorizeChannelWrite(request, 'manage_members', wid);
     if (!actor.ok) return reply.code(actor.status).send(actor.body);
 
-    // Validate channel ∈ workroom (404 covers both missing channel and cross-workroom).
-    const channel = await db.controlChannel.findUnique({ where: { id: cid }, select: { workroomId: true } });
-    if (!channel || channel.workroomId !== wid) {
-      return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+    const body = request.body as { name?: unknown; visibility?: unknown } | null;
+    const update: { name?: string; visibility?: 'public' | 'private' } = {};
+
+    if (body?.name !== undefined) {
+      const n = typeof body.name === 'string' ? body.name.trim() : '';
+      if (!n) {
+        return reply
+          .code(400)
+          .send({ error: { code: 'INVALID_NAME', message: 'name is required' } });
+      }
+      update.name = n;
+    }
+    if (body?.visibility !== undefined) {
+      if (body.visibility !== 'public' && body.visibility !== 'private') {
+        return reply.code(400).send({
+          error: {
+            code: 'INVALID_VISIBILITY',
+            message: "visibility must be 'public' or 'private'",
+          },
+        });
+      }
+      update.visibility = body.visibility;
+    }
+    if (update.name === undefined && update.visibility === undefined) {
+      return reply
+        .code(400)
+        .send({ error: { code: 'INVALID_BODY', message: 'name or visibility required' } });
     }
 
-    // Idempotent delete: deleteMany returns count 0 when the row is absent → no-op, no event.
-    const result = await db.controlChannelMember.deleteMany({ where: { channelId: cid, memberId } });
-    if (result.count === 0) {
-      return reply.send({ ok: true });
+    const existing = await db.controlChannel.findUnique({
+      where: { id: cid },
+      select: { workroomId: true, archivedAt: true, type: true },
+    });
+    if (!existing || existing.workroomId !== wid || existing.archivedAt !== null) {
+      return reply
+        .code(404)
+        .send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+    }
+    if (existing.type === 'dm') {
+      return reply
+        .code(400)
+        .send({ error: { code: 'INVALID_CHANNEL_TYPE', message: 'DM channels cannot be edited' } });
     }
 
-    await writeChannelEventAndBroadcast(wid, 'channel.member_removed', {
+    const updated = await db.controlChannel.update({
+      where: { id: cid },
+      data: update,
+    });
+
+    const memberCount = await db.controlChannelMember.count({ where: { channelId: cid } });
+
+    await writeChannelEventAndBroadcast(wid, 'channel.updated', {
       channel_id: cid,
-      member_id: memberId,
-      removed_by: actor.actorId,
+      name: updated.name,
+      visibility: updated.visibility,
+      updated_by: actor.actorId,
+    });
+
+    return reply.send({
+      id: updated.id,
+      name: updated.name,
+      type: updated.type,
+      visibility: updated.visibility,
+      last_activity_at: updated.lastActivityAt?.toISOString() ?? null,
+      unread_count: 0,
+      attention_count: 0,
+      member_count: memberCount,
+    });
+  });
+
+  /**
+   * DELETE /api/v1/workrooms/:wid/channels/:cid
+   *
+   * Hard-delete a channel and its membership rows. Auth: user_sess_ OWNER OR
+   * machine (mirrors POST /channels). DMs cannot be deleted via this route.
+   * Publishes channel.deleted on success.
+   */
+  app.delete('/api/v1/workrooms/:wid/channels/:cid', async (request, reply) => {
+    const { wid, cid } = request.params as { wid: string; cid: string };
+
+    const actor = await authorizeChannelWrite(request, 'manage_members', wid);
+    if (!actor.ok) return reply.code(actor.status).send(actor.body);
+
+    const existing = await db.controlChannel.findUnique({
+      where: { id: cid },
+      select: { workroomId: true, type: true },
+    });
+    if (!existing || existing.workroomId !== wid) {
+      return reply
+        .code(404)
+        .send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+    }
+    if (existing.type === 'dm') {
+      return reply
+        .code(400)
+        .send({ error: { code: 'INVALID_CHANNEL_TYPE', message: 'DM channels cannot be deleted' } });
+    }
+
+    // No onDelete cascade exists on any of these FKs, so children must be deleted
+    // (or FK-nulled) in strict dependency order before the channel itself, or
+    // Postgres raises P2003. The full set of real DB FKs that ultimately chain to
+    // this channel (verified against the migration DDL — exactly 4 FKs REFERENCE
+    // control_channels(id), plus the message-chained FKs below):
+    //   control_channel_members.channel_id     → control_channels  (NOT NULL, delete row)
+    //   control_messages.channel_id            → control_channels  (nullable, channel-owned → delete)
+    //   control_reminders.channel_id           → control_channels  (NOT NULL, no cascade → delete row;
+    //                                             control_reminder_events cascades via ON DELETE on reminder_id)
+    //   control_prepared_actions.channel_id    → control_channels  (NOT NULL, no cascade → delete row)
+    //   control_threads.parent_message_id      → control_messages  (NOT NULL, must delete row)
+    //   control_message_reactions.message_id   → control_messages  (NOT NULL, must delete row)
+    //   control_attachments.message_id         → control_messages  (nullable, channel-owned → delete)
+    //   control_tasks.thread_id                → control_threads    (nullable)
+    //   control_tasks.source_message_id        → control_messages   (nullable)
+    //   control_working_agreements.created_from_message_id → control_messages (nullable, cross-entity → null)
+    //   control_handoffs.created_from_message_id           → control_messages (nullable, cross-entity → null)
+    //   control_role_insights.related_message_id           → control_messages (nullable, cross-entity → null)
+    //   control_router_decisions.trigger_message_id        → control_messages (nullable, cross-entity → null)
+    //   control_goals.source_message_id                    → control_messages (nullable, cross-entity → null)
+    // ControlSavedMessage / ControlClientCursor have NO DB FK (control-plane
+    // self-ref convention) so they are intentionally left untouched.
+    //
+    // Explicit timeout/maxWait: a large channel cascade can exceed Prisma's default
+    // 5s interactive-transaction budget mid-way and abort, so we widen it.
+    // SCALE GUARD: child deletes/updates that filter by an id-array (`{ in: ids }`)
+    // bind one Postgres parameter per id. A channel with tens of thousands of
+    // messages would blow Postgres' ~65535 extended-protocol parameter ceiling
+    // and abort the whole tx (and big arrays also pressure the 30s budget).
+    // Two mitigations below:
+    //   1. Prefer a direct `channelId` filter wherever the child table has one
+    //      (control_tasks, control_attachments) — one bound param regardless of
+    //      row count. Only the id-array-driven steps that have NO channelId
+    //      column remain.
+    //   2. Chunk every remaining `{ in: ids }` step into ID_CHUNK-sized batches.
+    const ID_CHUNK = 1000;
+    const chunk = <T>(arr: T[]): T[][] => {
+      const out: T[][] = [];
+      for (let i = 0; i < arr.length; i += ID_CHUNK) out.push(arr.slice(i, i + ID_CHUNK));
+      return out;
+    };
+
+    await db.$transaction(async (tx) => {
+      const messages = await tx.controlMessage.findMany({
+        where: { channelId: cid },
+        select: { id: true },
+      });
+      const messageIds = messages.map((m) => m.id);
+      const messageIdChunks = chunk(messageIds);
+
+      // Threads anchored to this channel's messages (and their ids, for tasks).
+      const threads = await tx.controlThread.findMany({
+        where: { parentMessageId: { in: messageIds } },
+        select: { id: true },
+      });
+      const threadIds = threads.map((t) => t.id);
+      const threadIdChunks = chunk(threadIds);
+
+      // Tasks belonging to this channel: by channelId, or referencing one of this
+      // channel's messages/threads. The channelId-owned tasks are deleted by the
+      // direct channelId filter below; we still need the id-array for tasks that
+      // belong to OTHER channels but reference one of this channel's
+      // messages/threads (cross-channel thread/source refs), so gather those ids.
+      const crossRefTasks = await tx.controlTask.findMany({
+        where: {
+          channelId: { not: cid },
+          OR: [
+            { threadId: { in: threadIds } },
+            { sourceMessageId: { in: messageIds } },
+            { parentMessageId: { in: messageIds } },
+          ],
+        },
+        select: { id: true },
+      });
+      const channelOwnedTaskIds = (
+        await tx.controlTask.findMany({ where: { channelId: cid }, select: { id: true } })
+      ).map((t) => t.id);
+      // Full set of task ids whose children must be detached + that must be deleted.
+      const taskIds = [...channelOwnedTaskIds, ...crossRefTasks.map((t) => t.id)];
+      const crossRefTaskIdChunks = chunk(crossRefTasks.map((t) => t.id));
+      const taskIdChunks = chunk(taskIds);
+
+      // Detach cross-entity rows that FK → these tasks (all nullable; rows may
+      // belong to other flows so we null rather than delete). Chunked over taskIds.
+      for (const ids of taskIdChunks) {
+        await tx.controlAction.updateMany({ where: { taskId: { in: ids } }, data: { taskId: null } });
+        await tx.controlApproval.updateMany({ where: { taskId: { in: ids } }, data: { taskId: null } });
+        await tx.controlArtifact.updateMany({ where: { taskId: { in: ids } }, data: { taskId: null } });
+        await tx.controlHandoff.updateMany({ where: { taskId: { in: ids } }, data: { taskId: null } });
+      }
+
+      // Delete tasks (ref threads + messages) before threads/messages.
+      // channelId-owned tasks: one direct filter (no param explosion).
+      await tx.controlTask.deleteMany({ where: { channelId: cid } });
+      // cross-channel tasks referencing this channel's messages/threads: by id, chunked.
+      for (const ids of crossRefTaskIdChunks) {
+        await tx.controlTask.deleteMany({ where: { id: { in: ids } } });
+      }
+
+      // Threads (ref messages) — delete before messages. By id, chunked.
+      for (const ids of threadIdChunks) {
+        await tx.controlThread.deleteMany({ where: { id: { in: ids } } });
+      }
+
+      // Rows whose FK → messages is NOT NULL or channel-owned: delete.
+      // ControlMessageReaction has only message_id (no channel_id) → chunk by messageIds.
+      for (const ids of messageIdChunks) {
+        await tx.controlMessageReaction.deleteMany({ where: { messageId: { in: ids } } });
+      }
+      // ControlAttachment HAS a channel_id column → delete channel-owned rows directly.
+      await tx.controlAttachment.deleteMany({ where: { channelId: cid } });
+      // …plus any attachment that points at one of this channel's messages but
+      // carries a different/null channel_id (message_id-only) → chunk by messageIds.
+      for (const ids of messageIdChunks) {
+        await tx.controlAttachment.deleteMany({ where: { messageId: { in: ids } } });
+      }
+
+      // Cross-entity OPTIONAL FK → messages: null out (rows may belong to other
+      // channels/flows; only the dangling pointer to a soon-deleted message matters).
+      // None of these have a channel_id column, so chunk by messageIds.
+      for (const ids of messageIdChunks) {
+        await tx.controlWorkingAgreement.updateMany({
+          where: { createdFromMessageId: { in: ids } },
+          data: { createdFromMessageId: null },
+        });
+        await tx.controlHandoff.updateMany({
+          where: { createdFromMessageId: { in: ids } },
+          data: { createdFromMessageId: null },
+        });
+        await tx.controlRoleInsight.updateMany({
+          where: { relatedMessageId: { in: ids } },
+          data: { relatedMessageId: null },
+        });
+        await tx.controlRouterDecision.updateMany({
+          where: { triggerMessageId: { in: ids } },
+          data: { triggerMessageId: null },
+        });
+        await tx.controlGoal.updateMany({
+          where: { sourceMessageId: { in: ids } },
+          data: { sourceMessageId: null },
+        });
+      }
+
+      // NOT-NULL channel FKs with no DB cascade: reminders + prepared actions.
+      // Must delete these rows before the channel or Postgres raises P2003.
+      // control_reminder_events cascades automatically (ON DELETE CASCADE on
+      // reminder_id), so deleting the reminder rows is sufficient. Direct channelId.
+      await tx.controlReminder.deleteMany({ where: { channelId: cid } });
+      await tx.controlPreparedAction.deleteMany({ where: { channelId: cid } });
+
+      // Now safe to delete the messages, membership, and the channel. Direct channelId.
+      await tx.controlMessage.deleteMany({ where: { channelId: cid } });
+      await tx.controlChannelMember.deleteMany({ where: { channelId: cid } });
+      await tx.controlChannel.delete({ where: { id: cid } });
+    }, { timeout: 30000, maxWait: 5000 });
+
+    await writeChannelEventAndBroadcast(wid, 'channel.deleted', {
+      channel_id: cid,
+      deleted_by: actor.actorId,
     });
 
     return reply.send({ ok: true });
@@ -550,19 +879,7 @@ export async function channelRoutes(app: FastifyInstance) {
 
   /**
    * POST /api/v1/workrooms/:wid/channels/:cid/stop-agents  (emergency stop)
-   *
-   * The channel-header "□ Stop all agents" emergency stop. A human operator (op_sess_)
-   * — or a machine — hits this; the server broadcasts an `agents.stop` event scoped to
-   * the channel. Each mio-agent autonomous loop subscribed to the workroom, on receiving
-   * the event for ITS channel, halts auto-replying until the daemon restarts.
-   *
-   * Auth: op_sess_('stop_agents') OR machine_token; dev_ctl_ → 403.
-   * Validates the channel belongs to :wid (404 otherwise — covers cross-workroom + missing).
-   * Publishes 'agents.stop' (write-before-broadcast). Returns { ok: true }.
-   *
-   * No body. Idempotent at the operator level: re-pressing stop just emits another
-   * agents.stop event (the daemon's stopped flag is already set; replays are harmless).
-   * This is a POST (a state-changing op), so it is NOT added to the dev_ctl_ GET allowlist.
+   * Auth: user_sess_ owner OR machine. Channel must be in :wid. Publishes agents.stop.
    */
   app.post('/api/v1/workrooms/:wid/channels/:cid/stop-agents', async (request, reply) => {
     const { wid, cid } = request.params as { wid: string; cid: string };
@@ -570,10 +887,14 @@ export async function channelRoutes(app: FastifyInstance) {
     const actor = await authorizeChannelWrite(request, 'stop_agents', wid);
     if (!actor.ok) return reply.code(actor.status).send(actor.body);
 
-    // Validate channel ∈ workroom (404 covers both missing channel and cross-workroom).
-    const channel = await db.controlChannel.findUnique({ where: { id: cid }, select: { workroomId: true } });
+    const channel = await db.controlChannel.findUnique({
+      where: { id: cid },
+      select: { workroomId: true },
+    });
     if (!channel || channel.workroomId !== wid) {
-      return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+      return reply
+        .code(404)
+        .send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
     }
 
     await writeChannelEventAndBroadcast(wid, 'agents.stop', {

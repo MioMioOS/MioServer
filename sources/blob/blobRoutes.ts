@@ -4,7 +4,10 @@ import { getAccessibleDeviceIds } from '@/auth/deviceAccess';
 import { putBlob, readBlob, getBlob } from './blobStore';
 
 const MAX_BLOB_BYTES = 8 * 1024 * 1024; // 8 MB per blob
-const ALLOWED_MIME = new Set([
+
+// Single source of truth for the image MIME allowlist. Re-used by
+// sources/control/attachments/agentApiAttachments.ts — do NOT duplicate this set.
+export const ALLOWED_MIME = new Set([
     'image/jpeg',
     'image/png',
     'image/heic',

@@ -69,6 +69,15 @@ CONTROL_PLANE_MIGRATIONS=(
   "prisma/migrations/20260524070000_s5_activity_state/migration.sql"
   "prisma/migrations/20260524080000_s2_agent_model/migration.sql"
   "prisma/migrations/20260524090000_s2_agent_machine_drop_unique/migration.sql"
+  "prisma/migrations/20260525000000_s2_task_number/migration.sql"
+  "prisma/migrations/20260526000000_s4_reminders/migration.sql"
+  "prisma/migrations/20260527000000_s4_2_prepared_actions/migration.sql"
+  "prisma/migrations/20260527010000_bug2_task_parent_message/migration.sql"
+  "prisma/migrations/20260528000000_s4_3/migration.sql"
+  "prisma/migrations/20260528010000_task_creator_attribution/migration.sql"
+  "prisma/migrations/20260529000000_s6_machine_enrollment/migration.sql"
+  "prisma/migrations/20260530000000_user_auth_unification/migration.sql"
+  "prisma/migrations/20260530010000_p3_reviewer_gate_review_round/migration.sql"
 )
 for migration in "${CONTROL_PLANE_MIGRATIONS[@]}"; do
   echo "==> Applying ${migration}"

@@ -542,7 +542,7 @@ describe('GET /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(res.statusCode).toBe(401);
   });
 
-  it('returns wire shape fields: id, seq, sender_kind, sender_id, sender_display_name, content, mentions, embedded_card_type, embedded_card_id, thread_reply_count, created_at', async () => {
+  it('returns wire shape fields: id, seq, sender_kind, sender_id, sender_display_name, content, mentions, attachment_ids, embedded_card_type, embedded_card_id, thread_reply_count, created_at', async () => {
     const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages?after_seq=0&limit=1`);
     expect(res.statusCode).toBe(200);
     const msg = JSON.parse(res.body).messages[0];
@@ -553,6 +553,7 @@ describe('GET /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(msg).toHaveProperty('sender_display_name');
     expect(msg).toHaveProperty('content');
     expect(msg).toHaveProperty('mentions');
+    expect(msg).toHaveProperty('attachment_ids');
     expect(msg).toHaveProperty('embedded_card_type');
     expect(msg).toHaveProperty('embedded_card_id');
     expect(msg).toHaveProperty('thread_reply_count');
@@ -672,6 +673,7 @@ describe('GET /api/v1/messages/:id', () => {
     expect(body).toHaveProperty('sender_display_name');
     expect(body).toHaveProperty('content');
     expect(body).toHaveProperty('mentions');
+    expect(body).toHaveProperty('attachment_ids');
     expect(body).toHaveProperty('embedded_card_type');
     expect(body).toHaveProperty('embedded_card_id');
     expect(body).toHaveProperty('thread_reply_count');

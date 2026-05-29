@@ -26,9 +26,11 @@
  * Auth:
  *   Generic `token` field in subscribe message. Accepted token classes:
  *     - machine_token  (machine daemon)
- *     - dev_ctl_       (CodeLight phone, read-only)
- *     - op_sess_       (operator session, phone write-capable)
- *   All three are validated via tokenInWorkroom() which checks token validity
+ *     - dev_ctl_       (CodeLight phone, read-only — Slice 7 transitional)
+ *     - op_sess_       (operator session, phone write-capable — Slice 7 transitional)
+ *     - user_sess_     (Slice 7 B2-e: iOS sends user_sess_ in the same `token` field;
+ *                       wire protocol unchanged. Validated via UserWorkroomMembership.)
+ *   All classes are validated via tokenInWorkroom() which checks token validity
  *   AND workroom scope. If auth fails: error + socket disconnect.
  *
  * INVARIANTS:
@@ -62,7 +64,7 @@ export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
       }
 
       // Authenticate and verify workroom scope in one step.
-      // tokenInWorkroom accepts machine_token / dev_ctl_ / op_sess_ tokens.
+      // tokenInWorkroom accepts machine_token / dev_ctl_ / op_sess_ / user_sess_ tokens.
       const scope = await tokenInWorkroom(msg.token, msg.workroom_id);
       if (!scope) {
         socket.emit('error', { code: 'FORBIDDEN', message: 'Invalid token or not authorized for this workroom' });

@@ -1,25 +1,30 @@
 /**
- * S1 Chunk 2 — Contract update for GET /api/v1/workrooms/:wid/channels.
+ * Unit test for GET /api/v1/workrooms/:wid/channels — mocked Prisma + mocked auth helpers.
  *
- * The synthetic 'main' channel handler was removed from workroomRoutes.ts and replaced
- * by channelRoutes.ts (real ControlChannel table). This spec tests the NEW contract:
- *   - id is a real uuid (not the literal 'main')
- *   - visibility and member_count are present
- *   - attention_count is preserved (needs_human actions + pending approvals)
- *   - auth failures (403/401) still respected
+ * Slice 7 B2-c: handler now uses inline user_sess_ / machine_token resolution (no more
+ * authorizeControlRead). visibleChannels is invoked with the `{ viewerId }` overload —
+ * viewerId is user.id for user actors, machine.id for machine actors.
+ *
+ * FAST MODE — only meaningful tests:
+ *   - id is a real uuid (not literal 'main')
+ *   - visibility + member_count present
+ *   - attention_count preserved (needs_human actions + pending approvals)
+ *   - auth failures (machine invalid → 401)
+ *   - cross-org machine → 403 from requireMachineAccessToWorkroom
  *   - archived workrooms → 404
- *
- * The test registers channelRoutes (not workroomRoutes) since the handler moved.
+ *   - empty channel list
+ *   - private channels filtered by visibleChannels (member row required)
  */
 
 import fastify from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { channelRoutes } from '@/control/channels/channelRoutes';
 import { db } from '@/storage/db';
-import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
+import { verifyMachineToken } from '@/machines/machineRoutes';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 
 const CHANNEL_UUID = '11111111-2222-3333-4444-555555555555';
+const MACHINE_TOKEN = 'machine_fake';
 
 vi.mock('@/storage/db', () => ({
   db: {
@@ -28,15 +33,20 @@ vi.mock('@/storage/db', () => ({
     controlChannelMember: { groupBy: vi.fn() },
     controlAction: { count: vi.fn() },
     controlApproval: { count: vi.fn() },
+    userWorkroomMembership: { findUnique: vi.fn() },
   },
 }));
 
-vi.mock('@/control/devTokens/devTokenAuth', () => ({
-  authorizeControlRead: vi.fn(),
+vi.mock('@/machines/machineRoutes', () => ({
+  verifyMachineToken: vi.fn(),
 }));
 
 vi.mock('@/control/auth/machineAccess', () => ({
   requireMachineAccessToWorkroom: vi.fn(),
+}));
+
+vi.mock('@/auth/userSession/resolveUserSession', () => ({
+  resolveUserSession: vi.fn().mockResolvedValue(null),
 }));
 
 async function buildApp() {
@@ -45,7 +55,7 @@ async function buildApp() {
   return app;
 }
 
-const mockedAuth = vi.mocked(authorizeControlRead);
+const mockedVerifyMachine = vi.mocked(verifyMachineToken);
 const mockedAccess = vi.mocked(requireMachineAccessToWorkroom);
 const mockedDb = db as unknown as {
   controlWorkroom: { findUnique: ReturnType<typeof vi.fn> };
@@ -53,22 +63,20 @@ const mockedDb = db as unknown as {
   controlChannelMember: { groupBy: ReturnType<typeof vi.fn> };
   controlAction: { count: ReturnType<typeof vi.fn> };
   controlApproval: { count: ReturnType<typeof vi.fn> };
+  userWorkroomMembership: { findUnique: ReturnType<typeof vi.fn> };
 };
+
+const machineHeader = (): Record<string, string> => ({ authorization: `Bearer ${MACHINE_TOKEN}` });
 
 describe('GET /api/v1/workrooms/:wid/channels', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockedAuth.mockResolvedValue({
-      ok: true,
-      mode: 'machine',
-      machine: { id: 'machine-1', orgId: 'org-1' } as never,
-    });
+    mockedVerifyMachine.mockResolvedValue({ id: 'machine-1', orgId: 'org-1' } as never);
     mockedAccess.mockResolvedValue({ ok: true, workroomOrgId: 'org-1' });
     mockedDb.controlWorkroom.findUnique.mockResolvedValue({
       id: 'workroom-1',
       archivedAt: null,
     });
-    // visibleChannels returns a single public main channel
     mockedDb.controlChannel.findMany.mockResolvedValue([
       {
         id: CHANNEL_UUID,
@@ -80,7 +88,7 @@ describe('GET /api/v1/workrooms/:wid/channels', () => {
         createdAt: new Date('2026-05-20T00:00:00.000Z'),
         lastActivityAt: new Date('2026-05-23T00:00:00.000Z'),
         workroomId: 'workroom-1',
-        members: [], // public: no member rows needed
+        members: [],
       },
     ]);
     mockedDb.controlChannelMember.groupBy.mockResolvedValue([]);
@@ -90,7 +98,7 @@ describe('GET /api/v1/workrooms/:wid/channels', () => {
 
   it('returns the real channel contract with uuid id, visibility, member_count, and attention_count', async () => {
     const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels' });
+    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels', headers: machineHeader() });
 
     expect(res.statusCode).toBe(200);
     expect(mockedAccess).toHaveBeenCalledWith({ id: 'machine-1', orgId: 'org-1' }, 'workroom-1');
@@ -98,7 +106,6 @@ describe('GET /api/v1/workrooms/:wid/channels', () => {
     expect(body.workroom_id).toBe('workroom-1');
     expect(body.channels).toHaveLength(1);
     const ch = body.channels[0];
-    // id must be a uuid — not the literal 'main'
     expect(ch.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     expect(ch.id).toBe(CHANNEL_UUID);
     expect(ch.name).toBe('Mio Ops');
@@ -106,32 +113,18 @@ describe('GET /api/v1/workrooms/:wid/channels', () => {
     expect(ch.visibility).toBe('public');
     expect(ch.last_activity_at).toBe('2026-05-23T00:00:00.000Z');
     expect(ch.unread_count).toBe(0);
-    expect(ch.attention_count).toBe(5);   // 2 needs_human + 3 pending approvals
-    expect(ch.member_count).toBe(0);      // public channel, no explicit member rows
+    expect(ch.attention_count).toBe(5);
+    expect(ch.member_count).toBe(0);
   });
 
-  it('supports dev read tokens without the machine workroom guard after authorizeControlRead scopes the path', async () => {
-    mockedAuth.mockResolvedValue({
-      ok: true,
-      mode: 'dev',
-      devToken: { id: 'dev-1', orgId: 'org-1', workroomId: 'workroom-1', scope: 'read_only' },
-    });
+  it('denies before reading channel data when machine token invalid', async () => {
+    mockedVerifyMachine.mockResolvedValue(null);
 
     const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels' });
+    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels', headers: machineHeader() });
 
-    expect(res.statusCode).toBe(200);
-    expect(mockedAccess).not.toHaveBeenCalled();
-  });
-
-  it('denies before reading channel data when auth fails', async () => {
-    mockedAuth.mockResolvedValue({ ok: false, status: 403, code: 'FORBIDDEN', message: 'Forbidden' });
-
-    const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels' });
-
-    expect(res.statusCode).toBe(403);
-    expect(mockedDb.controlWorkroom.findUnique).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(401);
+    expect(mockedDb.controlChannel.findMany).not.toHaveBeenCalled();
   });
 
   it('returns the workroom access guard failure for machine auth', async () => {
@@ -142,11 +135,11 @@ describe('GET /api/v1/workrooms/:wid/channels', () => {
     });
 
     const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels' });
+    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels', headers: machineHeader() });
 
     expect(res.statusCode).toBe(403);
     expect(JSON.parse(res.body).error.code).toBe('FORBIDDEN');
-    expect(mockedDb.controlWorkroom.findUnique).not.toHaveBeenCalled();
+    expect(mockedDb.controlChannel.findMany).not.toHaveBeenCalled();
   });
 
   it('treats archived workrooms as unavailable for the channel switcher', async () => {
@@ -156,7 +149,7 @@ describe('GET /api/v1/workrooms/:wid/channels', () => {
     });
 
     const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels' });
+    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels', headers: machineHeader() });
 
     expect(res.statusCode).toBe(404);
     expect(JSON.parse(res.body).error.code).toBe('WORKROOM_NOT_FOUND');
@@ -166,7 +159,7 @@ describe('GET /api/v1/workrooms/:wid/channels', () => {
     mockedDb.controlChannel.findMany.mockResolvedValue([]);
 
     const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels' });
+    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels', headers: machineHeader() });
 
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ workroom_id: 'workroom-1', channels: [] });
@@ -178,14 +171,13 @@ describe('GET /api/v1/workrooms/:wid/channels', () => {
     ]);
 
     const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels' });
+    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels', headers: machineHeader() });
 
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).channels[0].member_count).toBe(4);
   });
 
   it('filters out private channels where viewer is not a member', async () => {
-    // Private channel where the viewer has no member row → filtered out by visibleChannels
     mockedDb.controlChannel.findMany.mockResolvedValue([
       {
         id: CHANNEL_UUID,
@@ -197,20 +189,18 @@ describe('GET /api/v1/workrooms/:wid/channels', () => {
         createdAt: new Date('2026-05-20T00:00:00.000Z'),
         lastActivityAt: new Date('2026-05-23T00:00:00.000Z'),
         workroomId: 'workroom-1',
-        members: [], // no member row for 'machine-1' → filtered out
+        members: [],
       },
     ]);
 
     const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels' });
+    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels', headers: machineHeader() });
 
     expect(res.statusCode).toBe(200);
-    // Private channel with no member rows should be invisible to this viewer
     expect(JSON.parse(res.body).channels).toHaveLength(0);
   });
 
   it('includes private channels where viewer is a member', async () => {
-    // Private channel where viewer has an explicit member row
     mockedDb.controlChannel.findMany.mockResolvedValue([
       {
         id: CHANNEL_UUID,
@@ -222,12 +212,12 @@ describe('GET /api/v1/workrooms/:wid/channels', () => {
         createdAt: new Date('2026-05-20T00:00:00.000Z'),
         lastActivityAt: new Date('2026-05-23T00:00:00.000Z'),
         workroomId: 'workroom-1',
-        members: [{ memberId: 'machine-1' }], // viewer IS a member
+        members: [{ memberId: 'machine-1' }],
       },
     ]);
 
     const app = await buildApp();
-    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels' });
+    const res = await app.inject({ method: 'GET', url: '/api/v1/workrooms/workroom-1/channels', headers: machineHeader() });
 
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).channels).toHaveLength(1);

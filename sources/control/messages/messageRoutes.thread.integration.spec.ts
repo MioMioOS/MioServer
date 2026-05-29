@@ -1,7 +1,7 @@
 /**
- * S2 Task 2.4 — Thread routes (REAL Postgres integration).
+ * S2 Task 2.4 — Thread routes — Slice 7 B2-d conversion.
  *
- * Covers S2 §4.2/§4.3/§4.4:
+ * Covers S2 §4.2/§4.3/§4.4 with user_sess_ / machine unification:
  *   GET  /api/v1/workrooms/:wid/threads/:parentId
  *     - thread meta { id, parent_message_id, reply_count, last_reply_at, task_id:null }
  *     - no ControlThread row → reply_count 0, last_reply_at null
@@ -11,11 +11,10 @@
  *     - { parent_message_id, messages:[…], has_more } ordered by seq
  *     - after_seq pagination + has_more
  *   POST /api/v1/workrooms/:wid/threads/:parentId/reply
- *     - op_sess_ (idempotency key required) → 201 full message with parent_message_id
+ *     - user-owner (idempotency key required) → 201 full message with parent_message_id
  *     - machine_token → 201 (kind agent)
- *     - dev_ctl_ → 403
+ *     - user non-member → 403
  *     - parent not found → 404
- *     - replies do NOT appear in GET channel messages (main timeline)
  *     - publishes a thread.reply event (write-before-broadcast)
  *
  * Run: npm run test:db:setup && npm run test:integration
@@ -26,38 +25,40 @@ import fastify, { type FastifyInstance } from 'fastify';
 import { createHash, randomUUID } from 'crypto';
 import { db } from '@/storage/db';
 import { messageRoutes } from './messageRoutes';
-import { mintOperatorSession, V1_OPERATOR_COMMANDS } from '@/control/operatorSessions/operatorSessionMint';
+import { hashPassword } from '@/auth/userSession/passwordHash';
+import { mintUserSessionToken, hashUserSessionToken } from '@/auth/userSession/tokenMint';
 
 // ── Fixture IDs ───────────────────────────────────────────────────────────────
 
 const ORG_ID = randomUUID();
 const WORKROOM_ID = randomUUID();
 const MACHINE_ID = randomUUID();
-const OPERATOR_SUBJECT_ID = `pairing:${randomUUID()}`;
 
 const MACHINE_RAW_TOKEN = `machine_${randomUUID().replace(/-/g, '')}`;
-const DEV_CTL_RAW_TOKEN = `dev_ctl_${randomUUID().replace(/-/g, '')}`;
 
-let OP_SESS_RAW_TOKEN = '';
+let OWNER_USER_ID = '';
+let OWNER_USER_TOKEN = '';
+let NON_MEMBER_USER_ID = '';
+let NON_MEMBER_USER_TOKEN = '';
 let PUBLIC_CHANNEL_ID = '';
 let PRIVATE_CHANNEL_ID = '';
-let PARENT_MSG_ID = '';          // top-level parent in the public channel
-let PRIVATE_PARENT_MSG_ID = '';  // top-level parent in the private channel
+let PARENT_MSG_ID = '';
+let PRIVATE_PARENT_MSG_ID = '';
 let APP: FastifyInstance;
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const opSessHeader = () => ({ authorization: `Bearer ${OP_SESS_RAW_TOKEN}` });
+const ownerUserHeader = () => ({ authorization: `Bearer ${OWNER_USER_TOKEN}` });
+const nonMemberUserHeader = () => ({ authorization: `Bearer ${NON_MEMBER_USER_TOKEN}` });
 const machineHeader = () => ({ authorization: `Bearer ${MACHINE_RAW_TOKEN}` });
-const devCtlHeader = () => ({ authorization: `Bearer ${DEV_CTL_RAW_TOKEN}` });
 
 function get(url: string, headers: Record<string, string> = machineHeader()) {
   return APP.inject({ method: 'GET', url, headers });
 }
 
-function post(url: string, body: Record<string, unknown>, headers: Record<string, string> = opSessHeader()) {
+function post(url: string, body: Record<string, unknown>, headers: Record<string, string> = ownerUserHeader()) {
   return APP.inject({
     method: 'POST',
     url,
@@ -99,12 +100,6 @@ beforeAll(async () => {
       platform: 'darwin', arch: 'arm64',
     },
   });
-  await db.controlDevToken.create({
-    data: {
-      id: randomUUID(), orgId: ORG_ID, workroomId: WORKROOM_ID,
-      tokenHash: sha256(DEV_CTL_RAW_TOKEN), scope: 'read_only', expiresAt: new Date(Date.now() + 24 * 3600_000),
-    },
-  });
   await db.controlWorkroom.create({
     data: { id: WORKROOM_ID, orgId: ORG_ID, name: 'ThreadSpec WR', createdBy: randomUUID() },
   });
@@ -122,14 +117,27 @@ beforeAll(async () => {
   PARENT_MSG_ID = await seedTopLevel(PUBLIC_CHANNEL_ID, 1, 'public parent');
   PRIVATE_PARENT_MSG_ID = await seedTopLevel(PRIVATE_CHANNEL_ID, 1, 'private parent');
 
-  const minted = await mintOperatorSession({
-    orgId: ORG_ID,
-    workroomId: WORKROOM_ID,
-    operatorSubjectId: OPERATOR_SUBJECT_ID,
-    issuedBy: 'test',
-    allowedCommands: [...V1_OPERATOR_COMMANDS],
+  // user_sess_ fixtures.
+  const owner = await db.user.create({
+    data: { email: `thread-owner-${randomUUID()}@example.test`, passwordHash: await hashPassword('p') },
   });
-  OP_SESS_RAW_TOKEN = minted.rawToken;
+  OWNER_USER_ID = owner.id;
+  OWNER_USER_TOKEN = mintUserSessionToken();
+  await db.userSession.create({
+    data: { userId: OWNER_USER_ID, tokenHash: hashUserSessionToken(OWNER_USER_TOKEN), expiresAt: new Date(Date.now() + 86_400_000) },
+  });
+  await db.userWorkroomMembership.create({
+    data: { userId: OWNER_USER_ID, workroomId: WORKROOM_ID, role: 'owner' },
+  });
+
+  const nm = await db.user.create({
+    data: { email: `thread-nm-${randomUUID()}@example.test`, passwordHash: await hashPassword('p') },
+  });
+  NON_MEMBER_USER_ID = nm.id;
+  NON_MEMBER_USER_TOKEN = mintUserSessionToken();
+  await db.userSession.create({
+    data: { userId: NON_MEMBER_USER_ID, tokenHash: hashUserSessionToken(NON_MEMBER_USER_TOKEN), expiresAt: new Date(Date.now() + 86_400_000) },
+  });
 });
 
 afterAll(async () => {
@@ -138,9 +146,10 @@ afterAll(async () => {
   await db.controlMessage.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlChannelMember.deleteMany({ where: { channel: { workroomId: WORKROOM_ID } } });
   await db.controlChannel.deleteMany({ where: { workroomId: WORKROOM_ID } });
-  await db.controlOperatorSession.deleteMany({ where: { workroomId: WORKROOM_ID } });
+  await db.userWorkroomMembership.deleteMany({ where: { userId: { in: [OWNER_USER_ID, NON_MEMBER_USER_ID] } } });
+  await db.userSession.deleteMany({ where: { userId: { in: [OWNER_USER_ID, NON_MEMBER_USER_ID] } } });
+  await db.user.deleteMany({ where: { id: { in: [OWNER_USER_ID, NON_MEMBER_USER_ID] } } });
   await db.controlWorkroom.deleteMany({ where: { id: WORKROOM_ID } });
-  await db.controlDevToken.deleteMany({ where: { orgId: ORG_ID } });
   await db.controlMachine.deleteMany({ where: { id: MACHINE_ID } });
   await db.controlOrg.deleteMany({ where: { id: ORG_ID } });
   await APP.close();
@@ -188,9 +197,14 @@ describe('GET /api/v1/workrooms/:wid/threads/:parentId', () => {
     expect(res.statusCode).toBe(404);
   });
 
-  it('dev_ctl_ in scope → 200', async () => {
-    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/threads/${PARENT_MSG_ID}`, devCtlHeader());
+  it('user-owner in scope → 200', async () => {
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/threads/${PARENT_MSG_ID}`, ownerUserHeader());
     expect(res.statusCode).toBe(200);
+  });
+
+  it('user non-member → 403', async () => {
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/threads/${PARENT_MSG_ID}`, nonMemberUserHeader());
+    expect(res.statusCode).toBe(403);
   });
 
   it('no token → 401', async () => {
@@ -213,7 +227,6 @@ describe('GET /api/v1/workrooms/:wid/threads/:parentId/replies', () => {
     const body = JSON.parse(res.body);
     expect(body.parent_message_id).toBe(parentId);
     expect(body.messages.map((m: { id: string }) => m.id)).toEqual([r1, r2, r3]);
-    // each reply carries its parent
     for (const m of body.messages) expect(m.parent_message_id).toBe(parentId);
     expect(body.has_more).toBe(false);
 
@@ -248,8 +261,8 @@ describe('GET /api/v1/workrooms/:wid/threads/:parentId/replies', () => {
     expect(res.statusCode).toBe(404);
   });
 
-  it('dev_ctl_ in scope → 200', async () => {
-    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/threads/${PARENT_MSG_ID}/replies`, devCtlHeader());
+  it('user-owner in scope → 200', async () => {
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/threads/${PARENT_MSG_ID}/replies`, ownerUserHeader());
     expect(res.statusCode).toBe(200);
   });
 });
@@ -257,20 +270,20 @@ describe('GET /api/v1/workrooms/:wid/threads/:parentId/replies', () => {
 // ── POST /workrooms/:wid/threads/:parentId/reply ───────────────────────────────
 
 describe('POST /api/v1/workrooms/:wid/threads/:parentId/reply', () => {
-  it('op_sess_ → 201 full message with parent_message_id; replies excluded from main timeline', async () => {
-    const parentId = await seedTopLevel(PUBLIC_CHANNEL_ID, 400, 'parent op reply');
+  it('user-owner → 201 full message with parent_message_id; replies excluded from main timeline', async () => {
+    const parentId = await seedTopLevel(PUBLIC_CHANNEL_ID, 400, 'parent user reply');
 
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/threads/${parentId}/reply`,
-      { content: 'an operator reply', client_idempotency_key: randomUUID() },
-      opSessHeader(),
+      { content: 'a user reply', client_idempotency_key: randomUUID() },
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(201);
     const body = JSON.parse(res.body);
     expect(body.parent_message_id).toBe(parentId);
     expect(body.sender_kind).toBe('user');
-    expect(body.sender_id).toBe(OPERATOR_SUBJECT_ID);
-    expect(body.content).toBe('an operator reply');
+    expect(body.sender_id).toBe(OWNER_USER_ID);
+    expect(body.content).toBe('a user reply');
     expect(body.idempotent).toBe(false);
 
     // The reply must NOT appear in the main channel timeline.
@@ -278,7 +291,6 @@ describe('POST /api/v1/workrooms/:wid/threads/:parentId/reply', () => {
     const listBody = JSON.parse(list.body);
     expect(listBody.messages.map((m: { id: string }) => m.id)).not.toContain(body.id);
 
-    // Thread bookkeeping advanced.
     const thread = await db.controlThread.findUnique({ where: { parentMessageId: parentId } });
     expect(thread!.replyCount).toBe(1);
 
@@ -287,12 +299,12 @@ describe('POST /api/v1/workrooms/:wid/threads/:parentId/reply', () => {
     await db.controlMessage.deleteMany({ where: { id: parentId } });
   });
 
-  it('op_sess_ missing client_idempotency_key → 400', async () => {
-    const parentId = await seedTopLevel(PUBLIC_CHANNEL_ID, 410, 'parent op noidem');
+  it('user-owner missing client_idempotency_key → 400', async () => {
+    const parentId = await seedTopLevel(PUBLIC_CHANNEL_ID, 410, 'parent user noidem');
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/threads/${parentId}/reply`,
       { content: 'no key' },
-      opSessHeader(),
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(400);
     await db.controlMessage.deleteMany({ where: { id: parentId } });
@@ -316,11 +328,11 @@ describe('POST /api/v1/workrooms/:wid/threads/:parentId/reply', () => {
     await db.controlMessage.deleteMany({ where: { id: parentId } });
   });
 
-  it('dev_ctl_ → 403', async () => {
+  it('user non-member → 403', async () => {
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/threads/${PARENT_MSG_ID}/reply`,
       { content: 'should be denied', client_idempotency_key: randomUUID() },
-      devCtlHeader(),
+      nonMemberUserHeader(),
     );
     expect(res.statusCode).toBe(403);
   });
@@ -329,7 +341,7 @@ describe('POST /api/v1/workrooms/:wid/threads/:parentId/reply', () => {
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/threads/${randomUUID()}/reply`,
       { content: 'orphan', client_idempotency_key: randomUUID() },
-      opSessHeader(),
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(404);
   });
@@ -339,7 +351,7 @@ describe('POST /api/v1/workrooms/:wid/threads/:parentId/reply', () => {
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/threads/${parentId}/reply`,
       { content: 'event reply', client_idempotency_key: randomUUID() },
-      opSessHeader(),
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(201);
     const body = JSON.parse(res.body);
@@ -367,12 +379,12 @@ describe('POST /api/v1/workrooms/:wid/threads/:parentId/reply', () => {
     const key = randomUUID();
     const url = `/api/v1/workrooms/${WORKROOM_ID}/threads/${parentId}/reply`;
 
-    const first = await post(url, { content: 'idem reply', client_idempotency_key: key }, opSessHeader());
+    const first = await post(url, { content: 'idem reply', client_idempotency_key: key }, ownerUserHeader());
     expect(first.statusCode).toBe(201);
     const b1 = JSON.parse(first.body);
     expect(b1.idempotent).toBe(false);
 
-    const second = await post(url, { content: 'idem reply', client_idempotency_key: key }, opSessHeader());
+    const second = await post(url, { content: 'idem reply', client_idempotency_key: key }, ownerUserHeader());
     expect(second.statusCode).toBe(201);
     const b2 = JSON.parse(second.body);
     expect(b2.idempotent).toBe(true);

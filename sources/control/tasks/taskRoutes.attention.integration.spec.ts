@@ -18,6 +18,7 @@ import { taskRoutes } from './taskRoutes';
 const ORG_ID = randomUUID();
 const WORKROOM_ID = randomUUID();
 const AGENT_ID = randomUUID();
+const CREATOR_AGENT_ID = randomUUID();
 const SESSION_ID = randomUUID();
 const MACHINE_ID = randomUUID();
 const MACHINE_RAW_TOKEN = `machine_raw_${randomUUID()}`;
@@ -26,9 +27,18 @@ let app: FastifyInstance;
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
-async function makeTask(title: string, status = 'todo'): Promise<string> {
+async function makeTask(title: string, status = 'todo', creatorInstanceId?: string): Promise<string> {
   const id = randomUUID();
-  await db.controlTask.create({ data: { id, workroomId: WORKROOM_ID, title, status, ownerInstanceId: AGENT_ID } });
+  await db.controlTask.create({
+    data: {
+      id,
+      workroomId: WORKROOM_ID,
+      title,
+      status,
+      ownerInstanceId: AGENT_ID,
+      ...(creatorInstanceId ? { creatorInstanceId } : {}),
+    },
+  });
   return id;
 }
 
@@ -51,6 +61,8 @@ async function listTasks() {
   return (JSON.parse(res.body).tasks as Array<{
     task_id: string; attention_reason: string[]; pending_attention_count: number; pending_action_count: number;
     owner_instance_id: string | null; owner_display_name: string | null;
+    creator_instance_id: string | null; creator_display_name: string | null;
+    created_at: string; updated_at: string;
   }>);
 }
 
@@ -64,6 +76,7 @@ beforeAll(async () => {
     data: { id: MACHINE_ID, orgId: ORG_ID, tokenHash: sha256(MACHINE_RAW_TOKEN), tokenExpiresAt: new Date(Date.now() + 24 * 3600_000), platform: 'darwin', arch: 'arm64' },
   });
   await db.controlAgent.create({ data: { id: AGENT_ID, orgId: ORG_ID, name: 'attn-agent', displayName: 'Attn Agent', role: 'ops' } });
+  await db.controlAgent.create({ data: { id: CREATOR_AGENT_ID, orgId: ORG_ID, name: 'creator-agent', displayName: 'Creator Agent', role: 'pm' } });
   await db.controlWorkroom.create({ data: { id: WORKROOM_ID, orgId: ORG_ID, name: 'Attn WR', createdBy: randomUUID() } });
   await db.controlSession.create({
     data: { id: SESSION_ID, orgId: ORG_ID, workroomId: WORKROOM_ID, machineId: MACHINE_ID, mode: 'daemon', runtime: 'claude', displayName: 'attn-session' },
@@ -75,7 +88,7 @@ afterAll(async () => {
   await db.controlTask.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlSession.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlWorkroom.deleteMany({ where: { id: WORKROOM_ID } });
-  await db.controlAgent.deleteMany({ where: { id: AGENT_ID } });
+  await db.controlAgent.deleteMany({ where: { id: { in: [AGENT_ID, CREATOR_AGENT_ID] } } });
   await db.controlMachine.deleteMany({ where: { id: MACHINE_ID } });
   await db.controlOrg.deleteMany({ where: { id: ORG_ID } });
   await app.close();
@@ -159,5 +172,16 @@ describe('#188① owner_display_name resolution (GET /workrooms/:id/tasks)', () 
     const t = (await listTasks()).find((x) => x.task_id === id)!;
     expect(t.owner_instance_id).toBeNull();
     expect(t.owner_display_name).toBeNull();
+  });
+});
+
+describe('creator attribution (GET /workrooms/:id/tasks)', () => {
+  it('creator_instance_id resolves to creator_display_name and includes timestamps', async () => {
+    const taskId = await makeTask('creator-resolved', 'todo', CREATOR_AGENT_ID);
+    const t = (await listTasks()).find((x) => x.task_id === taskId)!;
+    expect(t.creator_instance_id).toBe(CREATOR_AGENT_ID);
+    expect(t.creator_display_name).toBe('Creator Agent');
+    expect(typeof t.created_at).toBe('string');
+    expect(typeof t.updated_at).toBe('string');
   });
 });

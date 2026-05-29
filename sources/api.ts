@@ -6,6 +6,7 @@ import {
     type ZodTypeProvider,
 } from 'fastify-type-provider-zod';
 import { authRoutes } from '@/auth/authRoutes';
+import { userSessionRoutes } from '@/auth/userSession/userSessionRoutes';
 import { pairingRoutes } from '@/pairing/pairingRoutes';
 import { devicesRoutes } from '@/devices/devicesRoutes';
 import { sessionRoutes } from '@/session/sessionRoutes';
@@ -29,11 +30,25 @@ import { actionRoutes } from '@/control/actions/actionRoutes';
 import { eventRoutes } from '@/control/events/eventRoutes';
 import { artifactRoutes } from '@/control/artifacts/artifactRoutes';
 import { summaryRoutes } from '@/control/workrooms/summaryRoutes';
+import { workspaceMembershipRoutes } from '@/control/workrooms/workspaceMembershipRoutes';
+import { friendRoutes } from '@/control/friends/friendRoutes';
 import { sessionRoutes as controlSessionRoutes } from '@/control/sessions/sessionRoutes';
 import { operatorWriteRoutes } from '@/control/operatorSessions/operatorWriteRoutes';
-import { operatorPairingRoutes } from '@/control/operatorSessions/operatorPairingRoutes';
-import { connectionRoutes } from '@/control/connections/connectionRoutes';
+import { machineEnrollmentRoutes } from '@/control/operatorSessions/machineEnrollmentRoutes';
 import { explanationRoutes } from '@/control/llm/explanationRoutes';
+import { agentApiRoutes } from '@/control/agentApi/agentApiRoutes';
+import { agentApiTasks } from '@/control/agentApi/agentApiTasks';
+import { agentApiReminders } from '@/control/agentApi/agentApiReminders';
+import { agentApiChannels } from '@/control/agentApi/agentApiChannels';
+import { agentApiReactions } from '@/control/agentApi/agentApiReactions';
+import { agentApiAttachments } from '@/control/attachments/agentApiAttachments';
+import { userAttachments } from '@/control/attachments/userAttachments';
+import { agentApiPreparedActions } from '@/control/actions/agentApiPreparedActions';
+import { preparedActionOperatorRoutes } from '@/control/actions/preparedActionOperatorRoutes';
+import { agentApiProfile } from '@/control/profile/agentApiProfile';
+import { agentApiTyping } from '@/control/agentApi/agentApiTyping';
+import { agentApiStatus } from '@/control/agentApi/agentApiStatus';
+import { agentApiThreads } from '@/control/agentApi/agentApiThreads';
 import { registerEmptyJsonBodyParser } from '@/jsonBodyParser';
 import { provisionCredentialStore } from '@/control/credentials/provisionCredentialStore';
 import { config } from '@/config';
@@ -69,6 +84,7 @@ export async function startApi() {
     const credentialStore = provisionCredentialStore();
 
     await app.register(authRoutes);
+    await app.register(userSessionRoutes);
     await app.register(pairingRoutes);
     await app.register(devicesRoutes);
     await app.register(sessionRoutes);
@@ -81,7 +97,9 @@ export async function startApi() {
     // Control plane routes
     await app.register(machineRoutes);
     await app.register(workroomRoutes);
+    await app.register(workspaceMembershipRoutes);
     await app.register(channelRoutes);
+    await app.register(friendRoutes);
     await app.register(messageRoutes);
     await app.register(memberRoutes);
     await app.register(agentRoutes);
@@ -90,13 +108,25 @@ export async function startApi() {
 await app.register(slockTaskRoutes);
     await app.register(actionRoutes, { credentialStore });
     await app.register(operatorWriteRoutes);
-    await app.register(operatorPairingRoutes);
-    await app.register(connectionRoutes);
+    await app.register(machineEnrollmentRoutes);
     await app.register(explanationRoutes);
     await app.register(eventRoutes);
     await app.register(artifactRoutes);
     await app.register(summaryRoutes);
     await app.register(controlSessionRoutes);
+    await app.register(agentApiRoutes);
+    await app.register(agentApiTasks);
+    await app.register(agentApiReminders);
+    await app.register(agentApiChannels);
+    await app.register(agentApiReactions);
+    await app.register(agentApiAttachments);
+    await app.register(userAttachments);
+    await app.register(agentApiPreparedActions);
+    await app.register(preparedActionOperatorRoutes);
+    await app.register(agentApiProfile);
+    await app.register(agentApiTyping);
+    await app.register(agentApiStatus);
+    await app.register(agentApiThreads);
 
     await app.listen({ port: config.port, host: config.host });
     console.log(`CodeLight Server listening on port ${config.port}`);

@@ -32,6 +32,7 @@ export interface SendMessageInput {
   senderId: string;
   content: string;
   mentions?: string[];
+  attachmentIds?: string[];
   embeddedCardType?: string | null;
   embeddedCardId?: string | null;
   clientIdempotencyKey?: string | null;
@@ -91,6 +92,7 @@ export async function sendMessageTransaction(input: SendMessageInput): Promise<S
     senderId,
     content,
     mentions = [],
+    attachmentIds,
     embeddedCardType = null,
     embeddedCardId = null,
     clientIdempotencyKey = null,
@@ -136,6 +138,7 @@ export async function sendMessageTransaction(input: SendMessageInput): Promise<S
           senderId,
           content,
           mentions,
+          ...(attachmentIds !== undefined ? { attachmentIds } : {}),
           embeddedCardType,
           embeddedCardId,
           clientIdempotencyKey,

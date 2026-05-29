@@ -32,15 +32,16 @@ describe('verifySignature', () => {
 });
 
 describe('createToken / verifyToken', () => {
-    it('should create and verify a token', () => {
-        const token = createToken('device-123', 'test-secret');
+    it('should create and verify a token (deviceId + userId)', () => {
+        const token = createToken('device-123', 'user-abc', 'test-secret');
         const payload = verifyToken(token, 'test-secret');
         expect(payload).not.toBeNull();
         expect(payload!.deviceId).toBe('device-123');
+        expect(payload!.userId).toBe('user-abc');
     });
 
     it('should reject a token with wrong secret', () => {
-        const token = createToken('device-123', 'test-secret');
+        const token = createToken('device-123', 'user-abc', 'test-secret');
         const payload = verifyToken(token, 'wrong-secret');
         expect(payload).toBeNull();
     });

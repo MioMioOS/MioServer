@@ -18,14 +18,15 @@ const ORG_ID = randomUUID();
 const AGENT_ID = randomUUID();
 const WORKROOM = randomUUID();
 const SESSION = randomUUID();
+const USER_ID = randomUUID();
 let ACTION_WITH_EVIDENCE = '';
 let ACTION_NO_EVIDENCE = '';
 
-const RAW_DEV = `dev_ctl_${randomUUID().replace(/-/g, '')}`;
+const RAW_USER = `user_sess_${randomUUID().replace(/-/g, '')}`;
 const hash = (raw: string) => createHash('sha256').update(raw).digest('hex');
 
 let app: FastifyInstance;
-const get = (url: string, token = RAW_DEV) =>
+const get = (url: string, token = RAW_USER) =>
   app.inject({ method: 'GET', url, headers: { authorization: `Bearer ${token}` } });
 
 async function seedAction(status: string): Promise<string> {
@@ -75,12 +76,17 @@ beforeAll(async () => {
     },
   });
 
-  await db.controlDevToken.create({ data: { tokenHash: hash(RAW_DEV), orgId: ORG_ID, workroomId: WORKROOM, scope: 'read_only', expiresAt: new Date(Date.now() + 3600_000) } });
+  // Slice 7: seed User + UserSession + UserWorkroomMembership for the read auth path
+  await db.user.create({ data: { id: USER_ID, email: `evf-${randomUUID()}@local.test`, passwordHash: '$2b$12$placeholder-not-actually-checked-by-read-path' } });
+  await db.userSession.create({ data: { id: randomUUID(), userId: USER_ID, tokenHash: hash(RAW_USER), expiresAt: new Date(Date.now() + 3600_000) } });
+  await db.userWorkroomMembership.create({ data: { id: randomUUID(), userId: USER_ID, workroomId: WORKROOM, role: 'owner' } });
 });
 
 afterAll(async () => {
   await db.controlActionReconciliation.deleteMany({ where: { actionId: { in: [ACTION_WITH_EVIDENCE, ACTION_NO_EVIDENCE] } } });
-  await db.controlDevToken.deleteMany({ where: { workroomId: WORKROOM } });
+  await db.userWorkroomMembership.deleteMany({ where: { userId: USER_ID } });
+  await db.userSession.deleteMany({ where: { userId: USER_ID } });
+  await db.user.deleteMany({ where: { id: USER_ID } });
   await db.controlAction.deleteMany({ where: { workroomId: WORKROOM } });
   await db.controlSession.deleteMany({ where: { workroomId: WORKROOM } });
   await db.controlWorkroom.deleteMany({ where: { id: WORKROOM } });

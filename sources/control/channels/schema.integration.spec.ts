@@ -72,7 +72,7 @@ describe('S1 Chunk 1 — schema + migration', () => {
     });
 
     it('can add a ControlChannelMember to the channel', async () => {
-        const memberId = `op_sess_${randomUUID()}`;
+        const memberId = `pairing:${randomUUID()}`;
         const member = await db.controlChannelMember.create({
             data: { channelId: CHANNEL_ID, memberId },
         });
@@ -81,7 +81,7 @@ describe('S1 Chunk 1 — schema + migration', () => {
     });
 
     it('UNIQUE(channelId, memberId) prevents duplicate member rows', async () => {
-        const memberId = `op_sess_${randomUUID()}`;
+        const memberId = `pairing:${randomUUID()}`;
         await db.controlChannelMember.create({ data: { channelId: CHANNEL_ID, memberId } });
         await expect(
             db.controlChannelMember.create({ data: { channelId: CHANNEL_ID, memberId } }),

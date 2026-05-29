@@ -99,19 +99,10 @@ beforeAll(async () => {
       displayName: 'opcmd-session',
     },
   });
-  // Create a stub ControlOperatorSession row (audit log references sessionId by UUID; FK not enforced)
-  await db.controlOperatorSession.create({
-    data: {
-      id: OP_SESS_ID,
-      tokenHash: `op-sess-hash-${randomUUID()}`,
-      orgId: ORG_ID,
-      workroomId: WORKROOM_ID,
-      allowedCommands: ['acknowledge_needs_human', 'mark_reviewed'],
-      operatorSubjectId: 'operator-subject-test-88',
-      issuedBy: 'test-runner',
-      expiresAt: new Date(Date.now() + 24 * 3600_000),
-    },
-  });
+  // Slice 7: ControlOperatorSession is GONE. The audit log's sessionId column has no FK,
+  // so we just pass OP_SESS_ID through the synthetic VerifiedOperatorSession below — no
+  // backing row needed. Kept as a per-request UUID for audit attribution, mirroring
+  // operatorWriteRoutes.ts which synthesises a fresh UUID per call.
 });
 
 afterAll(async () => {
@@ -121,7 +112,7 @@ afterAll(async () => {
   // Actions seeded in WORKROOM_ID_OTHER also need cleanup
   await db.controlAction.deleteMany({ where: { workroomId: { in: [WORKROOM_ID, WORKROOM_ID_OTHER] } } });
   await db.controlSession.deleteMany({ where: { workroomId: WORKROOM_ID } });
-  await db.controlOperatorSession.deleteMany({ where: { workroomId: WORKROOM_ID } });
+  // ControlOperatorSession is gone in Slice 7 — no cleanup needed.
   await db.controlWorkroom.deleteMany({ where: { id: { in: [WORKROOM_ID, WORKROOM_ID_OTHER] } } });
   await db.controlAgent.deleteMany({ where: { id: AGENT_ID } });
   await db.controlMachine.deleteMany({ where: { id: MACHINE_ID } });

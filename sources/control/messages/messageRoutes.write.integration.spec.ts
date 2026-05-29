@@ -1,20 +1,16 @@
 /**
- * S1 Chunk 4 — Message WRITE endpoint (REAL Postgres integration).
+ * Message WRITE endpoint — Slice 7 B2-d (user_sess_ / machine unification).
  *
  * Covers POST /api/v1/workrooms/:wid/channels/:cid/messages:
- *   - op_sess_ send: OK (201)
+ *   - user-owner send: OK (201)
  *   - machine send: OK (201)
- *   - dev_ctl_ → 403 hard reject
+ *   - user non-member → 403
  *   - private non-member → 403
- *   - idempotent replay returns same message (idempotent:true)
- *   - op_sess_ missing client_idempotency_key → 400
+ *   - idempotent replay (user) returns same message (idempotent:true)
+ *   - user missing client_idempotency_key → 400
  *   - machine omit key: two sends → two distinct messages (no collision)
  *   - event message.created published write-before-broadcast (event row exists post-send)
  *   - preview is redacted + truncated to ≤120 chars
- *
- * Also covers:
- *   - V1_OPERATOR_COMMANDS includes 'send_message' (minting op_sess_ with it does not fail-closed)
- *   - operator command chain: mintOperatorSession with send_message succeeds
  *
  * Run: npm run test:db:setup && npm run test:integration
  */
@@ -24,22 +20,21 @@ import fastify, { type FastifyInstance } from 'fastify';
 import { createHash, randomUUID } from 'crypto';
 import { db } from '@/storage/db';
 import { messageRoutes } from './messageRoutes';
-import { mintOperatorSession, V1_OPERATOR_COMMANDS } from '@/control/operatorSessions/operatorSessionMint';
+import { hashPassword } from '@/auth/userSession/passwordHash';
+import { mintUserSessionToken, hashUserSessionToken } from '@/auth/userSession/tokenMint';
 
 // ── Fixture IDs ───────────────────────────────────────────────────────────────
 
 const ORG_ID = randomUUID();
 const WORKROOM_ID = randomUUID();
 const MACHINE_ID = randomUUID();
-// Real production-style pairing subject: 'pairing:<uuid>' (NOT a bare UUID).
-// This is what operatorSubjectId looks like after a phone pairing (operatorPairingRoutes.ts:145,160).
-const OPERATOR_SUBJECT_ID = `pairing:${randomUUID()}`;
 
-// Raw tokens (set in beforeAll after DB rows are created)
 const MACHINE_RAW_TOKEN = `machine_${randomUUID().replace(/-/g, '')}`;
-const DEV_CTL_RAW_TOKEN = `dev_ctl_${randomUUID().replace(/-/g, '')}`;
 
-let OP_SESS_RAW_TOKEN = '';
+let OWNER_USER_ID = '';
+let OWNER_USER_TOKEN = '';
+let NON_MEMBER_USER_ID = '';
+let NON_MEMBER_USER_TOKEN = '';
 let PUBLIC_CHANNEL_ID = '';
 let PRIVATE_CHANNEL_ID = '';
 let APP: FastifyInstance;
@@ -48,22 +43,14 @@ const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function opSessHeader() {
-  return { authorization: `Bearer ${OP_SESS_RAW_TOKEN}` };
-}
-
-function machineHeader() {
-  return { authorization: `Bearer ${MACHINE_RAW_TOKEN}` };
-}
-
-function devCtlHeader() {
-  return { authorization: `Bearer ${DEV_CTL_RAW_TOKEN}` };
-}
+const ownerUserHeader = () => ({ authorization: `Bearer ${OWNER_USER_TOKEN}` });
+const nonMemberUserHeader = () => ({ authorization: `Bearer ${NON_MEMBER_USER_TOKEN}` });
+const machineHeader = () => ({ authorization: `Bearer ${MACHINE_RAW_TOKEN}` });
 
 function post(
   url: string,
   body: Record<string, unknown>,
-  headers: Record<string, string> = opSessHeader(),
+  headers: Record<string, string> = ownerUserHeader(),
 ) {
   return APP.inject({
     method: 'POST',
@@ -80,7 +67,6 @@ beforeAll(async () => {
   await APP.register(messageRoutes);
   await APP.ready();
 
-  // Org, machine, dev token, workroom
   await db.controlOrg.create({
     data: { id: ORG_ID, name: 'WriteMsgSpec Org', slug: `write-msg-${randomUUID()}`, ownerUserId: randomUUID() },
   });
@@ -94,22 +80,10 @@ beforeAll(async () => {
       arch: 'arm64',
     },
   });
-  // Dev token stored directly so we can send it in tests (not a valid op/machine token).
-  await db.controlDevToken.create({
-    data: {
-      id: randomUUID(),
-      orgId: ORG_ID,
-      workroomId: WORKROOM_ID,
-      tokenHash: sha256(DEV_CTL_RAW_TOKEN),
-      scope: 'read_only',
-      expiresAt: new Date(Date.now() + 24 * 3600_000),
-    },
-  });
   await db.controlWorkroom.create({
     data: { id: WORKROOM_ID, orgId: ORG_ID, name: 'WriteMsgSpec WR', createdBy: randomUUID() },
   });
 
-  // Channels
   const pubCh = await db.controlChannel.create({
     data: { workroomId: WORKROOM_ID, name: 'general', type: 'main', visibility: 'public', createdBy: 'system' },
   });
@@ -120,66 +94,53 @@ beforeAll(async () => {
   });
   PRIVATE_CHANNEL_ID = privCh.id;
 
-  // Mint an op_sess_ that includes send_message (via mintOperatorSession).
-  // OPERATOR_SUBJECT_ID is 'pairing:<uuid>' — the real production pairing subject format.
-  // This proves the op_sess_ send path works with a non-UUID senderId (C1 fix).
-  const minted = await mintOperatorSession({
-    orgId: ORG_ID,
-    workroomId: WORKROOM_ID,
-    operatorSubjectId: OPERATOR_SUBJECT_ID,
-    issuedBy: 'test',
-    allowedCommands: [...V1_OPERATOR_COMMANDS],
+  // user_sess_ fixtures: an OWNER (writes pass) + a NON-MEMBER (writes 403).
+  const owner = await db.user.create({
+    data: { email: `write-msg-owner-${randomUUID()}@example.test`, passwordHash: await hashPassword('p') },
   });
-  OP_SESS_RAW_TOKEN = minted.rawToken;
+  OWNER_USER_ID = owner.id;
+  OWNER_USER_TOKEN = mintUserSessionToken();
+  await db.userSession.create({
+    data: { userId: OWNER_USER_ID, tokenHash: hashUserSessionToken(OWNER_USER_TOKEN), expiresAt: new Date(Date.now() + 86_400_000) },
+  });
+  await db.userWorkroomMembership.create({
+    data: { userId: OWNER_USER_ID, workroomId: WORKROOM_ID, role: 'owner' },
+  });
+
+  const nm = await db.user.create({
+    data: { email: `write-msg-nm-${randomUUID()}@example.test`, passwordHash: await hashPassword('p') },
+  });
+  NON_MEMBER_USER_ID = nm.id;
+  NON_MEMBER_USER_TOKEN = mintUserSessionToken();
+  await db.userSession.create({
+    data: { userId: NON_MEMBER_USER_ID, tokenHash: hashUserSessionToken(NON_MEMBER_USER_TOKEN), expiresAt: new Date(Date.now() + 86_400_000) },
+  });
 });
 
 afterAll(async () => {
-  // FK-safe delete order.
   await db.controlEventLog.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlMessage.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlChannelMember.deleteMany({ where: { channel: { workroomId: WORKROOM_ID } } });
   await db.controlChannel.deleteMany({ where: { workroomId: WORKROOM_ID } });
-  await db.controlOperatorSession.deleteMany({ where: { workroomId: WORKROOM_ID } });
+  await db.userWorkroomMembership.deleteMany({ where: { userId: { in: [OWNER_USER_ID, NON_MEMBER_USER_ID] } } });
+  await db.userSession.deleteMany({ where: { userId: { in: [OWNER_USER_ID, NON_MEMBER_USER_ID] } } });
+  await db.user.deleteMany({ where: { id: { in: [OWNER_USER_ID, NON_MEMBER_USER_ID] } } });
   await db.controlWorkroom.deleteMany({ where: { id: WORKROOM_ID } });
-  await db.controlDevToken.deleteMany({ where: { orgId: ORG_ID } });
   await db.controlMachine.deleteMany({ where: { id: MACHINE_ID } });
   await db.controlOrg.deleteMany({ where: { id: ORG_ID } });
   await APP.close();
   await db.$disconnect();
 });
 
-// ── Operator command chain: send_message in V1_OPERATOR_COMMANDS ──────────────
-
-describe('V1_OPERATOR_COMMANDS includes send_message', () => {
-  it('V1_OPERATOR_COMMANDS array contains send_message', () => {
-    expect(V1_OPERATOR_COMMANDS).toContain('send_message');
-  });
-
-  it('mintOperatorSession with send_message does not fail-closed', async () => {
-    // If send_message were NOT in V1_OPERATOR_COMMANDS, this would throw OperatorSessionMintError.
-    const result = await mintOperatorSession({
-      orgId: ORG_ID,
-      workroomId: WORKROOM_ID,
-      operatorSubjectId: randomUUID(),
-      issuedBy: 'test:chain-verify',
-      allowedCommands: ['send_message'],
-    });
-    expect(result.rawToken).toMatch(/^op_sess_/);
-    expect(result.allowedCommands).toContain('send_message');
-    // cleanup
-    await db.controlOperatorSession.deleteMany({ where: { id: result.id } });
-  });
-});
-
 // ── POST /api/v1/workrooms/:wid/channels/:cid/messages ────────────────────────
 
-describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
-  it('op_sess_ send: returns 201 with id, seq, created_at, idempotent:false', async () => {
+describe('POST /api/v1/workrooms/:wid/channels/:cid/messages (Slice 7 B2-d)', () => {
+  it('user-owner send: returns 201 with id, seq, created_at, idempotent:false', async () => {
     const key = randomUUID();
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages`,
-      { content: 'Hello from operator', client_idempotency_key: key },
-      opSessHeader(),
+      { content: 'Hello from user-owner', client_idempotency_key: key },
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(201);
     const body = JSON.parse(res.body);
@@ -189,15 +150,12 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(body.idempotent).toBe(false);
   });
 
-  // ── S2 Task 2.3 (C): POST returns the FULL message wire shape (not the thin
-  // {id,seq,created_at,idempotent}). iOS LiveMessageRepository.send decodes the
-  // full MessageDTO; a thin response would throw a DecodingError.
-  it('op_sess_ send: 201 returns the FULL message wire shape', async () => {
+  it('user-owner send: 201 returns the FULL message wire shape', async () => {
     const key = randomUUID();
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages`,
-      { content: 'Full shape from operator', client_idempotency_key: key },
-      opSessHeader(),
+      { content: 'Full shape from user', client_idempotency_key: key },
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(201);
     const body = JSON.parse(res.body);
@@ -205,10 +163,9 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(body).toHaveProperty('seq');
     expect(body).toHaveProperty('created_at');
     expect(body.idempotent).toBe(false);
-    // Full wire shape fields:
     expect(body.sender_kind).toBe('user');
-    expect(body.sender_id).toBe(OPERATOR_SUBJECT_ID);
-    expect(body.content).toBe('Full shape from operator');
+    expect(body.sender_id).toBe(OWNER_USER_ID);
+    expect(body.content).toBe('Full shape from user');
     expect(body).toHaveProperty('sender_display_name');
     expect(body).toHaveProperty('mentions');
     expect(body).toHaveProperty('embedded_card_type');
@@ -242,7 +199,6 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(body).toHaveProperty('id');
     expect(body).toHaveProperty('seq');
     expect(body.idempotent).toBe(false);
-    // Full wire shape fields:
     expect(body.sender_kind).toBe('agent');
     expect(body.sender_id).toBe(MACHINE_ID);
     expect(body.content).toBe('Full shape from machine');
@@ -252,20 +208,21 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(body.parent_message_id).toBeNull();
   });
 
-  it('dev_ctl_ → 403 hard reject', async () => {
+  it('user non-member → 403', async () => {
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages`,
       { content: 'Should be denied', client_idempotency_key: randomUUID() },
-      devCtlHeader(),
+      nonMemberUserHeader(),
     );
     expect(res.statusCode).toBe(403);
   });
 
   it('private channel non-member → 403', async () => {
+    // The user IS a workroom owner but is not an explicit member of the private channel.
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${PRIVATE_CHANNEL_ID}/messages`,
       { content: 'Should be denied', client_idempotency_key: randomUUID() },
-      opSessHeader(),
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(403);
     expect(JSON.parse(res.body).error.code).toBe('FORBIDDEN');
@@ -276,28 +233,25 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     const body = { content: 'Idempotent message', client_idempotency_key: key };
     const url = `/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages`;
 
-    // First send
-    const res1 = await post(url, body, opSessHeader());
+    const res1 = await post(url, body, ownerUserHeader());
     expect(res1.statusCode).toBe(201);
     const b1 = JSON.parse(res1.body);
     expect(b1.idempotent).toBe(false);
 
-    // Second send with same key
-    const res2 = await post(url, body, opSessHeader());
+    const res2 = await post(url, body, ownerUserHeader());
     expect(res2.statusCode).toBe(201);
     const b2 = JSON.parse(res2.body);
     expect(b2.idempotent).toBe(true);
 
-    // Same message id and seq
     expect(b2.id).toBe(b1.id);
     expect(b2.seq).toBe(b1.seq);
   });
 
-  it('op_sess_ missing client_idempotency_key → 400', async () => {
+  it('user missing client_idempotency_key → 400', async () => {
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages`,
       { content: 'No key provided' },
-      opSessHeader(),
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error.code).toBe('MISSING_IDEMPOTENCY_KEY');
@@ -316,7 +270,6 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     const b1 = JSON.parse(res1.body);
     const b2 = JSON.parse(res2.body);
 
-    // Two distinct messages (different IDs and different seqs)
     expect(b1.id).not.toBe(b2.id);
     expect(b1.seq).not.toBe(b2.seq);
   });
@@ -328,13 +281,11 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages`,
       { content, client_idempotency_key: key },
-      opSessHeader(),
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(201);
     const msgBody = JSON.parse(res.body);
 
-    // Event must exist in the DB after the send (write-before-broadcast guarantee).
-    // The event topic is 'message.created' and payload contains the message_id.
     const event = await db.controlEventLog.findFirst({
       where: {
         workroomId: WORKROOM_ID,
@@ -348,13 +299,14 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(payload.channel_id).toBe(PUBLIC_CHANNEL_ID);
     expect(payload.seq).toBe(msgBody.seq);
     expect(payload.sender_kind).toBe('user');
-    expect(payload.sender_id).toBe(OPERATOR_SUBJECT_ID);
-    // preview: redacted + truncated to ≤120
+    expect(payload.sender_id).toBe(OWNER_USER_ID);
     expect(typeof payload.preview).toBe('string');
     expect((payload.preview as string).length).toBeLessThanOrEqual(120);
   });
 
   it('preview in event payload is redacted (token shapes replaced with [REDACTED])', async () => {
+    // Use a token shape known to redactControlText. op_sess_ remains in the redactor's
+    // pattern list (legacy shape — defense in depth even after Slice 7 dropped the token).
     const sensitiveToken = 'op_sess_SECRETTOKEN123';
     const content = `Message with secret: ${sensitiveToken}`;
     const key = randomUUID();
@@ -362,7 +314,7 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages`,
       { content, client_idempotency_key: key },
-      opSessHeader(),
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(201);
     const msgBody = JSON.parse(res.body);
@@ -374,7 +326,6 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(event).not.toBeNull();
     const payload = event!.payloadJson as Record<string, unknown>;
     expect(payload.message_id).toBe(msgBody.id);
-    // The raw op_sess_ token should be redacted in the preview
     expect(payload.preview as string).not.toContain(sensitiveToken);
     expect(payload.preview as string).toContain('[REDACTED]');
   });
@@ -386,7 +337,7 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages`,
       { content: longContent, client_idempotency_key: key },
-      opSessHeader(),
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(201);
     const msgBody = JSON.parse(res.body);
@@ -415,25 +366,30 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     await db.controlWorkroom.create({
       data: { id: otherWrId, orgId: ORG_ID, name: 'Other WR', createdBy: randomUUID() },
     });
+    // The user must be an owner of the OTHER workroom for the write-auth to pass; otherwise
+    // the route fails at auth (403) before reaching the channel-scope 404. Mirror this.
+    await db.userWorkroomMembership.create({
+      data: { userId: OWNER_USER_ID, workroomId: otherWrId, role: 'owner' },
+    });
     const otherCh = await db.controlChannel.create({
       data: { workroomId: otherWrId, name: 'other-ch', type: 'main', visibility: 'public', createdBy: 'system' },
     });
 
+    // cid belongs to otherWrId, posting to WORKROOM_ID/.../otherCh → channel not in workroom (404).
     const res = await post(
-      // cid belongs to otherWrId, not WORKROOM_ID
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${otherCh.id}/messages`,
       { content: 'Wrong workroom', client_idempotency_key: randomUUID() },
-      opSessHeader(),
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(404);
 
     // cleanup
     await db.controlChannel.deleteMany({ where: { id: otherCh.id } });
+    await db.userWorkroomMembership.deleteMany({ where: { userId: OWNER_USER_ID, workroomId: otherWrId } });
     await db.controlWorkroom.deleteMany({ where: { id: otherWrId } });
   });
 
   it('seq increments monotonically across sends', async () => {
-    // Seed a fresh channel to get clean seq numbers
     const ch = await db.controlChannel.create({
       data: { workroomId: WORKROOM_ID, name: 'seq-mono-test', type: 'standard', visibility: 'public', createdBy: 'system' },
     });
@@ -441,17 +397,17 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     const res1 = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${ch.id}/messages`,
       { content: 'seq1', client_idempotency_key: randomUUID() },
-      opSessHeader(),
+      ownerUserHeader(),
     );
     const res2 = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${ch.id}/messages`,
       { content: 'seq2', client_idempotency_key: randomUUID() },
-      opSessHeader(),
+      ownerUserHeader(),
     );
     const res3 = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${ch.id}/messages`,
       { content: 'seq3', client_idempotency_key: randomUUID() },
-      opSessHeader(),
+      ownerUserHeader(),
     );
 
     expect(res1.statusCode).toBe(201);
@@ -465,42 +421,14 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(s1).toBeLessThan(s2);
     expect(s2).toBeLessThan(s3);
 
-    // cleanup
     await db.controlMessage.deleteMany({ where: { channelId: ch.id } });
     await db.controlChannel.deleteMany({ where: { id: ch.id } });
-  });
-
-  it('op_sess_ with pairing: subject succeeds and stores the pairing senderId verbatim (C1)', async () => {
-    // Prove that the real production op_sess_ subject ('pairing:<uuid>') can be stored in
-    // control_messages.sender_id (TEXT column after C1 fix).  Previously this would fail
-    // with a Postgres "invalid input syntax for type uuid" error because the column was UUID.
-    const key = randomUUID();
-    const res = await post(
-      `/api/v1/workrooms/${WORKROOM_ID}/channels/${PUBLIC_CHANNEL_ID}/messages`,
-      { content: 'Message from pairing-subject operator', client_idempotency_key: key },
-      opSessHeader(), // OP_SESS_RAW_TOKEN was minted with OPERATOR_SUBJECT_ID = 'pairing:<uuid>'
-    );
-    expect(res.statusCode).toBe(201);
-
-    const body = JSON.parse(res.body);
-    expect(body).toHaveProperty('id');
-    expect(body.idempotent).toBe(false);
-
-    // Verify the stored senderId is exactly the pairing: string (not truncated, not coerced).
-    const stored = await db.controlMessage.findUnique({
-      where: { id: body.id },
-      select: { senderId: true },
-    });
-    expect(stored).not.toBeNull();
-    expect(stored!.senderId).toBe(OPERATOR_SUBJECT_ID);  // must equal 'pairing:<uuid>'
-    expect(stored!.senderId).toMatch(/^pairing:/);        // explicit format check
   });
 
   it('lastActivityAt on channel advances after a send (I2)', async () => {
     const ch = await db.controlChannel.create({
       data: { workroomId: WORKROOM_ID, name: 'last-activity-test', type: 'standard', visibility: 'public', createdBy: 'system' },
     });
-    // lastActivityAt is null before any message.
     const before = await db.controlChannel.findUnique({ where: { id: ch.id }, select: { lastActivityAt: true } });
     expect(before!.lastActivityAt).toBeNull();
 
@@ -508,21 +436,19 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     const res = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${ch.id}/messages`,
       { content: 'bump last_activity_at', client_idempotency_key: randomUUID() },
-      opSessHeader(),
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(201);
 
     const after = await db.controlChannel.findUnique({ where: { id: ch.id }, select: { lastActivityAt: true } });
     expect(after!.lastActivityAt).not.toBeNull();
-    // lastActivityAt must be >= the time we started the send.
     expect(after!.lastActivityAt!.getTime()).toBeGreaterThanOrEqual(t0.getTime());
 
-    // A second send must push lastActivityAt forward (or equal — if timestamps land in the same ms).
     const lastBefore2nd = after!.lastActivityAt!;
     const res2 = await post(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${ch.id}/messages`,
       { content: 'bump again', client_idempotency_key: randomUUID() },
-      opSessHeader(),
+      ownerUserHeader(),
     );
     expect(res2.statusCode).toBe(201);
 
@@ -530,7 +456,6 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/messages', () => {
     expect(after2!.lastActivityAt).not.toBeNull();
     expect(after2!.lastActivityAt!.getTime()).toBeGreaterThanOrEqual(lastBefore2nd.getTime());
 
-    // cleanup
     await db.controlMessage.deleteMany({ where: { channelId: ch.id } });
     await db.controlChannel.deleteMany({ where: { id: ch.id } });
   });

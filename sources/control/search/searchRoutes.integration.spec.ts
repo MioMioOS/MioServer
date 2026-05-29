@@ -8,7 +8,9 @@
  *   - blank / missing q → empty result set, no DB work
  *   - visibility: a message in a channel the caller cannot see is excluded
  *   - scope=MY_MESSAGES (machine) filters to senderId = machine.id
- *   - dev-token allowlist accepts the search path (and rejects POST)
+ *   - Slice 7: user_sess_ (workroom member) → 200; user_sess_ (non-member) → 401 (uniform)
+ *
+ * Slice 7 note: the legacy `dev_ctl_` path is GONE. Auth is now userOrMachine.
  *
  * Run: npm run test:db:setup && npm run test:integration
  */
@@ -18,7 +20,8 @@ import fastify, { type FastifyInstance } from 'fastify';
 import { createHash, randomUUID } from 'crypto';
 import { db } from '@/storage/db';
 import { searchRoutes } from './searchRoutes';
-import { isDevTokenAllowedPath } from '@/control/devTokens/devTokenAuth';
+import { hashPassword } from '@/auth/userSession/passwordHash';
+import { mintUserSessionToken, hashUserSessionToken } from '@/auth/userSession/tokenMint';
 
 // ── Fixture IDs ─────────────────────────────────────────────────────────────
 const ORG_ID = randomUUID();
@@ -27,7 +30,11 @@ const MACHINE_ID = randomUUID();          // caller (machine token)
 const OTHER_SENDER_ID = randomUUID();     // a different message sender
 const AGENT_ID = randomUUID();            // searchable member
 const MACHINE_RAW_TOKEN = `machine_${randomUUID().replace(/-/g, '')}`;
-const DEV_RAW_TOKEN = `dev_ctl_${randomUUID().replace(/-/g, '')}`;
+
+let MEMBER_USER_ID = '';
+let MEMBER_USER_TOKEN = '';
+let NON_MEMBER_USER_TOKEN = '';
+let NON_MEMBER_USER_ID = '';
 
 let PUBLIC_CHANNEL_ID = '';
 let PRIVATE_CHANNEL_ID = '';
@@ -108,9 +115,32 @@ beforeAll(async () => {
 
   // Private-channel message that contains the query term — must be excluded for non-members.
   await seedMessage({ channelId: PRIVATE_CHANNEL_ID, seq: 1, senderId: OTHER_SENDER_ID, content: 'secret penguin plans' });
+
+  // Slice 7 user fixtures.
+  const memberUser = await db.user.create({
+    data: { email: `s-mem-${randomUUID()}@example.test`, passwordHash: await hashPassword('p') },
+  });
+  MEMBER_USER_ID = memberUser.id;
+  MEMBER_USER_TOKEN = mintUserSessionToken();
+  await db.userSession.create({
+    data: { userId: MEMBER_USER_ID, tokenHash: hashUserSessionToken(MEMBER_USER_TOKEN), expiresAt: new Date(Date.now() + 86_400_000) },
+  });
+  await db.userWorkroomMembership.create({
+    data: { userId: MEMBER_USER_ID, workroomId: WORKROOM_ID, role: 'owner' },
+  });
+
+  const nonMemberUser = await db.user.create({
+    data: { email: `s-nm-${randomUUID()}@example.test`, passwordHash: await hashPassword('p') },
+  });
+  NON_MEMBER_USER_ID = nonMemberUser.id;
+  NON_MEMBER_USER_TOKEN = mintUserSessionToken();
+  await db.userSession.create({
+    data: { userId: NON_MEMBER_USER_ID, tokenHash: hashUserSessionToken(NON_MEMBER_USER_TOKEN), expiresAt: new Date(Date.now() + 86_400_000) },
+  });
 });
 
 afterAll(async () => {
+  await db.user.deleteMany({ where: { id: { in: [MEMBER_USER_ID, NON_MEMBER_USER_ID] } } });
   await db.controlMessage.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlChannelMember.deleteMany({ where: { channel: { workroomId: WORKROOM_ID } } });
   await db.controlChannel.deleteMany({ where: { workroomId: WORKROOM_ID } });
@@ -189,37 +219,26 @@ describe('GET /api/v1/workrooms/:wid/search', () => {
     const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/search?q=penguin`, {});
     expect(res.statusCode).toBe(401);
   });
-});
 
-describe('dev-token allowlist for search', () => {
-  it('GET /search is allowlisted; POST /search is not', () => {
-    expect(isDevTokenAllowedPath('GET', `/api/v1/workrooms/${WORKROOM_ID}/search`)).toBe(true);
-    expect(isDevTokenAllowedPath('GET', `/api/v1/workrooms/${WORKROOM_ID}/search?q=x&scope=ALL`)).toBe(true);
-    expect(isDevTokenAllowedPath('POST', `/api/v1/workrooms/${WORKROOM_ID}/search`)).toBe(false);
-  });
-
-  it('a dev_ctl_ token can reach search end-to-end (read-only)', async () => {
-    // Mint a workroom-scoped read-only dev token, then call search with it through the full
-    // authorizeControlRead path (allowlist + workroom-scope + dev mode).
-    await db.controlDevToken.create({
-      data: {
-        tokenHash: sha256(DEV_RAW_TOKEN),
-        orgId: ORG_ID,
-        workroomId: WORKROOM_ID,
-        scope: 'read_only',
-        expiresAt: new Date(Date.now() + 3600_000),
-      },
-    });
-
+  // ── Slice 7 B2-a: userOrMachine ──
+  it('user_sess_ (workroom member) → 200 with the same result set', async () => {
     const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/search?q=penguin&scope=ALL`, {
-      authorization: `Bearer ${DEV_RAW_TOKEN}`,
+      authorization: `Bearer ${MEMBER_USER_TOKEN}`,
     });
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
-    // Dev token has no member identity, so visibility uses devToken.id → public channel visible.
+    // Public channel + agent still match. Private channel still hidden (user is not in
+    // ControlChannelMember for it, just like the machine).
     expect(body.channels.map((c: { id: string }) => c.id)).toContain(PUBLIC_CHANNEL_ID);
+    expect(body.channels.map((c: { id: string }) => c.id)).not.toContain(PRIVATE_CHANNEL_ID);
     expect(body.members.map((m: { id: string }) => m.id)).toContain(AGENT_ID);
+  });
 
-    await db.controlDevToken.deleteMany({ where: { tokenHash: sha256(DEV_RAW_TOKEN) } });
+  it('user_sess_ (NOT a workroom member) → 401 (uniform; anti-enumeration)', async () => {
+    const res = await get(`/api/v1/workrooms/${WORKROOM_ID}/search?q=penguin`, {
+      authorization: `Bearer ${NON_MEMBER_USER_TOKEN}`,
+    });
+    // resolveActor returns null on membership miss → searchRoutes maps to 401 (uniform).
+    expect(res.statusCode).toBe(401);
   });
 });

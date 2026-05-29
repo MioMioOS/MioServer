@@ -22,6 +22,13 @@ if (!process.env.DATABASE_URL) {
     process.env.DATABASE_URL = DEFAULT_TEST_DB_URL;
 }
 
+// Slice 7 A5: integration tests for /v1/auth need a non-empty JWT signing key
+// (jwt.sign throws on empty-string secrets). Default only when unset so any
+// explicit MASTER_SECRET from the runner environment still wins.
+if (!process.env.MASTER_SECRET) {
+    process.env.MASTER_SECRET = 'integration-test-master-secret';
+}
+
 const url = process.env.DATABASE_URL;
 
 function dbNameFromUrl(u: string): string {

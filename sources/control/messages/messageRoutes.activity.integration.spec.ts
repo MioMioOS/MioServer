@@ -1,5 +1,5 @@
 /**
- * S5 Activity feed — control plane (REAL Postgres integration).
+ * S5 Activity feed — Slice 7 B2-d (user_sess_ / machine unification).
  *
  * Covers:
  *   GET  /api/v1/workrooms/:wid/activity?filter=all|unread|mentions
@@ -8,12 +8,16 @@
  *        → upsert ControlActivityState; { ok: true }
  *
  * Auth:
- *   GET  /activity         → authorizeControlRead (machine OR dev_ctl_; dev allowlisted).
- *   POST /activity/.../handled → op_sess_('mark_reviewed') OR machine; dev_ctl_ → 403.
+ *   GET  /activity         → userOrMachine (user member OR machine org-scoped).
+ *   POST /activity/.../handled → user_sess_ (workroom OWNER) OR machine.
  *
- * Caller key (subject) for the mention match + handled join:
- *   machine → machine.id (and the machine's ControlAgent.id if one exists — both queried).
- *   dev_ctl_ → NO subject → debug view: messages with ANY non-empty mentions (disclosed).
+ * Caller keys for the mention match + handled join:
+ *   user actor    → [user.id]                                         (vacuous unless messages mention user.id)
+ *   machine actor → [machine.id, ...machine's ControlAgent.id]
+ *
+ * Privacy fix (vs. pre-Slice-7):
+ *   The previous "dev_ctl_ → debug ANY non-empty mentions" branch is GONE. Activity always
+ *   scopes by the actor's caller keys (never anonymous-broad).
  *
  * Behaviour verified here:
  *   - a mention to the caller appears in the activity list (machine subject)
@@ -23,9 +27,9 @@
  *   - unread filter hides handled items; all/mentions show them
  *   - POST handled then unread excludes it (and a 2nd POST is an idempotent upsert)
  *   - POST handled=false flips it back (unread shows it again)
- *   - dev_ctl_ → 403 on POST handled
+ *   - user non-member → 403 on POST handled
  *   - POST handled on a message not in :wid → 404
- *   - dev_ctl_ GET returns any-mention debug view
+ *   - user mention surfaces in the user-actor activity feed
  *   - GET /activity with no auth → 401
  *   - id shape is "act_" + messageId
  *
@@ -37,7 +41,8 @@ import fastify, { type FastifyInstance } from 'fastify';
 import { createHash, randomUUID } from 'crypto';
 import { db } from '@/storage/db';
 import { messageRoutes } from './messageRoutes';
-import { mintOperatorSession, V1_OPERATOR_COMMANDS } from '@/control/operatorSessions/operatorSessionMint';
+import { hashPassword } from '@/auth/userSession/passwordHash';
+import { mintUserSessionToken, hashUserSessionToken } from '@/auth/userSession/tokenMint';
 
 // ── Fixture IDs ───────────────────────────────────────────────────────────────
 
@@ -45,26 +50,28 @@ const ORG_ID = randomUUID();
 const WORKROOM_ID = randomUUID();
 const MACHINE_ID = randomUUID();
 const AGENT_ID = randomUUID(); // ControlAgent for the machine (machineId = MACHINE_ID)
-const OTHER_SUBJECT = randomUUID(); // a different caller's id (mentions to them must NOT show for the machine); mentions is uuid[]
-const OPERATOR_SUBJECT_ID = `pairing:${randomUUID()}`;
+const OTHER_SUBJECT = randomUUID();
 
 const MACHINE_RAW_TOKEN = `machine_${randomUUID().replace(/-/g, '')}`;
-const DEV_CTL_RAW_TOKEN = `dev_ctl_${randomUUID().replace(/-/g, '')}`;
 
-let OP_SESS_RAW_TOKEN = '';
+let OWNER_USER_ID = '';
+let OWNER_USER_TOKEN = '';
+let NON_MEMBER_USER_ID = '';
+let NON_MEMBER_USER_TOKEN = '';
 let CHANNEL_ID = '';
-let MSG_MENTION_MACHINE = ''; // mentions MACHINE_ID
-let MSG_MENTION_AGENT = '';   // mentions AGENT_ID (the machine's agent)
-let MSG_NO_MENTION = '';      // mentions OTHER_SUBJECT only → excluded for the machine
-let MSG_REPLY_MENTION = '';   // mentions MACHINE_ID but is a reply (parentMessageId set) → excluded
+let MSG_MENTION_MACHINE = '';
+let MSG_MENTION_AGENT = '';
+let MSG_NO_MENTION = '';
+let MSG_REPLY_MENTION = '';
 let APP: FastifyInstance;
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+const ownerUserHeader = () => ({ authorization: `Bearer ${OWNER_USER_TOKEN}` });
+const nonMemberUserHeader = () => ({ authorization: `Bearer ${NON_MEMBER_USER_TOKEN}` });
 const machineHeader = () => ({ authorization: `Bearer ${MACHINE_RAW_TOKEN}` });
-const devCtlHeader = () => ({ authorization: `Bearer ${DEV_CTL_RAW_TOKEN}` });
 
 function injectGet(url: string, headers: Record<string, string>) {
   return APP.inject({ method: 'GET', url, headers });
@@ -89,8 +96,8 @@ async function seedMessage(opts: {
       workroomId: WORKROOM_ID,
       channelId: CHANNEL_ID,
       seq: BigInt(seq++),
-      senderKind: 'user',
-      senderId: OPERATOR_SUBJECT_ID,
+      senderKind: 'system',
+      senderId: randomUUID(),
       content: 'activity seed',
       mentions: opts.mentions,
       parentMessageId: opts.parentMessageId ?? null,
@@ -123,7 +130,6 @@ beforeAll(async () => {
       arch: 'arm64',
     },
   });
-  // ControlAgent bound to this machine → the activity route must ALSO match mentions to AGENT_ID.
   await db.controlAgent.create({
     data: {
       id: AGENT_ID,
@@ -132,16 +138,6 @@ beforeAll(async () => {
       displayName: 'Agent For Machine',
       role: 'engineer',
       machineId: MACHINE_ID,
-    },
-  });
-  await db.controlDevToken.create({
-    data: {
-      id: randomUUID(),
-      orgId: ORG_ID,
-      workroomId: WORKROOM_ID,
-      tokenHash: sha256(DEV_CTL_RAW_TOKEN),
-      scope: 'read_only',
-      expiresAt: new Date(Date.now() + 24 * 3600_000),
     },
   });
   await db.controlWorkroom.create({
@@ -153,30 +149,47 @@ beforeAll(async () => {
   });
   CHANNEL_ID = ch.id;
 
+  // user_sess_ fixtures.
+  const owner = await db.user.create({
+    data: { email: `activity-owner-${randomUUID()}@example.test`, passwordHash: await hashPassword('p') },
+  });
+  OWNER_USER_ID = owner.id;
+  OWNER_USER_TOKEN = mintUserSessionToken();
+  await db.userSession.create({
+    data: { userId: OWNER_USER_ID, tokenHash: hashUserSessionToken(OWNER_USER_TOKEN), expiresAt: new Date(Date.now() + 86_400_000) },
+  });
+  await db.userWorkroomMembership.create({
+    data: { userId: OWNER_USER_ID, workroomId: WORKROOM_ID, role: 'owner' },
+  });
+
+  const nm = await db.user.create({
+    data: { email: `activity-nm-${randomUUID()}@example.test`, passwordHash: await hashPassword('p') },
+  });
+  NON_MEMBER_USER_ID = nm.id;
+  NON_MEMBER_USER_TOKEN = mintUserSessionToken();
+  await db.userSession.create({
+    data: { userId: NON_MEMBER_USER_ID, tokenHash: hashUserSessionToken(NON_MEMBER_USER_TOKEN), expiresAt: new Date(Date.now() + 86_400_000) },
+  });
+
   MSG_MENTION_MACHINE = await seedMessage({ mentions: [MACHINE_ID] });
   MSG_MENTION_AGENT = await seedMessage({ mentions: [AGENT_ID] });
   MSG_NO_MENTION = await seedMessage({ mentions: [OTHER_SUBJECT] });
-  // A reply that mentions the machine — must be excluded from the activity feed (parent set).
   MSG_REPLY_MENTION = await seedMessage({ mentions: [MACHINE_ID], parentMessageId: MSG_MENTION_MACHINE });
-
-  const minted = await mintOperatorSession({
-    orgId: ORG_ID,
-    workroomId: WORKROOM_ID,
-    operatorSubjectId: OPERATOR_SUBJECT_ID,
-    issuedBy: 'test',
-    allowedCommands: [...V1_OPERATOR_COMMANDS],
-  });
-  OP_SESS_RAW_TOKEN = minted.rawToken;
+  // NOTE: we cannot seed a mention to OWNER_USER_ID — User.id is a cuid but the DB
+  // mentions[] column is UUID[]. This is the documented user-mention-storage gap per
+  // controller decision 5 (activity-feed @user mention semantics deferred). Verified
+  // below: the user's activity feed is vacuous in this slice (filter collapses to empty).
 });
 
 afterAll(async () => {
   await db.controlActivityState.deleteMany({ where: { messageId: { in: [MSG_MENTION_MACHINE, MSG_MENTION_AGENT] } } });
   await db.controlMessage.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlChannel.deleteMany({ where: { workroomId: WORKROOM_ID } });
-  await db.controlOperatorSession.deleteMany({ where: { workroomId: WORKROOM_ID } });
+  await db.userWorkroomMembership.deleteMany({ where: { userId: { in: [OWNER_USER_ID, NON_MEMBER_USER_ID] } } });
+  await db.userSession.deleteMany({ where: { userId: { in: [OWNER_USER_ID, NON_MEMBER_USER_ID] } } });
+  await db.user.deleteMany({ where: { id: { in: [OWNER_USER_ID, NON_MEMBER_USER_ID] } } });
   await db.controlAgent.deleteMany({ where: { id: AGENT_ID } });
   await db.controlWorkroom.deleteMany({ where: { id: WORKROOM_ID } });
-  await db.controlDevToken.deleteMany({ where: { orgId: ORG_ID } });
   await db.controlMachine.deleteMany({ where: { id: MACHINE_ID } });
   await db.controlOrg.deleteMany({ where: { id: ORG_ID } });
   await APP.close();
@@ -185,8 +198,8 @@ afterAll(async () => {
 
 // ── GET /activity ───────────────────────────────────────────────────────────────
 
-describe('S5 activity feed — GET', () => {
-  it('a mention to the caller (machine.id) appears; id is act_<messageId>; handled defaults false', async () => {
+describe('S5 activity feed — GET (Slice 7 B2-d)', () => {
+  it('a mention to the machine appears; id is act_<messageId>; handled defaults false', async () => {
     const res = await injectGet(`/api/v1/workrooms/${WORKROOM_ID}/activity?filter=all`, machineHeader());
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
@@ -217,26 +230,36 @@ describe('S5 activity feed — GET', () => {
     expect(activityIds(all.body).sort()).toEqual(activityIds(mentions.body).sort());
   });
 
+  it('user-owner activity feed is vacuous this slice (user.id is cuid; mentions column is UUID[])', async () => {
+    // Per controller decision 5, activity-feed @user mention semantics are deferred. The
+    // route still authorizes the user and returns 200 — but with an empty activity list
+    // because the caller-key set (user.id) is not uuid-shaped and gets filtered out
+    // before the DB query (preventing a runtime error against the UUID[] column).
+    const res = await injectGet(`/api/v1/workrooms/${WORKROOM_ID}/activity?filter=all`, ownerUserHeader());
+    expect(res.statusCode).toBe(200);
+    const ids = activityIds(res.body);
+    // The user does NOT see machine-only mentions — and there is no plumbing for user
+    // mention storage this slice, so the user sees nothing.
+    expect(ids).not.toContain(MSG_MENTION_MACHINE);
+    expect(ids).not.toContain(MSG_MENTION_AGENT);
+    expect(ids).not.toContain(MSG_NO_MENTION);
+    expect(ids).toEqual([]);
+  });
+
+  it('user non-member → 403 on GET activity', async () => {
+    const res = await injectGet(`/api/v1/workrooms/${WORKROOM_ID}/activity?filter=all`, nonMemberUserHeader());
+    expect(res.statusCode).toBe(403);
+  });
+
   it('GET /activity with no auth → 401', async () => {
     const res = await injectGet(`/api/v1/workrooms/${WORKROOM_ID}/activity?filter=all`, {});
     expect(res.statusCode).toBe(401);
-  });
-
-  it('dev_ctl_ GET returns the any-mention debug view (no subject)', async () => {
-    const res = await injectGet(`/api/v1/workrooms/${WORKROOM_ID}/activity?filter=all`, devCtlHeader());
-    expect(res.statusCode).toBe(200);
-    const ids = activityIds(res.body);
-    // dev_ctl_ sees ALL messages with any non-empty mentions in visible channels.
-    expect(ids).toContain(MSG_MENTION_MACHINE);
-    expect(ids).toContain(MSG_MENTION_AGENT);
-    expect(ids).toContain(MSG_NO_MENTION); // mentions OTHER_SUBJECT (still a non-empty mention)
-    expect(ids).not.toContain(MSG_REPLY_MENTION); // replies still excluded
   });
 });
 
 // ── POST /activity/:messageId/handled + unread filter ───────────────────────────
 
-describe('S5 activity feed — POST handled + unread filter', () => {
+describe('S5 activity feed — POST handled + unread filter (Slice 7 B2-d)', () => {
   it('unread shows the mention before it is handled', async () => {
     const res = await injectGet(`/api/v1/workrooms/${WORKROOM_ID}/activity?filter=unread`, machineHeader());
     expect(activityIds(res.body)).toContain(MSG_MENTION_MACHINE);
@@ -251,7 +274,6 @@ describe('S5 activity feed — POST handled + unread filter', () => {
     expect(post.statusCode).toBe(200);
     expect(JSON.parse(post.body).ok).toBe(true);
 
-    // DB row exists, scoped to the machine subject.
     const row = await db.controlActivityState.findFirst({
       where: { subjectId: MACHINE_ID, messageId: MSG_MENTION_MACHINE },
     });
@@ -289,23 +311,25 @@ describe('S5 activity feed — POST handled + unread filter', () => {
     expect(activityIds(unread.body)).toContain(MSG_MENTION_MACHINE);
   });
 
-  it('op_sess_(mark_reviewed) can POST handled', async () => {
+  it('user-owner can POST handled (subjectId = user.id) — works on any in-workroom message', async () => {
+    // The user activity feed itself is vacuous this slice (see note above), but the
+    // POST handled write surface still works and stamps the user's id as the subject.
     const post = await injectPostJson(
       `/api/v1/workrooms/${WORKROOM_ID}/activity/${MSG_MENTION_AGENT}/handled`,
-      { authorization: `Bearer ${OP_SESS_RAW_TOKEN}` },
+      ownerUserHeader(),
       { handled: true },
     );
     expect(post.statusCode).toBe(200);
     const row = await db.controlActivityState.findFirst({
-      where: { subjectId: OPERATOR_SUBJECT_ID, messageId: MSG_MENTION_AGENT },
+      where: { subjectId: OWNER_USER_ID, messageId: MSG_MENTION_AGENT },
     });
     expect(row?.handled).toBe(true);
   });
 
-  it('dev_ctl_ → 403 on POST handled', async () => {
+  it('user non-member → 403 on POST handled', async () => {
     const post = await injectPostJson(
       `/api/v1/workrooms/${WORKROOM_ID}/activity/${MSG_MENTION_MACHINE}/handled`,
-      devCtlHeader(),
+      nonMemberUserHeader(),
       { handled: true },
     );
     expect(post.statusCode).toBe(403);

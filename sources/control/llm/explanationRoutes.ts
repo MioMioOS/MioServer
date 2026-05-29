@@ -6,7 +6,8 @@
  *   action_failure: &action_id=<uuid>                              → fetch action (scoped) → LLM/fallback
  *   task_summary:   &task_id=<uuid>                                 → fetch task (scoped)   → LLM/fallback
  *
- * Dual-auth (dev_ctl_ or machine_token), workroom-scoped. Feature-gated by a SERVER CONFIG flag
+ * Auth (Slice 7 B2-a): userOrMachine via resolveActor — accepts user_sess_ OR machine_token,
+ * workroom scope (user membership / machine org match) enforced inside resolveActor. Feature-gated by a SERVER CONFIG flag
  * (config.serverLlmExplanationEnabled, default OFF — NOT per-org; per-org is a later DB upgrade).
  *
  * Phase 1: readiness is always deterministic (no LLM). action/task call the LLM provider IF one is
@@ -17,8 +18,7 @@
 import { FastifyInstance } from 'fastify';
 import { db } from '@/storage/db';
 import { config } from '@/config';
-import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
-import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
+import { resolveActor, viewerIdFromActor } from '@/auth/userOrMachine/resolveActor';
 import {
   generateExplanation,
   type LLMProvider,
@@ -49,17 +49,15 @@ const isUuid = (s: unknown): s is string =>
 
 export async function explanationRoutes(app: FastifyInstance) {
   app.get('/api/v1/workrooms/:workroomId/explanation', async (request, reply) => {
-    // ── Dual-auth + workroom scope ──
-    const auth = await authorizeControlRead(request);
-    if (!auth.ok) return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
-
     const { workroomId } = request.params as { workroomId: string };
-    if (auth.mode === 'machine') {
-      const access = await requireMachineAccessToWorkroom(auth.machine, workroomId);
-      if (!access.ok) return reply.code(access.status).send({ error: access.error });
-    }
-    // dev mode: devTokenInWorkroomScope already matched the path workroom in authorizeControlRead.
-    const viewerId = auth.mode === 'dev' ? auth.devToken.id : auth.machine.id;
+
+    // Slice 7 B2-a: userOrMachine. workroomId comes from the `:workroomId` route
+    // param (NOT `:wid` — explanation predates the param-name standardisation).
+    // resolveActor enforces user membership / machine org-match against this id.
+    // Uniform 401 on auth failure or workroom-scope mismatch (anti-enumeration).
+    const actor = await resolveActor(request, { workroomId });
+    if (!actor) return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
+    const viewerId = viewerIdFromActor(actor);
 
     // ── Feature gate (server config; default OFF). Off → never fetch, never call provider. ──
     if (!config.serverLlmExplanationEnabled) {

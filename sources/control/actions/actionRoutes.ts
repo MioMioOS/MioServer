@@ -45,8 +45,9 @@ import { Prisma } from '@prisma/client';
 import { randomUUID, randomBytes, createHash } from 'crypto';
 import { db } from '@/storage/db';
 import { verifyMachineToken } from '@/machines/machineRoutes';
-import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
+import { resolveUserSession } from '@/auth/userSession/resolveUserSession';
+import { USER_SESSION_TOKEN_PREFIX } from '@/auth/userSession/tokenMint';
 import { publishControlEvent, type ControlEventResult } from '@/control/events/publishControlEvent';
 import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
 import { FIRE_GUARD_STATUSES, HARD_TERMINAL_STATUSES, ACTION_KIND_REQUIRES_CREDENTIAL } from '@/control/actionStatusSets';
@@ -257,14 +258,17 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
    * GET /api/v1/actions/:id
    */
   app.get('/api/v1/actions/:id', async (request, reply) => {
-    // Dual-auth: machine_token (full) OR dev_control_token (read-only, allowlist + workroom-scope).
-    const auth = await authorizeControlRead(request);
-    if (!auth.ok) {
-      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
+    // Slice 7 B2-e: dual-auth user_sess_ (workroom member) OR machine_token (org-scoped).
+    // Derived-workroom anti-enumeration: non-member / cross-org / missing all collapse to
+    // uniform 404 ACTION_NOT_FOUND (mirrors GET /messages/:id from B2-d).
+    const authHeader = request.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
     }
+    const token = authHeader.slice(7);
 
     const { id } = request.params as { id: string };
-    const action = await db.controlAction.findUnique({
+    const findOpts = {
       where: { id },
       include: {
         approvalConsumption: true,
@@ -275,19 +279,48 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
         // #141: also pull output_summary + raw_log_redacted for the Evidence / Runtime Log pages.
         reconciliations: {
           select: { runtimeWarnings: true, outputSummary: true, rawLogRedacted: true, createdAt: true },
-          orderBy: { createdAt: 'asc' },
+          orderBy: { createdAt: 'asc' as const },
         },
       },
-    });
+    };
+    let action: Awaited<ReturnType<typeof db.controlAction.findUnique<typeof findOpts>>> | null = null;
+    try {
+      action = await db.controlAction.findUnique(findOpts);
+    } catch {
+      // Malformed uuid → P2023 → uniform 404 (no leak).
+      return reply.code(404).send({ error: { code: 'ACTION_NOT_FOUND', message: 'Action not found' } });
+    }
     if (!action) {
       return reply.code(404).send({ error: { code: 'ACTION_NOT_FOUND', message: 'Action not found' } });
     }
 
-    // machine mode: enforce org/workroom access. dev mode: workroom-scope already
-    // verified in authorizeControlRead (reverse-lookup of this action's workroom).
-    if (auth.mode === 'machine') {
-      const access = await requireMachineAccessToWorkroom(auth.machine, action.workroomId, { orgId: action.workroom.orgId });
-      if (!access.ok) return reply.code(access.status).send({ error: access.error });
+    // ── Resolve actor against THIS action's workroom (derived) ──
+    type ActorKind = 'user' | 'machine';
+    let actorKind: ActorKind;
+    if (token.startsWith(USER_SESSION_TOKEN_PREFIX)) {
+      const session = await resolveUserSession(authHeader);
+      if (!session) {
+        return reply.code(401).send({ error: { code: 'INVALID_SESSION', message: 'Invalid or expired session' } });
+      }
+      // Anti-enumeration: non-member → 404 (NOT 403) — uniform with cross-org machine path.
+      const mem = await db.userWorkroomMembership.findUnique({
+        where: { userId_workroomId: { userId: session.userId, workroomId: action.workroomId } },
+      });
+      if (!mem) {
+        return reply.code(404).send({ error: { code: 'ACTION_NOT_FOUND', message: 'Action not found' } });
+      }
+      actorKind = 'user';
+    } else {
+      const machine = await verifyMachineToken(authHeader);
+      if (!machine) {
+        return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
+      }
+      const access = await requireMachineAccessToWorkroom(machine, action.workroomId, { orgId: action.workroom!.orgId });
+      if (!access.ok) {
+        // Anti-enumeration: cross-org / no-org → 404, NOT 403 (mirrors GET /messages/:id).
+        return reply.code(404).send({ error: { code: 'ACTION_NOT_FOUND', message: 'Action not found' } });
+      }
+      actorKind = 'machine';
     }
 
     const response: Record<string, unknown> = {
@@ -320,10 +353,11 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
       created_at: action.createdAt.toISOString(),
     };
 
-    // #83 (Slice 2): server-authoritative capabilities for the read-only (dev_ctl_) UI session.
-    // Only emitted for dev-mode sessions (CodeLight). machine_token (daemon) mode omits it —
-    // absent block = all writes unavailable (fail-closed), per the capability contract.
-    if (auth.mode === 'dev') {
+    // #83 (Slice 2): server-authoritative capabilities for the human-UI (CodeLight) session.
+    // Slice 7 B2-e: emitted for user_sess_ (replacing the old dev_ctl_ branch). machine_token
+    // (daemon) mode omits it — absent block = all writes unavailable (fail-closed),
+    // per the capability contract.
+    if (actorKind === 'user') {
       response.capabilities = buildReadOnlyDemoCapabilities(action);
     }
 
@@ -337,17 +371,37 @@ export async function actionRoutes(app: FastifyInstance, options: ActionRoutesOp
    * surface as the other control-plane GETs; response carries no token/secret values.
    */
   app.get('/api/v1/workrooms/:workroomId/actions', async (request, reply) => {
-    const auth = await authorizeControlRead(request);
-    if (!auth.ok) {
-      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
+    // Slice 7 B2-e: dual-auth user_sess_ (workroom member) OR machine_token (org-scoped).
+    // Param-workroom shape: missing workroom → 404; user non-member → 403 (mirrors
+    // GET /workrooms/:wid/channels/:cid/messages from B2-d).
+    const authHeader = request.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
     }
-
+    const token = authHeader.slice(7);
     const { workroomId } = request.params as { workroomId: string };
 
-    // machine mode: enforce org/workroom access. dev mode: path workroomId already
-    // matched against token.workroomId in authorizeControlRead.
-    if (auth.mode === 'machine') {
-      const access = await requireMachineAccessToWorkroom(auth.machine, workroomId);
+    if (token.startsWith(USER_SESSION_TOKEN_PREFIX)) {
+      const session = await resolveUserSession(authHeader);
+      if (!session) {
+        return reply.code(401).send({ error: { code: 'INVALID_SESSION', message: 'Invalid or expired session' } });
+      }
+      const wr = await db.controlWorkroom.findUnique({ where: { id: workroomId }, select: { id: true } });
+      if (!wr) {
+        return reply.code(404).send({ error: { code: 'WORKROOM_NOT_FOUND', message: 'Workroom not found' } });
+      }
+      const mem = await db.userWorkroomMembership.findUnique({
+        where: { userId_workroomId: { userId: session.userId, workroomId } },
+      });
+      if (!mem) {
+        return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
+      }
+    } else {
+      const machine = await verifyMachineToken(authHeader);
+      if (!machine) {
+        return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
+      }
+      const access = await requireMachineAccessToWorkroom(machine, workroomId);
       if (!access.ok) return reply.code(access.status).send({ error: access.error });
     }
 

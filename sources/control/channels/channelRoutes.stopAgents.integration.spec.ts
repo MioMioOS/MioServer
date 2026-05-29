@@ -2,15 +2,13 @@
  * Emergency stop — POST /api/v1/workrooms/:wid/channels/:cid/stop-agents
  * (REAL Postgres integration).
  *
- * The channel-header "□ Stop all agents" emergency stop. A human operator (op_sess_)
- * — or a machine — hits this; the server writes + broadcasts an `agents.stop` event
- * scoped to the channel.
+ * Slice 7 B2-c auth: user_sess_ (workroom OWNER) OR machine_token via authorizeChannelWrite.
  *
  * FAST MODE — only meaningful tests:
- *   - V1_OPERATOR_COMMANDS includes 'stop_agents'
- *   - op_sess_('stop_agents') → 200 {ok:true} + agents.stop event written with channel_id
+ *   - user-owner → 200 {ok:true} + agents.stop event written with channel_id + stopped_by
  *   - machine → 200 {ok:true}
- *   - dev_ctl_ → 403 (hard reject; POST, not on the GET allowlist)
+ *   - user non-member → 403
+ *   - no auth → 401
  *   - channel not in :wid → 404
  *
  * Run: npm run test:db:setup && npm run test:integration
@@ -21,37 +19,35 @@ import fastify, { type FastifyInstance } from 'fastify';
 import { createHash, randomUUID } from 'crypto';
 import { db } from '@/storage/db';
 import { channelRoutes } from './channelRoutes';
-import { mintOperatorSession, V1_OPERATOR_COMMANDS } from '@/control/operatorSessions/operatorSessionMint';
+import { hashPassword } from '@/auth/userSession/passwordHash';
+import { mintUserSessionToken, hashUserSessionToken } from '@/auth/userSession/tokenMint';
 
 // ── Fixture IDs ───────────────────────────────────────────────────────────────
 
 const ORG_ID = randomUUID();
 const WORKROOM_ID = randomUUID();
-const OTHER_WORKROOM_ID = randomUUID(); // same org, different workroom
+const OTHER_WORKROOM_ID = randomUUID();
 const MACHINE_ID = randomUUID();
-const OPERATOR_SUBJECT_ID = `pairing:${randomUUID()}`;
 
 const MACHINE_RAW_TOKEN = `machine_${randomUUID().replace(/-/g, '')}`;
-const DEV_CTL_RAW_TOKEN = `dev_ctl_${randomUUID().replace(/-/g, '')}`;
 
-let OP_SESS_RAW_TOKEN = '';
+let OWNER_USER_ID = '';
+let OWNER_USER_TOKEN = '';
+let NON_MEMBER_USER_ID = '';
+let NON_MEMBER_USER_TOKEN = '';
 let APP: FastifyInstance;
 let CHANNEL_ID = '';
-let OTHER_CHANNEL_ID = ''; // belongs to OTHER_WORKROOM_ID
+let OTHER_CHANNEL_ID = '';
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-const opSessHeader = () => ({ authorization: `Bearer ${OP_SESS_RAW_TOKEN}` });
+const ownerUserHeader = () => ({ authorization: `Bearer ${OWNER_USER_TOKEN}` });
+const nonMemberUserHeader = () => ({ authorization: `Bearer ${NON_MEMBER_USER_TOKEN}` });
 const machineHeader = () => ({ authorization: `Bearer ${MACHINE_RAW_TOKEN}` });
-const devCtlHeader = () => ({ authorization: `Bearer ${DEV_CTL_RAW_TOKEN}` });
 
 function postStop(url: string, headers: Record<string, string>) {
   return APP.inject({ method: 'POST', url, headers });
 }
-
-// ── Setup / teardown ──────────────────────────────────────────────────────────
 
 beforeAll(async () => {
   APP = fastify();
@@ -71,16 +67,6 @@ beforeAll(async () => {
       arch: 'arm64',
     },
   });
-  await db.controlDevToken.create({
-    data: {
-      id: randomUUID(),
-      orgId: ORG_ID,
-      workroomId: WORKROOM_ID,
-      tokenHash: sha256(DEV_CTL_RAW_TOKEN),
-      scope: 'read_only',
-      expiresAt: new Date(Date.now() + 24 * 3600_000),
-    },
-  });
   await db.controlWorkroom.create({
     data: { id: WORKROOM_ID, orgId: ORG_ID, name: 'StopAgentsSpec WR', createdBy: randomUUID() },
   });
@@ -98,14 +84,26 @@ beforeAll(async () => {
   });
   OTHER_CHANNEL_ID = otherCh.id;
 
-  const minted = await mintOperatorSession({
-    orgId: ORG_ID,
-    workroomId: WORKROOM_ID,
-    operatorSubjectId: OPERATOR_SUBJECT_ID,
-    issuedBy: 'test',
-    allowedCommands: [...V1_OPERATOR_COMMANDS],
+  const owner = await db.user.create({
+    data: { email: `stop-owner-${randomUUID()}@example.test`, passwordHash: await hashPassword('p') },
   });
-  OP_SESS_RAW_TOKEN = minted.rawToken;
+  OWNER_USER_ID = owner.id;
+  OWNER_USER_TOKEN = mintUserSessionToken();
+  await db.userSession.create({
+    data: { userId: OWNER_USER_ID, tokenHash: hashUserSessionToken(OWNER_USER_TOKEN), expiresAt: new Date(Date.now() + 86_400_000) },
+  });
+  await db.userWorkroomMembership.create({
+    data: { userId: OWNER_USER_ID, workroomId: WORKROOM_ID, role: 'owner' },
+  });
+
+  const nm = await db.user.create({
+    data: { email: `stop-nm-${randomUUID()}@example.test`, passwordHash: await hashPassword('p') },
+  });
+  NON_MEMBER_USER_ID = nm.id;
+  NON_MEMBER_USER_TOKEN = mintUserSessionToken();
+  await db.userSession.create({
+    data: { userId: NON_MEMBER_USER_ID, tokenHash: hashUserSessionToken(NON_MEMBER_USER_TOKEN), expiresAt: new Date(Date.now() + 86_400_000) },
+  });
 });
 
 afterAll(async () => {
@@ -113,30 +111,23 @@ afterAll(async () => {
   await db.controlEventLog.deleteMany({ where: { workroomId: { in: wrIds } } });
   await db.controlChannelMember.deleteMany({ where: { channel: { workroomId: { in: wrIds } } } });
   await db.controlChannel.deleteMany({ where: { workroomId: { in: wrIds } } });
-  await db.controlOperatorSession.deleteMany({ where: { workroomId: { in: wrIds } } });
+  await db.userWorkroomMembership.deleteMany({ where: { userId: { in: [OWNER_USER_ID, NON_MEMBER_USER_ID] } } });
+  await db.userSession.deleteMany({ where: { userId: { in: [OWNER_USER_ID, NON_MEMBER_USER_ID] } } });
+  await db.user.deleteMany({ where: { id: { in: [OWNER_USER_ID, NON_MEMBER_USER_ID] } } });
   await db.controlWorkroom.deleteMany({ where: { id: { in: wrIds } } });
-  await db.controlDevToken.deleteMany({ where: { orgId: ORG_ID } });
   await db.controlMachine.deleteMany({ where: { id: MACHINE_ID } });
   await db.controlOrg.deleteMany({ where: { id: ORG_ID } });
   await APP.close();
   await db.$disconnect();
 });
 
-// ── V1_OPERATOR_COMMANDS includes stop_agents ─────────────────────────────────
-
-describe('V1_OPERATOR_COMMANDS includes the emergency-stop command', () => {
-  it("contains 'stop_agents'", () => {
-    expect(V1_OPERATOR_COMMANDS).toContain('stop_agents');
-  });
-});
-
 // ── POST /api/v1/workrooms/:wid/channels/:cid/stop-agents ──────────────────────
 
 describe('POST /api/v1/workrooms/:wid/channels/:cid/stop-agents', () => {
-  it('op_sess_ stop: 200 {ok:true} + agents.stop event written with channel_id', async () => {
+  it('user-owner stop: 200 {ok:true} + agents.stop event written with channel_id + stopped_by', async () => {
     const res = await postStop(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${CHANNEL_ID}/stop-agents`,
-      opSessHeader(),
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).ok).toBe(true);
@@ -148,7 +139,7 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/stop-agents', () => {
     expect(event).not.toBeNull();
     const payload = event!.payloadJson as Record<string, unknown>;
     expect(payload.channel_id).toBe(CHANNEL_ID);
-    expect(payload.stopped_by).toBe(OPERATOR_SUBJECT_ID);
+    expect(payload.stopped_by).toBe(OWNER_USER_ID);
   });
 
   it('machine stop: 200 {ok:true}', async () => {
@@ -160,19 +151,23 @@ describe('POST /api/v1/workrooms/:wid/channels/:cid/stop-agents', () => {
     expect(JSON.parse(res.body).ok).toBe(true);
   });
 
-  it('dev_ctl_ → 403 hard reject (POST is not on the dev GET allowlist)', async () => {
+  it('user non-member → 403', async () => {
     const res = await postStop(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${CHANNEL_ID}/stop-agents`,
-      devCtlHeader(),
+      nonMemberUserHeader(),
     );
     expect(res.statusCode).toBe(403);
   });
 
+  it('no auth → 401', async () => {
+    const res = await postStop(`/api/v1/workrooms/${WORKROOM_ID}/channels/${CHANNEL_ID}/stop-agents`, {});
+    expect(res.statusCode).toBe(401);
+  });
+
   it('channel not in workroom → 404', async () => {
-    // OTHER_CHANNEL_ID belongs to OTHER_WORKROOM_ID but request targets WORKROOM_ID.
     const res = await postStop(
       `/api/v1/workrooms/${WORKROOM_ID}/channels/${OTHER_CHANNEL_ID}/stop-agents`,
-      opSessHeader(),
+      ownerUserHeader(),
     );
     expect(res.statusCode).toBe(404);
   });

@@ -15,25 +15,29 @@
  *  it already emits the S3 Slock wire shape additively. We do NOT re-register it here
  *  to avoid a Fastify duplicate-route error.)
  *
- * Auth:
- *   Reads  (GET): authorizeControlRead (machine_token OR dev_ctl_ on the allowlist).
- *   Writes (POST/PATCH): op_sess_ (per-command) OR machine_token. dev_ctl_ → hard 403.
- *   Mirrors messageRoutes auth ordering (dev_ctl_ 403 first, then op_sess_, then machine).
+ * Auth (Slice 7 B2-b):
+ *   Reads  (GET): userOrMachine — user_sess_ (workroom member) OR machine_token.
+ *     Inline resolveActor preserves 401/403/404 status-code matrix (mirrors memberRoutes).
+ *   Writes (POST/PATCH): authorizeTaskWrite — user_sess_ (workroom OWNER) OR machine_token.
+ *     User non-owner → 403; missing/invalid → 401.
  *
  * Validation: the task/channel must belong to :wid; 404 otherwise.
  * Events: writes publish 'task.created' / 'task.updated' (write-before-broadcast).
  */
 
-import { FastifyInstance } from 'fastify';
-import { randomUUID } from 'crypto';
+import { FastifyInstance, FastifyRequest } from 'fastify';
 import { db } from '@/storage/db';
-import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
+import { resolveActor } from '@/auth/userOrMachine/resolveActor';
+import { resolveUserSession } from '@/auth/userSession/resolveUserSession';
+import { USER_SESSION_TOKEN_PREFIX } from '@/auth/userSession/tokenMint';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
-import { authorizeOperatorWrite } from '@/control/operatorSessions/operatorSessionAuth';
 import { verifyMachineToken } from '@/machines/machineRoutes';
-import { publishControlEvent } from '@/control/events/publishControlEvent';
-import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
 import { slockToServerStatus, serverToSlockStatus } from './slockTaskStatus';
+import { nextChannelTaskNumber } from './nextChannelTaskNumber';
+import { emitTaskLifecycleMessage } from './taskMessageBridge';
+import { writeTaskEventAndBroadcast } from './writeTaskEventAndBroadcast';
+import { insertSystemMessage } from '@/control/messages/insertSystemMessage';
+import { writeEventAndBroadcast } from '@/control/messages/writeEventAndBroadcast';
 
 // ── Wire shape ──────────────────────────────────────────────────────────────────
 
@@ -43,6 +47,7 @@ interface TaskRow {
   title: string;
   status: string;
   ownerInstanceId: string | null;
+  creatorInstanceId: string | null;
   threadId: string | null;
   createdAt: Date;
 }
@@ -66,8 +71,10 @@ async function resolveAssigneeDisplayNames(ownerIds: Array<string | null>): Prom
   return result;
 }
 
+const resolveAgentDisplayNames = resolveAssigneeDisplayNames;
+
 /** Format a task row as the S3 Slock wire shape (snake_case, Slock-vocab status). */
-function formatTask(t: TaskRow, assigneeNames: Map<string, string>) {
+function formatTask(t: TaskRow, agentNames: Map<string, string>) {
   return {
     id: t.id,
     channel_id: t.channelId,
@@ -75,9 +82,12 @@ function formatTask(t: TaskRow, assigneeNames: Map<string, string>) {
     status: serverToSlockStatus(t.status),       // Slock vocab
     slock_status: serverToSlockStatus(t.status), // alias so iOS reads `slock_status` uniformly across endpoints
     assignee_id: t.ownerInstanceId,
-    assignee_display_name: t.ownerInstanceId ? (assigneeNames.get(t.ownerInstanceId) ?? null) : null,
-    // ControlTask has no stored creator identity → null (not fabricated). See taskRoutes.ts note.
-    creator_id: null as string | null,
+    assignee_display_name: t.ownerInstanceId ? (agentNames.get(t.ownerInstanceId) ?? null) : null,
+    owner_instance_id: t.ownerInstanceId,
+    owner_display_name: t.ownerInstanceId ? (agentNames.get(t.ownerInstanceId) ?? null) : null,
+    creator_id: t.creatorInstanceId,
+    creator_display_name: t.creatorInstanceId ? (agentNames.get(t.creatorInstanceId) ?? null) : null,
+    creator_instance_id: t.creatorInstanceId,
     created_at: t.createdAt.toISOString(),
     thread_id: t.threadId,
   };
@@ -87,48 +97,11 @@ function formatTask(t: TaskRow, assigneeNames: Map<string, string>) {
 async function fetchFormattedTask(id: string) {
   const row = await db.controlTask.findUnique({
     where: { id },
-    select: { id: true, channelId: true, title: true, status: true, ownerInstanceId: true, threadId: true, createdAt: true },
+    select: { id: true, channelId: true, title: true, status: true, ownerInstanceId: true, creatorInstanceId: true, threadId: true, createdAt: true },
   });
   if (!row) return null;
-  const names = await resolveAssigneeDisplayNames([row.ownerInstanceId]);
+  const names = await resolveAgentDisplayNames([row.ownerInstanceId, row.creatorInstanceId]);
   return formatTask(row, names);
-}
-
-// ── Event publish (write-before-broadcast; mirrors messageRoutes) ────────────────
-
-/**
- * Persist a task event (awaited → exists before the route returns) then fire-and-forget
- * the WS broadcast (non-fatal; clients catch up via GET). topic: 'task.created' | 'task.updated'.
- */
-async function writeTaskEventAndBroadcast(topic: 'task.created' | 'task.updated', task: {
-  id: string;
-  workroomId: string;
-  channelId: string | null;
-  status: string;
-  ownerInstanceId: string | null;
-}): Promise<void> {
-  const event = await publishControlEvent({
-    workroomId: task.workroomId,
-    eventId: randomUUID(),
-    topic,
-    payload: {
-      task_id: task.id,
-      channel_id: task.channelId,
-      status: serverToSlockStatus(task.status),
-      assignee_id: task.ownerInstanceId,
-    },
-  });
-
-  if (!event.idempotent) {
-    workroomBroadcaster.broadcast(task.workroomId, {
-      event_id: event.eventId,
-      workroom_id: event.workroomId,
-      seq: event.seq.toString(),
-      topic: event.topic,
-      payload: event.payloadJson as Record<string, unknown>,
-      created_at: event.createdAt.toISOString(),
-    });
-  }
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -136,66 +109,64 @@ async function writeTaskEventAndBroadcast(topic: 'task.created' | 'task.updated'
 export async function slockTaskRoutes(app: FastifyInstance) {
   /**
    * GET /api/v1/workrooms/:wid/channels/:cid/tasks
-   * Tasks belonging to ONE channel. authorizeControlRead (machine OR dev_ctl_ allowlist).
+   * Tasks belonging to ONE channel. userOrMachine read (user_sess_ member OR machine_token).
+   *
+   * Inline resolution (not requireActor) so we preserve route-specific status codes
+   * mirroring the memberRoutes pattern: no-bearer → 401; bad-token → 401; user
+   * non-member → 403; machine cross-org → 403; workroom missing → 404. resolveActor's
+   * uniform-401 collapse would regress the existing test matrix.
    */
   app.get('/api/v1/workrooms/:wid/channels/:cid/tasks', async (request, reply) => {
-    const auth = await authorizeControlRead(request);
-    if (!auth.ok) {
-      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
-    }
-
     const { wid, cid } = request.params as { wid: string; cid: string };
-
-    if (auth.mode === 'machine') {
-      const access = await requireMachineAccessToWorkroom(auth.machine, wid);
-      if (!access.ok) return reply.code(access.status).send({ error: access.error });
-    }
+    const guard = await resolveTaskReadActor(request, wid);
+    if (!guard.ok) return reply.code(guard.status).send({ error: guard.error });
 
     const tasks = await db.controlTask.findMany({
       where: { workroomId: wid, channelId: cid },
       orderBy: { createdAt: 'asc' },
       take: 100,
-      select: { id: true, channelId: true, title: true, status: true, ownerInstanceId: true, threadId: true, createdAt: true },
+      select: { id: true, channelId: true, title: true, status: true, ownerInstanceId: true, creatorInstanceId: true, threadId: true, createdAt: true },
     });
 
-    const names = await resolveAssigneeDisplayNames(tasks.map((t) => t.ownerInstanceId));
+    const names = await resolveAgentDisplayNames([
+      ...tasks.map((t) => t.ownerInstanceId),
+      ...tasks.map((t) => t.creatorInstanceId),
+    ]);
     return { tasks: tasks.map((t) => formatTask(t, names)) };
   });
 
   /**
    * POST /api/v1/workrooms/:wid/channels/:cid/tasks   body { title }
-   * Create a task in a channel (status 'todo'). Auth: op_sess_('create_task') OR machine.
-   * dev_ctl_ → hard 403. Validates the channel belongs to :wid (404 otherwise).
+   * Create a task in a channel (status 'todo').
+   * Auth: user_sess_ (workroom OWNER) OR machine_token (via authorizeTaskWrite).
+   * Validates the channel belongs to :wid (404 otherwise).
    */
   app.post('/api/v1/workrooms/:wid/channels/:cid/tasks', async (request, reply) => {
     const { wid, cid } = request.params as { wid: string; cid: string };
-    const authHeader = request.headers.authorization;
 
-    // dev_ctl_ → hard 403 first (defense-in-depth; mirrors messageRoutes ordering).
-    const rawToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
-    if (rawToken.startsWith('dev_ctl_')) {
-      return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
-    }
+    const subject = await authorizeTaskWrite(request, { workroomId: wid, command: 'create_task' });
+    if (!subject.ok) return reply.code(subject.status).send({ error: subject.error });
 
-    // op_sess_ first, then machine fallback.
-    const opAuth = await authorizeOperatorWrite(request, { command: 'create_task', workroomId: wid });
-    if (!opAuth.ok) {
-      if (opAuth.status === 403) {
-        return reply.code(403).send({ error: { code: opAuth.code, message: opAuth.message } });
-      }
-      // 401 from op path → try machine.
-      const machine = await verifyMachineToken(authHeader);
-      if (!machine) {
-        return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
-      }
-      const access = await requireMachineAccessToWorkroom(machine, wid);
-      if (!access.ok) return reply.code(access.status).send({ error: access.error });
-    }
-
-    const body = request.body as { title?: unknown } | null;
+    const body = request.body as { title?: unknown; owner_instance_id?: unknown; attach_to_message_id?: unknown } | null;
     if (!body?.title || typeof body.title !== 'string') {
       return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'title is required' } });
     }
+
+    // Optional initial owner (M5): accept owner_instance_id on create so callers can
+    // create-and-assign atomically. Null/missing → unassigned (existing behavior).
+    const initialOwner: string | null =
+      typeof body.owner_instance_id === 'string' && body.owner_instance_id.length > 0
+        ? body.owner_instance_id
+        : null;
+
+    // Bug-2 Thread feature: optional attach_to_message_id pins the new task to
+    // an existing message in the same channel. The server additionally writes a
+    // system_task_created reply under that message so reply_count increments
+    // and iOS surfaces the thread.
+    const attachToMessageId: string | null =
+      typeof body.attach_to_message_id === 'string' && body.attach_to_message_id.length > 0
+        ? body.attach_to_message_id
+        : null;
 
     // Validate the channel belongs to this workroom (404 otherwise).
     const channel = await db.controlChannel.findUnique({ where: { id: cid }, select: { workroomId: true } });
@@ -203,28 +174,116 @@ export async function slockTaskRoutes(app: FastifyInstance) {
       return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
     }
 
-    const task = await db.controlTask.create({
-      data: { workroomId: wid, channelId: cid, title: body.title, status: 'todo' },
-      select: { id: true, channelId: true, title: true, status: true, ownerInstanceId: true, threadId: true, createdAt: true },
+    // Validate the attach target message belongs to THIS channel (not just this workroom)
+    // — the thread under it must be in the channel iOS will fetch replies from.
+    if (attachToMessageId) {
+      const parentMsg = await db.controlMessage.findUnique({
+        where: { id: attachToMessageId },
+        select: { id: true, channelId: true, workroomId: true },
+      });
+      if (!parentMsg || parentMsg.channelId !== cid || parentMsg.workroomId !== wid) {
+        return reply.code(404).send({
+          error: { code: 'ATTACH_MESSAGE_NOT_FOUND', message: 'attach_to_message_id not found in this channel' },
+        });
+      }
+    }
+
+    // Allocate per-channel number inside a transaction (serialized via FOR UPDATE on
+    // the channel row — mirrors agentApiTasks.ts A5 pattern).
+    let task!: { id: string; channelId: string | null; title: string; status: string; ownerInstanceId: string | null; creatorInstanceId: string | null; threadId: string | null; createdAt: Date; number: number | null };
+    await db.$transaction(async (tx) => {
+      const num = await nextChannelTaskNumber(tx, cid);
+      task = await tx.controlTask.create({
+        data: {
+          workroomId: wid,
+          channelId: cid,
+          title: body.title as string,
+          status: 'todo',
+          number: num,
+          ownerInstanceId: initialOwner,
+          parentMessageId: attachToMessageId,
+        },
+        select: { id: true, channelId: true, title: true, status: true, ownerInstanceId: true, creatorInstanceId: true, threadId: true, createdAt: true, number: true },
+      });
     });
 
-    await writeTaskEventAndBroadcast('task.created', {
-      id: task.id, workroomId: wid, channelId: task.channelId, status: task.status, ownerInstanceId: task.ownerInstanceId,
+    // Actor id (creator) — for task.created.created_by and task.assigned.assigner_id.
+    const actorId: string = subject.subject.kind === 'user' ? subject.subject.userId : subject.subject.machineId;
+
+    await writeTaskEventAndBroadcast({
+      workroomId: wid,
+      topic: 'task.created',
+      payload: {
+        task_id: task.id,
+        channel_id: task.channelId,
+        workroom_id: wid,
+        title: task.title,
+        status: serverToSlockStatus(task.status),
+        assignee_id: task.ownerInstanceId,
+        owner_id: task.ownerInstanceId,    // alias for M5 wake-reason payload
+        created_by: actorId,
+      },
     });
 
-    const names = await resolveAssigneeDisplayNames([task.ownerInstanceId]);
+    // M5: if created with an initial assignee, ALSO emit task.assigned so the
+    // daemon can wake the assignee (the create wake alone may be filtered out
+    // by relevance gates for non-owner channel members).
+    if (initialOwner) {
+      await writeTaskEventAndBroadcast({
+        workroomId: wid,
+        topic: 'task.assigned',
+        payload: {
+          task_id: task.id,
+          channel_id: task.channelId,
+          workroom_id: wid,
+          assignee_id: initialOwner,
+          assigner_id: actorId,
+        },
+      });
+    }
+
+    // Emit 📋 bridge message so agents see iOS-created tasks (best-effort, after commit).
+    if (task.number !== null) {
+      await emitTaskLifecycleMessage({
+        kind: 'created',
+        workroomId: wid,
+        channelId: task.channelId,
+        tasks: [{ number: task.number, title: task.title }],
+      });
+    }
+
+    // Bug-2 Thread feature: when the task is attached to a message, write a
+    // system_task_created reply under that parent so the parent's reply_count
+    // increments and iOS shows the thread inline. Same channel as the task.
+    // Best-effort: failure here must not roll back the task write.
+    if (attachToMessageId && task.channelId && task.number !== null) {
+      try {
+        const sysRow = await insertSystemMessage({
+          workroomId: wid,
+          channelId: task.channelId,
+          content: `1 new task created: #${task.number} "${task.title}"`,
+          parentMessageId: attachToMessageId,
+        });
+        await writeEventAndBroadcast(sysRow);
+      } catch (err) {
+        console.error('[slockTaskRoutes] failed to emit system_task_created thread message:', err);
+      }
+    }
+
+    const names = await resolveAgentDisplayNames([task.ownerInstanceId, task.creatorInstanceId]);
     return reply.code(201).send(formatTask(task, names));
   });
 
   /**
    * PATCH /api/v1/workrooms/:wid/tasks/:id/status   body { status }  (Slock vocab)
-   * Translate + update. Auth: op_sess_('update_task_status') OR machine. dev_ctl_ → 403.
+   * Translate + update. Auth: user_sess_ (workroom OWNER) OR machine_token.
    * Validates the task belongs to :wid (404 otherwise).
    */
   app.patch('/api/v1/workrooms/:wid/tasks/:id/status', async (request, reply) => {
     const { wid, id } = request.params as { wid: string; id: string };
-    const guard = await authorizeTaskWrite(request, reply, wid, 'update_task_status');
-    if (!guard.ok) return guard.sent;
+
+    const subject = await authorizeTaskWrite(request, { workroomId: wid, command: 'update_task_status' });
+    if (!subject.ok) return reply.code(subject.status).send({ error: subject.error });
 
     const body = request.body as { status?: unknown } | null;
     if (!body?.status || typeof body.status !== 'string') {
@@ -235,33 +294,70 @@ export async function slockTaskRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: { code: 'INVALID_STATUS', message: 'Unknown status' } });
     }
 
-    const task = await db.controlTask.findUnique({ where: { id }, select: { workroomId: true } });
+    const task = await db.controlTask.findUnique({ where: { id }, select: { workroomId: true, status: true } });
     if (!task || task.workroomId !== wid) {
       return reply.code(404).send({ error: { code: 'TASK_NOT_FOUND', message: 'Task not found' } });
     }
+    const prevStatus = task.status;
 
     const updated = await db.controlTask.update({
       where: { id },
       data: { status: serverStatus },
-      select: { id: true, channelId: true, status: true, ownerInstanceId: true },
+      select: { id: true, channelId: true, status: true, ownerInstanceId: true, number: true },
     });
 
-    await writeTaskEventAndBroadcast('task.updated', {
-      id: updated.id, workroomId: wid, channelId: updated.channelId, status: updated.status, ownerInstanceId: updated.ownerInstanceId,
+    await writeTaskEventAndBroadcast({
+      workroomId: wid,
+      topic: 'task.updated',
+      payload: {
+        task_id: updated.id,
+        channel_id: updated.channelId,
+        status: serverToSlockStatus(updated.status),
+        assignee_id: updated.ownerInstanceId,
+      },
     });
+
+    // M5: dedicated status_changed event for autonomous wake routing.
+    if (prevStatus !== updated.status) {
+      const actorId: string = subject.subject.kind === 'user' ? subject.subject.userId : subject.subject.machineId;
+      await writeTaskEventAndBroadcast({
+        workroomId: wid,
+        topic: 'task.status_changed',
+        payload: {
+          task_id: updated.id,
+          channel_id: updated.channelId,
+          workroom_id: wid,
+          from: serverToSlockStatus(prevStatus),
+          to: serverToSlockStatus(updated.status),
+          actor_id: actorId,
+          assignee_id: updated.ownerInstanceId,
+        },
+      });
+    }
+
+    // Fix B: emit the channel lifecycle system message so agents see operator status changes.
+    if (updated.number !== null) {
+      await emitTaskLifecycleMessage({
+        kind: 'status',
+        workroomId: wid,
+        channelId: updated.channelId,
+        task: { number: updated.number, status: serverStatus },   // server vocab, matches agent path
+      });
+    }
 
     return reply.code(200).send((await fetchFormattedTask(id))!);
   });
 
   /**
    * PATCH /api/v1/workrooms/:wid/tasks/:id/assignee   body { assignee_id }  (nullable)
-   * Set/clear ownerInstanceId. Auth: op_sess_('assign_task') OR machine. dev_ctl_ → 403.
+   * Set/clear ownerInstanceId. Auth: user_sess_ (workroom OWNER) OR machine_token.
    * Validates the task belongs to :wid (404 otherwise).
    */
   app.patch('/api/v1/workrooms/:wid/tasks/:id/assignee', async (request, reply) => {
     const { wid, id } = request.params as { wid: string; id: string };
-    const guard = await authorizeTaskWrite(request, reply, wid, 'assign_task');
-    if (!guard.ok) return guard.sent;
+
+    const subject = await authorizeTaskWrite(request, { workroomId: wid, command: 'assign_task' });
+    if (!subject.ok) return reply.code(subject.status).send({ error: subject.error });
 
     const body = request.body as { assignee_id?: unknown } | null;
     // assignee_id is nullable: explicit null clears, a string sets. Missing key → 400.
@@ -273,10 +369,11 @@ export async function slockTaskRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'assignee_id must be a string or null' } });
     }
 
-    const task = await db.controlTask.findUnique({ where: { id }, select: { workroomId: true } });
+    const task = await db.controlTask.findUnique({ where: { id }, select: { workroomId: true, ownerInstanceId: true } });
     if (!task || task.workroomId !== wid) {
       return reply.code(404).send({ error: { code: 'TASK_NOT_FOUND', message: 'Task not found' } });
     }
+    const prevAssignee = task.ownerInstanceId;
 
     const updated = await db.controlTask.update({
       where: { id },
@@ -284,53 +381,138 @@ export async function slockTaskRoutes(app: FastifyInstance) {
       select: { id: true, channelId: true, status: true, ownerInstanceId: true },
     });
 
-    await writeTaskEventAndBroadcast('task.updated', {
-      id: updated.id, workroomId: wid, channelId: updated.channelId, status: updated.status, ownerInstanceId: updated.ownerInstanceId,
+    await writeTaskEventAndBroadcast({
+      workroomId: wid,
+      topic: 'task.updated',
+      payload: {
+        task_id: updated.id,
+        channel_id: updated.channelId,
+        status: serverToSlockStatus(updated.status),
+        assignee_id: updated.ownerInstanceId,
+      },
     });
+
+    // M5: emit task.assigned when the assignee actually changed AND landed on a
+    // non-null id (clears don't wake anyone). assigner_id is the actor making
+    // the change.
+    if (prevAssignee !== updated.ownerInstanceId && updated.ownerInstanceId !== null) {
+      const actorId: string = subject.subject.kind === 'user' ? subject.subject.userId : subject.subject.machineId;
+      await writeTaskEventAndBroadcast({
+        workroomId: wid,
+        topic: 'task.assigned',
+        payload: {
+          task_id: updated.id,
+          channel_id: updated.channelId,
+          workroom_id: wid,
+          assignee_id: updated.ownerInstanceId,
+          assigner_id: actorId,
+          prev_assignee_id: prevAssignee,
+        },
+      });
+    }
 
     return reply.code(200).send((await fetchFormattedTask(id))!);
   });
 }
 
-// ── Shared write-auth guard (op_sess_ per-command OR machine; dev_ctl_ → 403) ────
+// ── Read-auth resolver (user_sess_ member OR machine_token) ──────────────────────
+//
+// Inline path that preserves the route-specific status-code matrix (401/403/404),
+// mirroring memberRoutes.ts. resolveActor exists but uniformly collapses to null →
+// using it here would require duplicating the disambiguation logic at the caller.
 
-type TaskWriteGuard =
-  | { ok: true }
-  | { ok: false; sent: unknown };
+type TaskReadResult =
+  | { ok: true; subject: { kind: 'user'; userId: string } | { kind: 'machine'; machineId: string } }
+  | { ok: false; status: number; error: { code: string; message: string } };
 
-/**
- * Authorize a task write: dev_ctl_ → hard 403, then op_sess_(command), then machine fallback.
- * On failure, sends the reply and returns { ok:false, sent } so the caller can `return guard.sent`.
- * Mirrors the messageRoutes write auth ordering exactly.
- */
-async function authorizeTaskWrite(
-  request: import('fastify').FastifyRequest,
-  reply: import('fastify').FastifyReply,
-  wid: string,
-  command: string,
-): Promise<TaskWriteGuard> {
-  const authHeader = request.headers.authorization;
+async function resolveTaskReadActor(req: FastifyRequest, workroomId: string): Promise<TaskReadResult> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return { ok: false, status: 401, error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } };
+  }
+  const token = authHeader.slice(7);
 
-  const rawToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
-  if (rawToken.startsWith('dev_ctl_')) {
-    return { ok: false, sent: reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } }) };
+  if (token.startsWith(USER_SESSION_TOKEN_PREFIX)) {
+    const session = await resolveUserSession(authHeader);
+    if (!session) {
+      return { ok: false, status: 401, error: { code: 'INVALID_SESSION', message: 'Invalid or expired session' } };
+    }
+    const wr = await db.controlWorkroom.findUnique({ where: { id: workroomId }, select: { orgId: true } });
+    if (!wr) {
+      return { ok: false, status: 404, error: { code: 'WORKROOM_NOT_FOUND', message: 'Workroom not found' } };
+    }
+    const mem = await db.userWorkroomMembership.findUnique({
+      where: { userId_workroomId: { userId: session.userId, workroomId } },
+    });
+    if (!mem) {
+      return { ok: false, status: 403, error: { code: 'FORBIDDEN', message: 'Forbidden' } };
+    }
+    return { ok: true, subject: { kind: 'user', userId: session.userId } };
   }
 
-  const opAuth = await authorizeOperatorWrite(request, { command, workroomId: wid });
-  if (opAuth.ok) return { ok: true };
-
-  if (opAuth.status === 403) {
-    return { ok: false, sent: reply.code(403).send({ error: { code: opAuth.code, message: opAuth.message } }) };
-  }
-
-  // 401 from op path → try machine.
   const machine = await verifyMachineToken(authHeader);
   if (!machine) {
-    return { ok: false, sent: reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } }) };
+    return { ok: false, status: 401, error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } };
   }
-  const access = await requireMachineAccessToWorkroom(machine, wid);
-  if (!access.ok) {
-    return { ok: false, sent: reply.code(access.status).send({ error: access.error }) };
+  const access = await requireMachineAccessToWorkroom(machine, workroomId);
+  if (!access.ok) return { ok: false, status: access.status, error: access.error };
+  return { ok: true, subject: { kind: 'machine', machineId: machine.id } };
+}
+
+// ── Shared write-auth guard (user_sess_ owner OR machine fallback) ───────────────
+
+export type TaskWriteSubject =
+  | { kind: 'user'; userId: string }
+  | { kind: 'machine'; machineId: string };
+
+type TaskWriteResult =
+  | { ok: true; subject: TaskWriteSubject }
+  | { ok: false; status: number; error: { code: string; message: string } };
+
+/**
+ * Authorize a task WRITE. Two-actor ladder:
+ *   1. user_sess_  → must be a workroom owner (per §6.2). Non-owner → 403.
+ *   2. machine_token → must have org access to the workroom.
+ *   3. anything else → 401.
+ *
+ * `command` parameter is kept for API compatibility / future per-command auditing
+ * but is not currently checked against an allowlist (granular per-command grants
+ * died with Slice 7's auth unification).
+ */
+export async function authorizeTaskWrite(
+  req: FastifyRequest,
+  opts: { workroomId: string; command: string },
+): Promise<TaskWriteResult> {
+  void opts.command; // reserved for future audit; user/machine path does not gate by command
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return { ok: false, status: 401, error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } };
   }
-  return { ok: true };
+  const token = authHeader.slice(7);
+
+  // ── Path 1: user_sess_ ──
+  if (token.startsWith(USER_SESSION_TOKEN_PREFIX)) {
+    const actor = await resolveActor(req, { workroomId: opts.workroomId });
+    if (!actor || actor.kind !== 'user') {
+      // Non-member user OR invalid session: 401 if session was bad, 403 if member missing.
+      const session = await resolveUserSession(authHeader);
+      if (!session) {
+        return { ok: false, status: 401, error: { code: 'INVALID_SESSION', message: 'Invalid or expired session' } };
+      }
+      return { ok: false, status: 403, error: { code: 'FORBIDDEN', message: 'Forbidden' } };
+    }
+    if (actor.workroomRole !== 'owner') {
+      return { ok: false, status: 403, error: { code: 'FORBIDDEN', message: 'Forbidden' } };
+    }
+    return { ok: true, subject: { kind: 'user', userId: actor.userId } };
+  }
+
+  // ── Path 2: machine_token ──
+  const machine = await verifyMachineToken(authHeader);
+  if (!machine) {
+    return { ok: false, status: 401, error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } };
+  }
+  const access = await requireMachineAccessToWorkroom(machine, opts.workroomId);
+  if (!access.ok) return { ok: false, status: access.status, error: access.error };
+  return { ok: true, subject: { kind: 'machine', machineId: machine.id } };
 }

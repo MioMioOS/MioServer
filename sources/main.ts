@@ -6,6 +6,7 @@ import { initBlobStore } from '@/blob/blobStore';
 import { config } from '@/config';
 import { expireStaleTrials, findExpiringTrials } from '@/subscription/subscriptionService';
 import { sendTrialExpiryNotification } from '@/push/apns';
+import { seedUserIfEmpty } from '@/setup/seedUser';
 
 async function main() {
     if (!config.masterSecret || config.masterSecret === 'change-me-to-a-random-string') {
@@ -15,6 +16,19 @@ async function main() {
 
     await db.$connect();
     console.log('Database connected');
+
+    // Slice 7 §4.4: first-boot seed of the dogfood user + migration attribution
+    // of pre-Slice-7 workrooms/devices. Runs AFTER DB connect and BEFORE
+    // app.listen so a misconfigured env on first boot fails fast (the process
+    // exits via the main().catch handler instead of binding the port with no
+    // human identity). After the seed exists this is a no-op on every reboot.
+    try {
+        await seedUserIfEmpty();
+        console.log('Seed user check complete');
+    } catch (err) {
+        console.error('Seed user failed:', err);
+        throw err;
+    }
 
     await initBlobStore();
 

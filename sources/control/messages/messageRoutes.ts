@@ -1,132 +1,194 @@
 /**
- * Message API — control plane (S1 Chunks 3 + 4)
+ * Message API — control plane (Slice 7 B2-d converted: user_sess_ / machine_token unification).
  *
- * Endpoints:
- *   GET /api/v1/workrooms/:wid/channels/:cid/messages?after_seq=<n>&limit=<=100
- *     Returns seq-ascending page of messages in a channel.
- *     Private channel non-member → 404 (uniform, anti-enumeration).
+ * Endpoints (10 routes):
+ *   READS  (userOrMachine):
+ *     GET    /api/v1/workrooms/:wid/channels/:cid/messages
+ *     GET    /api/v1/messages/:id                                   (derived workroom)
+ *     GET    /api/v1/workrooms/:wid/threads/:parentId
+ *     GET    /api/v1/workrooms/:wid/threads/:parentId/replies
+ *     GET    /api/v1/workrooms/:wid/saved
+ *     GET    /api/v1/workrooms/:wid/activity
  *
- *   GET /api/v1/messages/:id
- *     Returns a single message by id (for thread parent / deep links).
- *     Private channel non-member → 404 (uniform, anti-enumeration).
+ *   WRITES (user owner OR machine, dev_ctl_/op_sess_ gone):
+ *     POST   /api/v1/workrooms/:wid/channels/:cid/messages
+ *     POST   /api/v1/workrooms/:wid/threads/:parentId/reply
+ *     POST   /api/v1/workrooms/:wid/messages/:id/save
+ *     DELETE /api/v1/workrooms/:wid/messages/:id/save
+ *     POST   /api/v1/workrooms/:wid/activity/:messageId/handled
  *
- *   POST /api/v1/workrooms/:wid/channels/:cid/messages  (Chunk 4)
- *     Send a message. Auth: op_sess_ (command 'send_message') OR machine_token.
- *     dev_ctl_ → 403 hard reject.
- *     op_sess_ path: client_idempotency_key required (missing → 400).
- *     machine path: client_idempotency_key optional (null → no unique collision per spec §4.3).
- *     private non-member → 403.
- *     Post-commit: publishAndBroadcast(message.created) with redacted+truncated preview.
+ * Auth model (Slice 7 §6.2):
+ *   READS  → resolveMessageReadActor — user_sess_ (workroom MEMBER) OR machine_token.
+ *            Inline resolution preserves 401/403/404 matrix (mirrors B2-c channelRoutes).
+ *   WRITES → authorizeMessageWrite — user_sess_ (workroom OWNER) OR machine_token.
+ *            Per-site helper shape (subject = { kind, id }) so each write can mint
+ *            the canonical subject id used downstream (senderId / saved.subjectId /
+ *            activityState.subjectId). Mirrors authorizeTaskWrite (B2-b) / authorizeChannelWrite (B2-c).
  *
- * Spec: §4.2 (list) + §4.3 (send) + §4.4 (single).
+ * Anti-enumeration:
+ *   GET /messages/:id: workroom is derived from the loaded message. A user that is not
+ *   a member of message.workroomId → uniform 404 (matches the existing
+ *   "private channel non-member → 404" semantic for the in-URL workroom case).
+ *
+ * Privacy fixes vs. previous code:
+ *   - GET /saved: the old `dev_ctl_` no-subject "all in workroom" branch is gone — there
+ *     is no anonymous read credential post-Slice-7. Saved now scopes by actor's viewerId.
+ *   - GET /activity: the old `dev_ctl_` "any non-empty mentions" debug branch is gone.
+ *     Activity caller keys: user → [user.id]; machine → [machine.id, ...owned agents].
+ *
+ * Spec: docs/superpowers/specs/2026-05-26-slock-clone-slice7-user-auth-unification-design.md §6.2
  */
 
 import { FastifyInstance, FastifyRequest } from 'fastify';
-import { randomUUID } from 'crypto';
 import { Prisma } from '@prisma/client';
 import { db } from '@/storage/db';
-import { authorizeControlRead } from '@/control/devTokens/devTokenAuth';
+import { resolveUserSession } from '@/auth/userSession/resolveUserSession';
+import { USER_SESSION_TOKEN_PREFIX } from '@/auth/userSession/tokenMint';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { visibleChannels } from '@/control/channels/channelVisibility';
-import { authorizeOperatorWrite } from '@/control/operatorSessions/operatorSessionAuth';
 import { verifyMachineToken } from '@/machines/machineRoutes';
 import { sendMessageTransaction } from './sendMessageTransaction';
-import { publishControlEvent } from '@/control/events/publishControlEvent';
-import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
-import { redactControlText } from '@/control/redaction/redactControlText';
+import { writeEventAndBroadcast } from './writeEventAndBroadcast';
+import { writeThreadReplyEventAndBroadcast } from './writeThreadReplyEventAndBroadcast';
+import { resolveSenderDisplayNames, formatMessage, resolveAttachedTasks, resolveAttachmentMetadata } from './messageFormatting';
+import { classifyAndMaybeCreateTask } from '@/control/classify/classifyAndMaybeCreateTask';
 
 const MAX_PAGE_SIZE = 100;
 
+// ── Auth resolvers (Slice 7 B2-d) ────────────────────────────────────────────────
+
 /**
- * Resolve sender display names in a batch (no N+1).
- * For `agent` senderKind: look up ControlAgent.displayName / name.
- * For `user` or `system` senderKind: no agent row; return null (client renders kind as label).
+ * Read actor for any GET that knows the workroom id up-front (workroom-in-URL routes).
+ * Inline so we preserve the route-specific status-code matrix:
+ *   no Bearer → 401, invalid session/token → 401, user non-member → 403,
+ *   machine cross-org → 403, workroom missing → 404.
  *
- * Returns a map from senderId → display name string.
- * Missing or unresolvable senders → absent from map (caller converts to null).
+ * Mirrors resolveChannelReadActor (B2-c) and resolveTaskReadActor (B2-b).
  */
-async function resolveSenderDisplayNames(
-  senders: Array<{ senderId: string; senderKind: string }>,
-): Promise<Map<string, string>> {
-  const result = new Map<string, string>();
-  // ControlAgent.id is @db.Uuid; senderId is opaque text (may be a non-uuid like
-  // 'kris' or 'pairing:<uuid>'). Filter to uuid-shaped ids before querying, else
-  // Prisma throws P2023 (Inconsistent column data) on the uuid column. Non-uuid
-  // agent senderIds simply resolve to no display name (caller falls back).
-  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const agentIds = [
-    ...new Set(
-      senders
-        .filter((s) => s.senderKind === 'agent')
-        .map((s) => s.senderId)
-        .filter((id) => uuidRe.test(id)),
-    ),
-  ];
-  if (agentIds.length === 0) return result;
+type MessageReadActor =
+  | { kind: 'user'; userId: string }
+  | { kind: 'machine'; machineId: string };
 
-  // S2 §1.4 — additive (id ∪ machineId) resolution. An agent senderId may be either
-  // ControlAgent.id (agent sent as itself, S1) OR machine.id (daemon send). Match on
-  // either and key the result map by whichever id the sender actually used.
-  //   - id is @db.Uuid: agentIds are already uuid-shape-filtered above → safe to query.
-  //   - machineId is text: querying it with the same (uuid-shaped) agentIds is safe.
-  //
-  // MULTIPLE AGENTS PER MACHINE: the (org, machine) unique was dropped, so a machine.id
-  // can map to MANY ControlAgent rows. A daemon message uses senderId = machine.id and is
-  // therefore AMBIGUOUS — there is no single "the" agent for that machine. We pick the
-  // FIRST agent by createdAt (oldest = the default agent created at bind-org) deterministically.
-  // We order ascending and only set the machineId key once (do not overwrite), so the
-  // oldest agent's name always wins regardless of row return order.
-  const agents = await db.controlAgent.findMany({
-    where: { OR: [{ id: { in: agentIds } }, { machineId: { in: agentIds } }] },
-    select: { id: true, machineId: true, displayName: true, name: true },
-    orderBy: { createdAt: 'asc' },
-  });
+type MessageReadResult =
+  | { ok: true; viewerId: string; actor: MessageReadActor }
+  | { ok: false; status: number; error: { code: string; message: string } };
 
-  for (const a of agents) {
-    const label = a.displayName?.trim() || a.name?.trim();
-    if (!label) continue;
-    result.set(a.id, label);                          // agent-id senders (S1): exact, unambiguous
-    // machine-id senders (daemon): first (oldest) agent for the machine wins — deterministic.
-    if (a.machineId && !result.has(a.machineId)) result.set(a.machineId, label);
+async function resolveMessageReadActor(
+  req: FastifyRequest,
+  workroomId: string,
+): Promise<MessageReadResult> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return { ok: false, status: 401, error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } };
   }
-  return result;
+  const token = authHeader.slice(7);
+
+  // ── Path 1: user_sess_ ──
+  if (token.startsWith(USER_SESSION_TOKEN_PREFIX)) {
+    const session = await resolveUserSession(authHeader);
+    if (!session) {
+      return { ok: false, status: 401, error: { code: 'INVALID_SESSION', message: 'Invalid or expired session' } };
+    }
+    // Workroom missing → 404 (anti-enumeration, mirrors memberRoutes / channelRoutes).
+    const wr = await db.controlWorkroom.findUnique({ where: { id: workroomId }, select: { id: true } });
+    if (!wr) {
+      return { ok: false, status: 404, error: { code: 'WORKROOM_NOT_FOUND', message: 'Workroom not found' } };
+    }
+    const mem = await db.userWorkroomMembership.findUnique({
+      where: { userId_workroomId: { userId: session.userId, workroomId } },
+    });
+    if (!mem) {
+      return { ok: false, status: 403, error: { code: 'FORBIDDEN', message: 'Forbidden' } };
+    }
+    return { ok: true, viewerId: session.userId, actor: { kind: 'user', userId: session.userId } };
+  }
+
+  // ── Path 2: machine_token ──
+  const machine = await verifyMachineToken(authHeader);
+  if (!machine) {
+    return { ok: false, status: 401, error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } };
+  }
+  const access = await requireMachineAccessToWorkroom(machine, workroomId);
+  if (!access.ok) return { ok: false, status: access.status, error: access.error };
+  return { ok: true, viewerId: machine.id, actor: { kind: 'machine', machineId: machine.id } };
 }
 
 /**
- * Format a ControlMessage row as the wire shape (§4.2).
- * sender_display_name: resolved for agents; null for user/system.
+ * Write subject for message writes (send, reply, save/unsave, mark-handled).
+ *   - user_sess_ → must be a workroom OWNER (Slice 7 §6.2). Non-owner → 403; non-member → 403.
+ *   - machine_token → must have org access to the workroom.
+ *   - missing / invalid → 401.
+ *
+ * Per-site helper shape: returns the canonical `subjectId` that becomes:
+ *   - senderId for messages       (user.id / machine.id — agent_id may override on machine path)
+ *   - subjectId for ControlSavedMessage rows
+ *   - subjectId for ControlActivityState rows
+ *
+ * `command` is reserved for future audit; user/machine path does not gate by it
+ * (granular per-command grants died with Slice 7 — mirrors authorizeTaskWrite / authorizeChannelWrite).
  */
-function formatMessage(
-  msg: {
-    id: string;
-    seq: bigint;
-    senderKind: string;
-    senderId: string;
-    content: string;
-    mentions: string[];
-    embeddedCardType: string | null;
-    embeddedCardId: string | null;
-    threadReplyCount: number;
-    createdAt: Date;
-    channelId: string;
-    parentMessageId: string | null;
-  },
-  senderNames: Map<string, string>,
-) {
-  return {
-    id: msg.id,
-    seq: msg.seq.toString(),
-    sender_kind: msg.senderKind,
-    sender_id: msg.senderId,
-    sender_display_name: senderNames.get(msg.senderId) ?? null,
-    content: msg.content,
-    mentions: msg.mentions,
-    embedded_card_type: msg.embeddedCardType,
-    embedded_card_id: msg.embeddedCardId,
-    thread_reply_count: msg.threadReplyCount,
-    parent_message_id: msg.parentMessageId ?? null,
-    created_at: msg.createdAt.toISOString(),
-  };
+type MessageWriteSubject =
+  | { kind: 'user'; userId: string; subjectId: string }
+  | { kind: 'machine'; machineId: string; subjectId: string };
+
+type MessageWriteResult =
+  | { ok: true; subject: MessageWriteSubject }
+  | { ok: false; status: number; body: { error: { code: string; message: string } } };
+
+async function authorizeMessageWrite(
+  req: FastifyRequest,
+  opts: { workroomId: string; command: 'send_message' | 'save_message' | 'mark_reviewed' },
+): Promise<MessageWriteResult> {
+  void opts.command; // reserved for future audit; user/machine path does not gate by command
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return {
+      ok: false,
+      status: 401,
+      body: { error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } },
+    };
+  }
+  const token = authHeader.slice(7);
+
+  // ── Path 1: user_sess_ ──
+  if (token.startsWith(USER_SESSION_TOKEN_PREFIX)) {
+    const session = await resolveUserSession(authHeader);
+    if (!session) {
+      return {
+        ok: false,
+        status: 401,
+        body: { error: { code: 'INVALID_SESSION', message: 'Invalid or expired session' } },
+      };
+    }
+    const mem = await db.userWorkroomMembership.findUnique({
+      where: { userId_workroomId: { userId: session.userId, workroomId: opts.workroomId } },
+    });
+    if (!mem) {
+      return { ok: false, status: 403, body: { error: { code: 'FORBIDDEN', message: 'Forbidden' } } };
+    }
+    if (mem.role !== 'owner') {
+      return { ok: false, status: 403, body: { error: { code: 'FORBIDDEN', message: 'Forbidden' } } };
+    }
+    return {
+      ok: true,
+      subject: { kind: 'user', userId: session.userId, subjectId: session.userId },
+    };
+  }
+
+  // ── Path 2: machine_token ──
+  const machine = await verifyMachineToken(authHeader);
+  if (!machine) {
+    return {
+      ok: false,
+      status: 401,
+      body: { error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } },
+    };
+  }
+  const access = await requireMachineAccessToWorkroom(machine, opts.workroomId);
+  if (!access.ok) {
+    return { ok: false, status: access.status, body: { error: access.error } };
+  }
+  return { ok: true, subject: { kind: 'machine', machineId: machine.id, subjectId: machine.id } };
 }
 
 /**
@@ -147,6 +209,7 @@ async function fetchFormattedMessage(id: string) {
       senderId: true,
       content: true,
       mentions: true,
+      attachmentIds: true,
       embeddedCardType: true,
       embeddedCardId: true,
       threadReplyCount: true,
@@ -157,7 +220,12 @@ async function fetchFormattedMessage(id: string) {
   });
   if (!row) return null;
   const names = await resolveSenderDisplayNames([{ senderId: row.senderId, senderKind: row.senderKind }]);
-  return formatMessage(row, names);
+  const attached = await resolveAttachedTasks([row.id]);
+  const attachmentMetadata = await resolveAttachmentMetadata(row.attachmentIds);
+  return formatMessage(row, names, {
+    attachedTask: attached.get(row.id) ?? null,
+    attachmentMetadata,
+  });
 }
 
 export async function messageRoutes(app: FastifyInstance) {
@@ -165,6 +233,8 @@ export async function messageRoutes(app: FastifyInstance) {
    * GET /api/v1/workrooms/:wid/channels/:cid/messages
    *
    * Seq-ascending paginated messages for a channel.
+   *
+   * Auth: userOrMachine — user_sess_ workroom member OR machine_token org-scoped.
    *
    * Query params:
    *   after_seq  — exclusive lower bound (seq > after_seq). Absent → most recent `limit` rows.
@@ -174,19 +244,10 @@ export async function messageRoutes(app: FastifyInstance) {
    * Channel not in workroom: 404.
    */
   app.get('/api/v1/workrooms/:wid/channels/:cid/messages', async (request, reply) => {
-    // Dual-auth: machine_token (full) OR dev_control_token (read-only, allowlist + workroom-scope).
-    const auth = await authorizeControlRead(request);
-    if (!auth.ok) {
-      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
-    }
-
     const { wid, cid } = request.params as { wid: string; cid: string };
 
-    // machine mode: enforce org/workroom access.
-    if (auth.mode === 'machine') {
-      const access = await requireMachineAccessToWorkroom(auth.machine, wid);
-      if (!access.ok) return reply.code(access.status).send({ error: access.error });
-    }
+    const guard = await resolveMessageReadActor(request, wid);
+    if (!guard.ok) return reply.code(guard.status).send({ error: guard.error });
 
     // Parse query params.
     const query = request.query as { after_seq?: string; limit?: string };
@@ -204,12 +265,8 @@ export async function messageRoutes(app: FastifyInstance) {
       : MAX_PAGE_SIZE;
 
     // Verify the channel belongs to this workroom AND is visible to this viewer.
-    // visibleChannels returns all visible (non-archived) channels for the workroom.
-    // We then check if cid is among them. This ensures:
-    //   - channel exists in this workroom
-    //   - viewer can see it (public or member of private)
     // 404 for both missing and private-non-member (uniform, anti-enumeration).
-    const visible = await visibleChannels(auth, wid);
+    const visible = await visibleChannels({ viewerId: guard.viewerId, viewerKind: guard.actor.kind }, wid);
     const channel = visible.find((ch) => ch.id === cid);
     if (!channel) {
       return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
@@ -231,28 +288,35 @@ export async function messageRoutes(app: FastifyInstance) {
       hasMore = rows.length > requestedLimit;
       page = rows.slice(0, requestedLimit);
     } else {
-      // No after_seq: most recent `limit` rows.
-      // Fetch limit+1 desc to detect has_more; slice to limit; reverse to ascending order.
       const rows = await db.controlMessage.findMany({
-        // S2 §3/§5: replies (parentMessageId set) are excluded from the main timeline.
         where: { channelId: cid, parentMessageId: null },
         orderBy: { seq: 'desc' },
         take: requestedLimit + 1,
       });
       hasMore = rows.length > requestedLimit;
       const pageDesc = rows.slice(0, requestedLimit);
-      pageDesc.reverse(); // seq-ascending
+      pageDesc.reverse();
       page = pageDesc;
     }
 
-    // Resolve sender display names (batch, no N+1).
     const senderNames = await resolveSenderDisplayNames(
       page.map((m) => ({ senderId: m.senderId, senderKind: m.senderKind })),
+    );
+    // Bug-2 Thread feature: batch-load attached_task per message (no N+1).
+    const attachedByMsg = await resolveAttachedTasks(page.map((m) => m.id));
+    // S7 attachment-preview: batch-load attachment metadata for inline previews.
+    const attachmentMetadata = await resolveAttachmentMetadata(
+      page.flatMap((m) => m.attachmentIds),
     );
 
     return {
       channel_id: cid,
-      messages: page.map((m) => formatMessage(m, senderNames)),
+      messages: page.map((m) =>
+        formatMessage(m, senderNames, {
+          attachedTask: attachedByMsg.get(m.id) ?? null,
+          attachmentMetadata,
+        }),
+      ),
       has_more: hasMore,
     };
   });
@@ -261,174 +325,111 @@ export async function messageRoutes(app: FastifyInstance) {
    * GET /api/v1/messages/:id
    *
    * Fetch a single message by id. Used for thread parent / deep links (§4.4).
+   * Auth: userOrMachine. Workroom is DERIVED from the loaded message (not in URL).
    *
-   * Auth: dual-read + channel visibility check.
-   * Returns the message including its channel_id.
-   * Private channel non-member → 404 (uniform, anti-enumeration).
+   * Anti-enumeration:
+   *   - missing message → 404
+   *   - user-actor not a member of message.workroomId → 404 (NOT 403)
+   *   - machine-actor cross-org → 404 (NOT 403; mirrors the missing-message shape)
+   *   - private channel non-member → 404
    */
   app.get('/api/v1/messages/:id', async (request, reply) => {
-    // Dual-auth: machine_token (full) OR dev_control_token (read-only, allowlist + workroom-scope).
-    // NOTE: /api/v1/messages/:id is NOT on the dev-token allowlist in S1 (added in Chunk 5).
-    // For now only machine tokens can reach this endpoint via authorizeControlRead.
-    const auth = await authorizeControlRead(request);
-    if (!auth.ok) {
-      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
+    const authHeader = request.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
     }
+    const token = authHeader.slice(7);
 
     const { id } = request.params as { id: string };
 
-    // Fetch the message first.
-    const msg = await db.controlMessage.findUnique({
-      where: { id },
-    });
-
-    // 404 if message doesn't exist.
+    // Fetch the message first so we know the workroom to authorize against.
+    let msg: Awaited<ReturnType<typeof db.controlMessage.findUnique>> = null;
+    try {
+      msg = await db.controlMessage.findUnique({ where: { id } });
+    } catch {
+      // Malformed uuid → P2023 → uniform 404.
+      return reply.code(404).send({ error: { code: 'MESSAGE_NOT_FOUND', message: 'Message not found' } });
+    }
     if (!msg) {
       return reply.code(404).send({ error: { code: 'MESSAGE_NOT_FOUND', message: 'Message not found' } });
     }
 
-    // machine mode: enforce org/workroom access.
-    if (auth.mode === 'machine') {
-      const access = await requireMachineAccessToWorkroom(auth.machine, msg.workroomId);
-      if (!access.ok) return reply.code(access.status).send({ error: access.error });
+    let viewerId: string;
+    let viewerKind: 'user' | 'machine';
+    // ── Resolve actor for THIS message's workroom (derived) ──
+    if (token.startsWith(USER_SESSION_TOKEN_PREFIX)) {
+      const session = await resolveUserSession(authHeader);
+      if (!session) {
+        return reply.code(401).send({ error: { code: 'INVALID_SESSION', message: 'Invalid or expired session' } });
+      }
+      // Anti-enumeration: non-member → 404 (NOT 403). This is the uniform-404 semantic
+      // for derived-workroom routes that must not reveal whether the message exists.
+      const mem = await db.userWorkroomMembership.findUnique({
+        where: { userId_workroomId: { userId: session.userId, workroomId: msg.workroomId } },
+      });
+      if (!mem) {
+        return reply.code(404).send({ error: { code: 'MESSAGE_NOT_FOUND', message: 'Message not found' } });
+      }
+      viewerId = session.userId;
+      viewerKind = 'user';
+    } else {
+      const machine = await verifyMachineToken(authHeader);
+      if (!machine) {
+        return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
+      }
+      const access = await requireMachineAccessToWorkroom(machine, msg.workroomId);
+      if (!access.ok) {
+        // Anti-enumeration: machine cross-org → 404 (not 403). Same uniform 404 as above.
+        return reply.code(404).send({ error: { code: 'MESSAGE_NOT_FOUND', message: 'Message not found' } });
+      }
+      viewerId = machine.id;
+      viewerKind = 'machine';
     }
 
     // Channel visibility check: verify the viewer can see this channel.
     // 404 uniform for non-member private channels (anti-enumeration).
-    const visible = await visibleChannels(auth, msg.workroomId);
+    const visible = await visibleChannels({ viewerId, viewerKind }, msg.workroomId);
     const isVisible = visible.some((ch) => ch.id === msg.channelId);
     if (!isVisible) {
       return reply.code(404).send({ error: { code: 'MESSAGE_NOT_FOUND', message: 'Message not found' } });
     }
 
-    // Resolve sender display name.
     const senderNames = await resolveSenderDisplayNames([{ senderId: msg.senderId, senderKind: msg.senderKind }]);
+    const attachedByMsg = await resolveAttachedTasks([msg.id]);
+    const attachmentMetadata = await resolveAttachmentMetadata(msg.attachmentIds);
 
     return {
-      ...formatMessage(msg, senderNames),
+      ...formatMessage(msg, senderNames, {
+        attachedTask: attachedByMsg.get(msg.id) ?? null,
+        attachmentMetadata,
+      }),
       channel_id: msg.channelId,
     };
   });
 
   /**
-   * POST /api/v1/workrooms/:wid/channels/:cid/messages  (S1 Chunk 4)
+   * POST /api/v1/workrooms/:wid/channels/:cid/messages
    *
    * Send a message to a channel.
-   *
-   * Auth:
-   *   1. op_sess_ (command 'send_message', workroomId-scoped) via authorizeOperatorWrite.
-   *   2. machine_token via verifyMachineToken + requireMachineAccessToWorkroom.
-   *   dev_ctl_ → hard 403 (defense-in-depth; authorizeOperatorWrite rejects it first, but we
-   *   also catch it on the machine path because dev_ctl_ does not pass verifyMachineToken).
+   * Auth (Slice 7): user_sess_ (workroom OWNER) OR machine_token, via authorizeMessageWrite.
    *
    * Idempotency:
-   *   op_sess_ path: client_idempotency_key REQUIRED (absent → 400).
-   *   machine path: client_idempotency_key optional (null → no collision; two machine sends →
-   *     two distinct messages, as intended per spec §4.3 / schema @@unique behaviour for NULLs).
+   *   user path:    client_idempotency_key REQUIRED (absent → 400).
+   *   machine path: client_idempotency_key optional (null → no collision; two machine sends
+   *                 → two distinct messages per spec §4.3 / schema @@unique NULL semantics).
    *
-   * Membership:
-   *   private/dm non-member send → 403.
+   * Membership of the target channel: private/dm non-member → 403 (via sendMessageTransaction).
    *
-   * Post-commit broadcast:
-   *   publishAndBroadcast('message.created') with preview = redactControlText(content).slice(0,120).
-   *   Broadcast failure is non-fatal (client catches up via GET).
+   * Post-commit: publishAndBroadcast('message.created') with redacted+truncated preview.
+   * Broadcast failure is non-fatal (client catches up via GET).
    */
   app.post('/api/v1/workrooms/:wid/channels/:cid/messages', async (request, reply) => {
     const { wid, cid } = request.params as { wid: string; cid: string };
 
-    // ── Auth: try op_sess_ first, then machine_token. dev_ctl_ rejected by both. ──
-    let senderKind: string;
-    let senderId: string;
+    const auth = await authorizeMessageWrite(request, { workroomId: wid, command: 'send_message' });
+    if (!auth.ok) return reply.code(auth.status).send(auth.body);
 
-    const authHeader = request.headers.authorization;
-
-    // Defense-in-depth: explicitly 403 dev_ctl_ before trying either auth path.
-    // (authorizeOperatorWrite also hard-rejects dev_ctl_, but we check here too so the
-    // machine fallback cannot inadvertently accept a dev token in some edge case.)
-    const rawToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
-    if (rawToken.startsWith('dev_ctl_')) {
-      return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
-    }
-
-    // Path 1: op_sess_ (operator / human)
-    const opAuth = await authorizeOperatorWrite(request, { command: 'send_message', workroomId: wid });
-
-    if (opAuth.ok) {
-      // op_sess_ path: client_idempotency_key is REQUIRED.
-      const body = request.body as {
-        content?: unknown;
-        mentions?: unknown;
-        embedded_card_type?: unknown;
-        embedded_card_id?: unknown;
-        client_idempotency_key?: unknown;
-      } | null;
-
-      if (!body?.client_idempotency_key || typeof body.client_idempotency_key !== 'string') {
-        return reply.code(400).send({
-          error: { code: 'MISSING_IDEMPOTENCY_KEY', message: 'client_idempotency_key is required for operator sends' },
-        });
-      }
-
-      if (!body.content || typeof body.content !== 'string') {
-        return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'content is required' } });
-      }
-
-      senderKind = 'user';
-      senderId = opAuth.session.operatorSubjectId;
-
-      const result = await sendMessageTransaction({
-        channelId: cid,
-        workroomId: wid,
-        senderKind,
-        senderId,
-        content: body.content,
-        mentions: Array.isArray(body.mentions) ? (body.mentions as string[]) : [],
-        embeddedCardType: typeof body.embedded_card_type === 'string' ? body.embedded_card_type : null,
-        embeddedCardId: typeof body.embedded_card_id === 'string' ? body.embedded_card_id : null,
-        clientIdempotencyKey: body.client_idempotency_key,
-      });
-
-      if (!result.ok) {
-        if (result.code === 'CHANNEL_NOT_FOUND') {
-          return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
-        }
-        if (result.code === 'CHANNEL_FORBIDDEN') {
-          return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
-        }
-        return reply.code(500).send({ error: { code: 'INTERNAL_ERROR', message: 'Internal error' } });
-      }
-
-      // Post-commit write-before-broadcast:
-      //   1. publishControlEvent writes the event row to DB (awaited — guarantees event exists before response).
-      //   2. WS broadcast is fire-and-forget (non-fatal; client catches up via GET /events).
-      await writeEventAndBroadcast(result);
-
-      // S2 §2-C: return the FULL message wire shape (re-fetched) + idempotent flag.
-      return reply.code(201).send({
-        ...(await fetchFormattedMessage(result.id))!,
-        idempotent: result.idempotent,
-      });
-    }
-
-    // op_sess_ returned 401 (not an op_sess_ token) — fall through to machine path.
-    // op_sess_ returned 403 (wrong workroom / command) — hard reject.
-    if (opAuth.status === 403) {
-      return reply.code(403).send({ error: { code: opAuth.code, message: opAuth.message } });
-    }
-
-    // Path 2: machine_token
-    const machine = await verifyMachineToken(authHeader);
-    if (!machine) {
-      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
-    }
-
-    const access = await requireMachineAccessToWorkroom(machine, wid);
-    if (!access.ok) {
-      return reply.code(access.status).send({ error: access.error });
-    }
-
-    // machine path: parse body (client_idempotency_key is optional → null if absent)
-    const machineBody = request.body as {
+    const body = request.body as {
       content?: unknown;
       mentions?: unknown;
       embedded_card_type?: unknown;
@@ -437,53 +438,87 @@ export async function messageRoutes(app: FastifyInstance) {
       agent_id?: unknown;
     } | null;
 
-    if (!machineBody?.content || typeof machineBody.content !== 'string') {
+    if (!body?.content || typeof body.content !== 'string') {
       return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'content is required' } });
     }
 
-    // Multi-agent attribution (machine path): an optional agent_id lets a machine post AS one of
-    // the agents it owns (e.g. "PM"), so the message carries senderId = <agent id> and
-    // resolveSenderDisplayNames (id branch) maps it to that agent's name. Absent → legacy default
-    // (senderId = machine.id). Operator path never reaches here, so op senders ignore agent_id.
-    const machineSender = await resolveMachineSenderId(machine.id, machineBody.agent_id);
-    if (!machineSender.ok) {
-      return reply.code(403).send({ error: { code: machineSender.code, message: machineSender.message } });
+    // Per-actor idempotency policy + sender attribution.
+    let senderKind: string;
+    let senderId: string;
+    let clientIdempotencyKey: string | null;
+
+    if (auth.subject.kind === 'user') {
+      // User path: idempotency key REQUIRED.
+      if (!body.client_idempotency_key || typeof body.client_idempotency_key !== 'string') {
+        return reply.code(400).send({
+          error: { code: 'MISSING_IDEMPOTENCY_KEY', message: 'client_idempotency_key is required for user sends' },
+        });
+      }
+      senderKind = 'user';
+      senderId = auth.subject.userId;
+      clientIdempotencyKey = body.client_idempotency_key;
+    } else {
+      // Machine path: idempotency key optional. agent_id may override senderId.
+      const machineSender = await resolveMachineSenderId(auth.subject.machineId, body.agent_id);
+      if (!machineSender.ok) {
+        return reply.code(403).send({ error: { code: machineSender.code, message: machineSender.message } });
+      }
+      senderKind = 'agent';
+      senderId = machineSender.senderId;
+      clientIdempotencyKey = typeof body.client_idempotency_key === 'string' ? body.client_idempotency_key : null;
     }
 
-    senderKind = 'agent';
-    senderId = machineSender.senderId;
-
-    const machineResult = await sendMessageTransaction({
+    const result = await sendMessageTransaction({
       channelId: cid,
       workroomId: wid,
       senderKind,
       senderId,
-      content: machineBody.content,
-      mentions: Array.isArray(machineBody.mentions) ? (machineBody.mentions as string[]) : [],
-      embeddedCardType: typeof machineBody.embedded_card_type === 'string' ? machineBody.embedded_card_type : null,
-      embeddedCardId: typeof machineBody.embedded_card_id === 'string' ? machineBody.embedded_card_id : null,
-      clientIdempotencyKey: typeof machineBody.client_idempotency_key === 'string'
-        ? machineBody.client_idempotency_key
-        : null,
+      content: body.content,
+      mentions: Array.isArray(body.mentions) ? (body.mentions as string[]) : [],
+      embeddedCardType: typeof body.embedded_card_type === 'string' ? body.embedded_card_type : null,
+      embeddedCardId: typeof body.embedded_card_id === 'string' ? body.embedded_card_id : null,
+      clientIdempotencyKey,
     });
 
-    if (!machineResult.ok) {
-      if (machineResult.code === 'CHANNEL_NOT_FOUND') {
+    if (!result.ok) {
+      if (result.code === 'CHANNEL_NOT_FOUND') {
         return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
       }
-      if (machineResult.code === 'CHANNEL_FORBIDDEN') {
+      if (result.code === 'CHANNEL_FORBIDDEN') {
         return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
       }
       return reply.code(500).send({ error: { code: 'INTERNAL_ERROR', message: 'Internal error' } });
     }
 
-    // Post-commit write-before-broadcast (same as op_sess_ path above).
-    await writeEventAndBroadcast(machineResult);
+    // Classifier hook: top-level user/agent messages may auto-promote to a task.
+    // Thread replies are excluded (this route is the top-level send path, but the
+    // hook also self-gates on parentMessageId === null defensively). Skipped on
+    // idempotent replay so a retried POST does not create duplicate tasks.
+    //
+    // Run BEFORE writeEventAndBroadcast: the classifier may create a task and
+    // insert a system message, and downstream auto-route logic in the agent-api
+    // depends on the task already existing when the daemon receives the WS push.
+    // Adds ~1.5s to the POST latency — accepted per product spec.
+    if (!result.idempotent) {
+      await classifyAndMaybeCreateTask({
+        workroomId: wid,
+        channelId: cid,
+        messageId: result.id,
+        parentMessageId: null,
+        senderKind,
+        senderId,
+        content: body.content,
+      });
+    }
+
+    // Post-commit write-before-broadcast (runs AFTER classifier so the task +
+    // system message are persisted before the daemon sees the original message).
+    await writeEventAndBroadcast(result);
 
     // S2 §2-C: return the FULL message wire shape (re-fetched) + idempotent flag.
     return reply.code(201).send({
-      ...(await fetchFormattedMessage(machineResult.id))!,
-      idempotent: machineResult.idempotent,
+      ...(await fetchFormattedMessage(result.id))!,
+      idempotent: result.idempotent,
     });
   });
 
@@ -491,46 +526,36 @@ export async function messageRoutes(app: FastifyInstance) {
 
   /**
    * Resolve a thread parent for a read request: load the parent message, enforce
-   * machine org/workroom access, and verify the parent's channel is visible to the
-   * viewer. Returns the parent row on success, or a reply-status object on failure.
-   * 404 (uniform) for missing parent, parent-in-other-workroom, or invisible channel.
+   * userOrMachine workroom scope (via resolveMessageReadActor), and verify the
+   * parent's channel is visible to the viewer. 404 (uniform) for missing parent,
+   * parent-in-other-workroom, or invisible channel.
    */
   async function loadVisibleParent(
     request: FastifyRequest,
     wid: string,
     parentId: string,
   ): Promise<
-    | { ok: true; auth: Extract<Awaited<ReturnType<typeof authorizeControlRead>>, { ok: true }>; parent: { id: string; channelId: string; workroomId: string } }
+    | { ok: true; viewerId: string; parent: { id: string; channelId: string; workroomId: string } }
     | { ok: false; status: number; body: { error: { code: string; message: string } } }
   > {
-    const auth = await authorizeControlRead(request);
-    if (!auth.ok) {
-      return { ok: false, status: auth.status, body: { error: { code: auth.code, message: auth.message } } };
-    }
+    const guard = await resolveMessageReadActor(request, wid);
+    if (!guard.ok) return { ok: false, status: guard.status, body: { error: guard.error } };
 
     const parent = await db.controlMessage.findUnique({
       where: { id: parentId },
       select: { id: true, channelId: true, workroomId: true },
     });
-    // 404 uniform: missing parent or parent not in this workroom.
     if (!parent || parent.workroomId !== wid) {
       return { ok: false, status: 404, body: { error: { code: 'THREAD_NOT_FOUND', message: 'Thread not found' } } };
     }
 
-    if (auth.mode === 'machine') {
-      const access = await requireMachineAccessToWorkroom(auth.machine, wid);
-      if (!access.ok) {
-        return { ok: false, status: access.status, body: { error: access.error } };
-      }
-    }
-
     // Channel visibility: 404 uniform if the parent's channel is not visible (anti-enumeration).
-    const visible = await visibleChannels(auth, wid);
+    const visible = await visibleChannels({ viewerId: guard.viewerId, viewerKind: guard.actor.kind }, wid);
     if (!visible.some((ch) => ch.id === parent.channelId)) {
       return { ok: false, status: 404, body: { error: { code: 'THREAD_NOT_FOUND', message: 'Thread not found' } } };
     }
 
-    return { ok: true, auth, parent };
+    return { ok: true, viewerId: guard.viewerId, parent };
   }
 
   /**
@@ -548,12 +573,20 @@ export async function messageRoutes(app: FastifyInstance) {
       select: { replyCount: true, lastReplyAt: true },
     });
 
+    // Bug-2 Thread feature: surface attached task_id on thread meta so iOS can
+    // jump straight to the task chip from the thread header.
+    const attached = await db.controlTask.findFirst({
+      where: { parentMessageId: parentId },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true },
+    });
+
     return {
       id: parentId,
       parent_message_id: parentId,
       reply_count: thread?.replyCount ?? 0,
       last_reply_at: thread?.lastReplyAt ? thread.lastReplyAt.toISOString() : null,
-      task_id: null, // reserved for S3 (task-as-thread); always null this milestone.
+      task_id: attached?.id ?? null,
     };
   });
 
@@ -587,7 +620,7 @@ export async function messageRoutes(app: FastifyInstance) {
       take: requestedLimit + 1,
       select: {
         id: true, seq: true, senderKind: true, senderId: true, content: true,
-        mentions: true, embeddedCardType: true, embeddedCardId: true,
+        mentions: true, attachmentIds: true, embeddedCardType: true, embeddedCardId: true,
         threadReplyCount: true, createdAt: true, channelId: true, parentMessageId: true,
       },
     });
@@ -597,10 +630,22 @@ export async function messageRoutes(app: FastifyInstance) {
     const senderNames = await resolveSenderDisplayNames(
       page.map((m) => ({ senderId: m.senderId, senderKind: m.senderKind })),
     );
+    // Bug-2 Thread feature: include attached_task on replies as well (nearly
+    // always null in practice, but symmetric with timeline GET).
+    const attachedByMsg = await resolveAttachedTasks(page.map((m) => m.id));
+    // S7 attachment-preview: batch-load attachment metadata for inline previews.
+    const attachmentMetadata = await resolveAttachmentMetadata(
+      page.flatMap((m) => m.attachmentIds),
+    );
 
     return {
       parent_message_id: parentId,
-      messages: page.map((m) => formatMessage(m, senderNames)),
+      messages: page.map((m) =>
+        formatMessage(m, senderNames, {
+          attachedTask: attachedByMsg.get(m.id) ?? null,
+          attachmentMetadata,
+        }),
+      ),
       has_more: hasMore,
     };
   });
@@ -608,7 +653,7 @@ export async function messageRoutes(app: FastifyInstance) {
   /**
    * POST /api/v1/workrooms/:wid/threads/:parentId/reply  (S2 §4.4)
    *
-   * Auth: op_sess_ (command 'send_message') OR machine_token. dev_ctl_ → hard 403.
+   * Auth (Slice 7): user_sess_ (workroom OWNER) OR machine_token, via authorizeMessageWrite.
    * The reply routes through the extended sendMessageTransaction (parentMessageId set),
    * which does the thread bookkeeping in the same $transaction. Post-commit, publishes a
    * thread.reply event (write-before-broadcast; skipped on idempotent replay).
@@ -616,20 +661,8 @@ export async function messageRoutes(app: FastifyInstance) {
   app.post('/api/v1/workrooms/:wid/threads/:parentId/reply', async (request, reply) => {
     const { wid, parentId } = request.params as { wid: string; parentId: string };
 
-    const authHeader = request.headers.authorization;
-
-    // Defense-in-depth: explicitly 403 dev_ctl_ before either write-auth path.
-    const rawToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
-    if (rawToken.startsWith('dev_ctl_')) {
-      return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
-    }
-
-    // Resolve sender via op_sess_ first, then machine_token.
-    let senderKind: string;
-    let senderId: string;
-    let clientIdempotencyKey: string | null = null;
-    let content: string;
-    let mentions: string[] = [];
+    const auth = await authorizeMessageWrite(request, { workroomId: wid, command: 'send_message' });
+    if (!auth.ok) return reply.code(auth.status).send(auth.body);
 
     const body = request.body as {
       content?: unknown;
@@ -638,52 +671,35 @@ export async function messageRoutes(app: FastifyInstance) {
       agent_id?: unknown;
     } | null;
 
-    const opAuth = await authorizeOperatorWrite(request, { command: 'send_message', workroomId: wid });
+    if (!body?.content || typeof body.content !== 'string') {
+      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'content is required' } });
+    }
 
-    if (opAuth.ok) {
-      if (!body?.client_idempotency_key || typeof body.client_idempotency_key !== 'string') {
+    let senderKind: string;
+    let senderId: string;
+    let clientIdempotencyKey: string | null;
+
+    if (auth.subject.kind === 'user') {
+      if (!body.client_idempotency_key || typeof body.client_idempotency_key !== 'string') {
         return reply.code(400).send({
-          error: { code: 'MISSING_IDEMPOTENCY_KEY', message: 'client_idempotency_key is required for operator sends' },
+          error: { code: 'MISSING_IDEMPOTENCY_KEY', message: 'client_idempotency_key is required for user sends' },
         });
       }
-      if (!body.content || typeof body.content !== 'string') {
-        return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'content is required' } });
-      }
       senderKind = 'user';
-      senderId = opAuth.session.operatorSubjectId;
+      senderId = auth.subject.userId;
       clientIdempotencyKey = body.client_idempotency_key;
-      content = body.content;
-      mentions = Array.isArray(body.mentions) ? (body.mentions as string[]) : [];
     } else {
-      // op_sess_ returned 403 (wrong workroom / command) — hard reject.
-      if (opAuth.status === 403) {
-        return reply.code(403).send({ error: { code: opAuth.code, message: opAuth.message } });
-      }
-
-      // Path 2: machine_token (client_idempotency_key optional).
-      const machine = await verifyMachineToken(authHeader);
-      if (!machine) {
-        return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
-      }
-      const access = await requireMachineAccessToWorkroom(machine, wid);
-      if (!access.ok) {
-        return reply.code(access.status).send({ error: access.error });
-      }
-      if (!body?.content || typeof body.content !== 'string') {
-        return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'content is required' } });
-      }
-      // Multi-agent attribution (machine reply path): mirror the POST messages route — an
-      // optional agent_id attributes the reply to an owned agent's id; absent → machine.id default.
-      const machineSender = await resolveMachineSenderId(machine.id, body.agent_id);
+      const machineSender = await resolveMachineSenderId(auth.subject.machineId, body.agent_id);
       if (!machineSender.ok) {
         return reply.code(403).send({ error: { code: machineSender.code, message: machineSender.message } });
       }
       senderKind = 'agent';
       senderId = machineSender.senderId;
       clientIdempotencyKey = typeof body.client_idempotency_key === 'string' ? body.client_idempotency_key : null;
-      content = body.content;
-      mentions = Array.isArray(body.mentions) ? (body.mentions as string[]) : [];
     }
+
+    const content = body.content;
+    const mentions = Array.isArray(body.mentions) ? (body.mentions as string[]) : [];
 
     // Load the parent → derive channelId (404 if missing / not in this workroom).
     const parent = await db.controlMessage.findUnique({
@@ -728,7 +744,6 @@ export async function messageRoutes(app: FastifyInstance) {
       idempotent: result.idempotent,
     });
 
-    // S2 §4.4: full message wire shape (re-fetched) + idempotent flag. 201 (mirrors S1).
     return reply.code(201).send({
       ...(await fetchFormattedMessage(result.id))!,
       idempotent: result.idempotent,
@@ -738,57 +753,11 @@ export async function messageRoutes(app: FastifyInstance) {
   // ── S5 Saved messages ────────────────────────────────────────────────────────
 
   /**
-   * Resolve the caller subject for a save/unsave write:
-   *   op_sess_('save_message')  → subjectId = operatorSubjectId
-   *   machine_token             → subjectId = machine.id
-   *   dev_ctl_                  → hard 403 (read-only credential cannot write)
-   *
-   * Returns { ok: true, subjectId } on success, or a reply-status object on failure.
-   * Mirrors the op-first → 403-on-wrong-scope → machine-fallback ordering of the
-   * send/reply write routes above.
-   */
-  async function resolveSaveSubject(
-    request: FastifyRequest,
-    wid: string,
-  ): Promise<
-    | { ok: true; subjectId: string }
-    | { ok: false; status: number; body: { error: { code: string; message: string } } }
-  > {
-    const authHeader = request.headers.authorization;
-
-    // Defense-in-depth: dev_ctl_ (read-only) can never authorize a write → 403.
-    const rawToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
-    if (rawToken.startsWith('dev_ctl_')) {
-      return { ok: false, status: 403, body: { error: { code: 'FORBIDDEN', message: 'Forbidden' } } };
-    }
-
-    // Path 1: op_sess_ (operator / human).
-    const opAuth = await authorizeOperatorWrite(request, { command: 'save_message', workroomId: wid });
-    if (opAuth.ok) {
-      return { ok: true, subjectId: opAuth.session.operatorSubjectId };
-    }
-    // op_sess_ valid but wrong workroom / command → hard 403.
-    if (opAuth.status === 403) {
-      return { ok: false, status: 403, body: { error: { code: opAuth.code, message: opAuth.message } } };
-    }
-
-    // Path 2: machine_token.
-    const machine = await verifyMachineToken(authHeader);
-    if (!machine) {
-      return { ok: false, status: 401, body: { error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } } };
-    }
-    const access = await requireMachineAccessToWorkroom(machine, wid);
-    if (!access.ok) {
-      return { ok: false, status: access.status, body: { error: access.error } };
-    }
-    return { ok: true, subjectId: machine.id };
-  }
-
-  /**
    * POST /api/v1/workrooms/:wid/messages/:id/save  (S5)
    *
    * Save (bookmark) a message for the caller subject.
-   * Auth: op_sess_('save_message') OR machine_token. dev_ctl_ → 403.
+   * Auth (Slice 7): user_sess_ (workroom OWNER) OR machine_token.
+   * subjectId: user.id for user actor, machine.id for machine actor.
    * Validates the message exists in :wid (404 otherwise — anti-enumeration uniform 404).
    * Idempotent: a second save (P2002 on (subjectId, messageId)) → 200 no-op.
    * Returns { ok: true }.
@@ -796,8 +765,8 @@ export async function messageRoutes(app: FastifyInstance) {
   app.post('/api/v1/workrooms/:wid/messages/:id/save', async (request, reply) => {
     const { wid, id } = request.params as { wid: string; id: string };
 
-    const subj = await resolveSaveSubject(request, wid);
-    if (!subj.ok) return reply.code(subj.status).send(subj.body);
+    const auth = await authorizeMessageWrite(request, { workroomId: wid, command: 'save_message' });
+    if (!auth.ok) return reply.code(auth.status).send(auth.body);
 
     // Validate the message exists in this workroom (404 uniform for missing / other-workroom).
     let msg: { id: string } | null = null;
@@ -816,10 +785,9 @@ export async function messageRoutes(app: FastifyInstance) {
 
     try {
       await db.controlSavedMessage.create({
-        data: { workroomId: wid, subjectId: subj.subjectId, messageId: id },
+        data: { workroomId: wid, subjectId: auth.subject.subjectId, messageId: id },
       });
     } catch (err) {
-      // Idempotent: already saved (P2002 on the (subject_id, message_id) unique index) → no-op.
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
         return reply.code(200).send({ ok: true });
       }
@@ -833,19 +801,19 @@ export async function messageRoutes(app: FastifyInstance) {
    * DELETE /api/v1/workrooms/:wid/messages/:id/save  (S5)
    *
    * Unsave a message for the caller subject.
-   * Auth: op_sess_('save_message') OR machine_token. dev_ctl_ → 403.
+   * Auth (Slice 7): user_sess_ (workroom OWNER) OR machine_token.
    * Idempotent: missing save → 200 no-op (deleteMany returns count 0).
    * Returns { ok: true }.
    */
   app.delete('/api/v1/workrooms/:wid/messages/:id/save', async (request, reply) => {
     const { wid, id } = request.params as { wid: string; id: string };
 
-    const subj = await resolveSaveSubject(request, wid);
-    if (!subj.ok) return reply.code(subj.status).send(subj.body);
+    const auth = await authorizeMessageWrite(request, { workroomId: wid, command: 'save_message' });
+    if (!auth.ok) return reply.code(auth.status).send(auth.body);
 
     try {
       await db.controlSavedMessage.deleteMany({
-        where: { subjectId: subj.subjectId, messageId: id },
+        where: { subjectId: auth.subject.subjectId, messageId: id },
       });
     } catch {
       // Malformed id → treat as no-op (uniform 200; nothing to delete).
@@ -858,37 +826,27 @@ export async function messageRoutes(app: FastifyInstance) {
   /**
    * GET /api/v1/workrooms/:wid/saved  (S5)
    *
-   * List the caller subject's saved messages in the workroom, newest first.
-   * Auth: authorizeControlRead (machine_token OR dev_ctl_; allowlisted + workroom-scoped).
+   * List the caller's saved messages in the workroom, newest first.
+   * Auth (Slice 7): userOrMachine — user_sess_ (member) OR machine_token.
    *
    * Subject resolution:
-   *   machine mode → subjectId = machine.id (machine-scoped saves).
-   *   dev mode     → NO subject (dev_ctl_ is a debug credential with no actor identity).
-   *                  Returns ALL saved rows in the workroom (debug view). DISCLOSED:
-   *                  this is intentional — dev_ctl_ has no subject to scope by.
+   *   user actor    → subjectId = user.id
+   *   machine actor → subjectId = machine.id
+   *
+   * The previous "dev_ctl_ no-subject → return ALL workroom saves (debug)" branch is GONE.
+   * Anonymous read tokens no longer exist post-Slice-7; leaving the branch would have been a
+   * privacy regression. The viewer's own subject is always non-null now.
    *
    * Returns { saved: [{ id, message_id }] }.
    */
   app.get('/api/v1/workrooms/:wid/saved', async (request, reply) => {
-    const auth = await authorizeControlRead(request);
-    if (!auth.ok) {
-      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
-    }
-
     const { wid } = request.params as { wid: string };
 
-    // machine mode: enforce org/workroom access + scope to machine.id subject.
-    // dev mode: no subject — return all saved in the workroom (debug; workroom-scope already
-    // enforced by authorizeControlRead's devTokenInWorkroomScope).
-    const where: { workroomId: string; subjectId?: string } = { workroomId: wid };
-    if (auth.mode === 'machine') {
-      const access = await requireMachineAccessToWorkroom(auth.machine, wid);
-      if (!access.ok) return reply.code(access.status).send({ error: access.error });
-      where.subjectId = auth.machine.id;
-    }
+    const guard = await resolveMessageReadActor(request, wid);
+    if (!guard.ok) return reply.code(guard.status).send({ error: guard.error });
 
     const rows = await db.controlSavedMessage.findMany({
-      where,
+      where: { workroomId: wid, subjectId: guard.viewerId },
       orderBy: { createdAt: 'desc' },
       select: { id: true, messageId: true },
     });
@@ -902,69 +860,24 @@ export async function messageRoutes(app: FastifyInstance) {
 
   /**
    * Resolve the caller's subject keys for the activity (mention) match.
-   *   machine mode → [machine.id] PLUS the machine's ControlAgent.id if one exists
-   *                  (a mention may target the daemon's machine.id OR its agent id).
-   *   dev mode     → null (dev_ctl_ has NO actor subject). The GET route interprets a
-   *                  null key set as the "any non-empty mention" debug view. DISCLOSED.
+   *   user actor    → [user.id]  (Slice 7: messages with mentions of the user.id surface here.
+   *                   Until messages start carrying user.id mentions there will be no rows —
+   *                   semantically vacuous, never crashes. The activity-feed @user mention
+   *                   semantics are deferred per controller decision 5.)
+   *   machine actor → [machine.id, ...machine's ControlAgent.id]  (a mention may target the
+   *                   daemon's machine.id OR any agent id bound to that machine).
    */
-  async function resolveActivityCallerKeys(
-    auth: Extract<Awaited<ReturnType<typeof authorizeControlRead>>, { ok: true }>,
-  ): Promise<string[] | null> {
-    if (auth.mode !== 'machine') return null;
-    const keys = [auth.machine.id];
-    // A ControlAgent bound to this machine → mentions to its id are also "for" this caller.
+  async function resolveActivityCallerKeys(actor: MessageReadActor): Promise<string[]> {
+    if (actor.kind === 'user') {
+      return [actor.userId];
+    }
+    const keys = [actor.machineId];
     const agents = await db.controlAgent.findMany({
-      where: { machineId: auth.machine.id },
+      where: { machineId: actor.machineId },
       select: { id: true },
     });
     for (const a of agents) keys.push(a.id);
     return keys;
-  }
-
-  /**
-   * Resolve the caller subject for a setHandled write:
-   *   op_sess_('mark_reviewed')  → subjectId = operatorSubjectId
-   *   machine_token              → subjectId = machine.id
-   *   dev_ctl_                   → hard 403 (read-only credential cannot write)
-   *
-   * Reuses the existing 'mark_reviewed' V1 operator command (no new command introduced).
-   * Mirrors the op-first → 403-on-wrong-scope → machine-fallback ordering of resolveSaveSubject.
-   */
-  async function resolveHandledSubject(
-    request: FastifyRequest,
-    wid: string,
-  ): Promise<
-    | { ok: true; subjectId: string }
-    | { ok: false; status: number; body: { error: { code: string; message: string } } }
-  > {
-    const authHeader = request.headers.authorization;
-
-    // Defense-in-depth: dev_ctl_ (read-only) can never authorize a write → 403.
-    const rawToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
-    if (rawToken.startsWith('dev_ctl_')) {
-      return { ok: false, status: 403, body: { error: { code: 'FORBIDDEN', message: 'Forbidden' } } };
-    }
-
-    // Path 1: op_sess_ (operator / human). Reuse the existing 'mark_reviewed' command.
-    const opAuth = await authorizeOperatorWrite(request, { command: 'mark_reviewed', workroomId: wid });
-    if (opAuth.ok) {
-      return { ok: true, subjectId: opAuth.session.operatorSubjectId };
-    }
-    // op_sess_ valid but wrong workroom / command → hard 403.
-    if (opAuth.status === 403) {
-      return { ok: false, status: 403, body: { error: { code: opAuth.code, message: opAuth.message } } };
-    }
-
-    // Path 2: machine_token.
-    const machine = await verifyMachineToken(authHeader);
-    if (!machine) {
-      return { ok: false, status: 401, body: { error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } } };
-    }
-    const access = await requireMachineAccessToWorkroom(machine, wid);
-    if (!access.ok) {
-      return { ok: false, status: access.status, body: { error: access.error } };
-    }
-    return { ok: true, subjectId: machine.id };
   }
 
   /**
@@ -975,76 +888,70 @@ export async function messageRoutes(app: FastifyInstance) {
    * newest first, limit 50. Joined with ControlActivityState (subjectId=callerKey,
    * messageId) for the per-message `handled` flag (missing row → handled=false).
    *
-   * Auth: authorizeControlRead (machine_token OR dev_ctl_; allowlisted + workroom-scoped).
+   * Auth (Slice 7): userOrMachine — user_sess_ (member) OR machine_token.
    *
    * Caller keys:
-   *   machine → [machine.id, ...machine's ControlAgent.id]; mention match = hasSome(keys).
-   *   dev_ctl_ → no subject → DEBUG view: messages with ANY non-empty mentions (NotEmpty),
-   *              handled always false (no subject to join). DISCLOSED.
+   *   user    → [user.id]                                 (vacuous this slice — see note above)
+   *   machine → [machine.id, ...machine's ControlAgent.id]
+   *
+   * The previous "dev_ctl_ no-subject → debug ANY non-empty mentions" branch is GONE
+   * (no anonymous read tokens post-Slice-7 — leaving it would have been a privacy regression).
    *
    * filter:
-   *   all / mentions → the full mention set (all == mentions for MVP; no other activity
-   *                    sources yet — DISCLOSED).
+   *   all / mentions → the full mention set (all == mentions for MVP).
    *   unread         → only handled=false ("unread" ≈ "unhandled"; no per-message
-   *                    read-cursor this MVP — DISCLOSED).
+   *                    read-cursor this MVP).
    *
    * Returns { activity: [{ id: "act_<messageId>", message_id, handled }] }.
    */
   app.get('/api/v1/workrooms/:wid/activity', async (request, reply) => {
-    const auth = await authorizeControlRead(request);
-    if (!auth.ok) {
-      return reply.code(auth.status).send({ error: { code: auth.code, message: auth.message } });
-    }
-
     const { wid } = request.params as { wid: string };
+
+    const guard = await resolveMessageReadActor(request, wid);
+    if (!guard.ok) return reply.code(guard.status).send({ error: guard.error });
+
     const { filter: rawFilter } = request.query as { filter?: string };
     const filter = rawFilter === 'unread' ? 'unread' : 'all'; // all == mentions for MVP
 
-    // machine mode: enforce org/workroom access. (dev workroom-scope already enforced upstream.)
-    if (auth.mode === 'machine') {
-      const access = await requireMachineAccessToWorkroom(auth.machine, wid);
-      if (!access.ok) return reply.code(access.status).send({ error: access.error });
-    }
-
     // Restrict to channels the viewer can see (anti-enumeration consistent with the timeline).
-    const visible = await visibleChannels(auth, wid);
+    const visible = await visibleChannels({ viewerId: guard.viewerId, viewerKind: guard.actor.kind }, wid);
     const visibleChannelIds = visible.map((ch) => ch.id);
     if (visibleChannelIds.length === 0) {
       return { activity: [] };
     }
 
-    const callerKeys = await resolveActivityCallerKeys(auth);
+    const callerKeys = await resolveActivityCallerKeys(guard.actor);
 
-    // Base set: top-level messages in visible channels with a matching mention, newest first.
-    //   machine → mentions hasSome(callerKeys).
-    //   dev_ctl_ (callerKeys null) → mentions isEmpty:false (any non-empty mention; debug).
-    const mentionWhere =
-      callerKeys === null
-        ? { mentions: { isEmpty: false } }
-        : { mentions: { hasSome: callerKeys } };
+    // The DB column `mentions` is UUID[]; non-uuid keys (e.g. user.id is a cuid this slice)
+    // would crash the query. Filter to uuid-shape only — for user actors with a cuid id this
+    // collapses to an empty filter and the feed is vacuous (per Slice 7 spec; user-mention
+    // semantics for activity are deferred per controller decision 5).
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const uuidCallerKeys = callerKeys.filter((k) => uuidRe.test(k));
+    if (uuidCallerKeys.length === 0) {
+      return { activity: [] };
+    }
 
     const rows = await db.controlMessage.findMany({
       where: {
         workroomId: wid,
         channelId: { in: visibleChannelIds },
         parentMessageId: null,
-        ...mentionWhere,
+        mentions: { hasSome: uuidCallerKeys },
       },
       orderBy: { createdAt: 'desc' },
       take: 50,
       select: { id: true },
     });
 
-    // Join ControlActivityState for the `handled` flag.
-    //   machine → join by (subjectId=machine.id, messageId). NOTE the handled state is keyed
-    //     on machine.id (the canonical subject the POST /handled route writes); agent-id-only
-    //     matches share the same machine subject for handled state.
-    //   dev_ctl_ → no subject → handled always false.
+    // Join ControlActivityState for the `handled` flag. subjectId is the actor's primary id
+    // (user.id for users; machine.id for machines — agent-id-only matches share the same
+    // machine subject for handled state, per the POST /handled write).
     const handledByMessage = new Map<string, boolean>();
-    if (callerKeys !== null && rows.length > 0) {
+    if (rows.length > 0) {
       const states = await db.controlActivityState.findMany({
         where: {
-          subjectId: auth.mode === 'machine' ? auth.machine.id : '',
+          subjectId: guard.viewerId,
           messageId: { in: rows.map((r) => r.id) },
         },
         select: { messageId: true, handled: true },
@@ -1069,15 +976,16 @@ export async function messageRoutes(app: FastifyInstance) {
    * POST /api/v1/workrooms/:wid/activity/:messageId/handled  body { handled: boolean }  (S5)
    *
    * Upsert the caller subject's handled-state for an activity (mention) item.
-   * Auth: op_sess_('mark_reviewed') OR machine_token. dev_ctl_ → 403.
+   * Auth (Slice 7): user_sess_ (workroom OWNER) OR machine_token, via authorizeMessageWrite.
+   * subjectId: user.id for user actor, machine.id for machine actor.
    * Validates the message exists in :wid (404 otherwise — anti-enumeration uniform 404).
    * Idempotent upsert on (subjectId, messageId). Returns { ok: true }.
    */
   app.post('/api/v1/workrooms/:wid/activity/:messageId/handled', async (request, reply) => {
     const { wid, messageId } = request.params as { wid: string; messageId: string };
 
-    const subj = await resolveHandledSubject(request, wid);
-    if (!subj.ok) return reply.code(subj.status).send(subj.body);
+    const auth = await authorizeMessageWrite(request, { workroomId: wid, command: 'mark_reviewed' });
+    if (!auth.ok) return reply.code(auth.status).send(auth.body);
 
     const body = request.body as { handled?: unknown } | null;
     if (typeof body?.handled !== 'boolean') {
@@ -1093,7 +1001,6 @@ export async function messageRoutes(app: FastifyInstance) {
         select: { id: true },
       });
     } catch {
-      // Malformed id (not a valid uuid) → uniform 404.
       return reply.code(404).send({ error: { code: 'MESSAGE_NOT_FOUND', message: 'Message not found' } });
     }
     if (!msg) {
@@ -1101,8 +1008,8 @@ export async function messageRoutes(app: FastifyInstance) {
     }
 
     await db.controlActivityState.upsert({
-      where: { subjectId_messageId: { subjectId: subj.subjectId, messageId } },
-      create: { subjectId: subj.subjectId, messageId, handled },
+      where: { subjectId_messageId: { subjectId: auth.subject.subjectId, messageId } },
+      create: { subjectId: auth.subject.subjectId, messageId, handled },
       update: { handled },
     });
 
@@ -1116,15 +1023,13 @@ export async function messageRoutes(app: FastifyInstance) {
  * Resolve the senderId for a machine-token send/reply, supporting multi-agent attribution.
  *
  *   - agent_id absent (or not a string): legacy default → senderId = machine.id.
- *     (A machine that does not specify an agent posts as its default identity.)
  *   - agent_id provided: the agent must EXIST and be OWNED by this machine
- *     (ControlAgent.machineId === machine.id). On success → senderId = agent.id, so the
- *     message carries the agent's id and resolveSenderDisplayNames maps it to the agent's name.
+ *     (ControlAgent.machineId === machine.id). On success → senderId = agent.id.
  *     If the agent does not exist, or is owned by a different machine → AGENT_NOT_OWNED (403).
  *
- * agent_id is matched against ControlAgent.id (@db.Uuid). A non-uuid agent_id can never match a
- * real row, and querying the uuid column with it would throw P2023; we catch that and treat it
- * as "not owned" (403) — a malformed agent_id is never silently downgraded to the machine default.
+ * A non-uuid agent_id can never match a real row, and querying the uuid column with it would
+ * throw P2023; we catch that and treat it as "not owned" (403) — a malformed agent_id is
+ * never silently downgraded to the machine default.
  */
 async function resolveMachineSenderId(
   machineId: string,
@@ -1133,7 +1038,6 @@ async function resolveMachineSenderId(
   | { ok: true; senderId: string }
   | { ok: false; code: 'AGENT_NOT_OWNED'; message: string }
 > {
-  // No agent_id → legacy default (post as the machine itself).
   if (typeof agentId !== 'string' || agentId.length === 0) {
     return { ok: true, senderId: machineId };
   }
@@ -1145,11 +1049,9 @@ async function resolveMachineSenderId(
       select: { id: true, machineId: true },
     });
   } catch {
-    // Malformed (non-uuid) agent_id → P2023 on the uuid column → treat as not owned.
     return { ok: false, code: 'AGENT_NOT_OWNED', message: 'Agent not found or not owned by this machine' };
   }
 
-  // Must exist AND be owned by this machine (a machine may only post as agents it owns).
   if (!agent || agent.machineId !== machineId) {
     return { ok: false, code: 'AGENT_NOT_OWNED', message: 'Agent not found or not owned by this machine' };
   }
@@ -1157,103 +1059,3 @@ async function resolveMachineSenderId(
   return { ok: true, senderId: agent.id };
 }
 
-/**
- * Write-before-broadcast for message.created.
- *
- * Step 1 (awaited by route): publishControlEvent persists the event row to DB.
- *   This guarantees the event exists BEFORE the HTTP 201 response is returned,
- *   satisfying the write-before-broadcast contract (spec §5, same as actionRoutes.ts:74).
- * Step 2 (fire-and-forget): WS broadcast to subscribers. Non-fatal; clients catch up via GET.
- *
- * SECURITY: preview = redactControlText(content) truncated ≤120 chars (spec §5).
- * No tokens, paths, or credentials appear in the WS payload.
- */
-async function writeEventAndBroadcast(msg: {
-  id: string;
-  seq: bigint;
-  created_at: Date;
-  workroomId: string;
-  channelId: string;
-  senderKind: string;
-  senderId: string;
-  content: string;
-}): Promise<void> {
-  const preview = redactControlText(msg.content).slice(0, 120);
-
-  // Step 1: write event to DB (awaited — guarantees persistence before route returns 201).
-  const event = await publishControlEvent({
-    workroomId: msg.workroomId,
-    eventId: randomUUID(),
-    topic: 'message.created',
-    payload: {
-      channel_id: msg.channelId,
-      message_id: msg.id,
-      seq: msg.seq.toString(),
-      sender_kind: msg.senderKind,
-      sender_id: msg.senderId,
-      preview,
-    },
-  });
-
-  // Step 2: WS broadcast (fire-and-forget; non-fatal).
-  if (!event.idempotent) {
-    workroomBroadcaster.broadcast(msg.workroomId, {
-      event_id: event.eventId,
-      workroom_id: event.workroomId,
-      seq: event.seq.toString(),
-      topic: event.topic,
-      payload: event.payloadJson as Record<string, unknown>,
-      created_at: event.createdAt.toISOString(),
-    });
-  }
-}
-
-/**
- * Write-before-broadcast for thread.reply (S2 §4.4 / §5).
- *
- * Mirrors writeEventAndBroadcast but emits topic 'thread.reply' with the parent_message_id.
- * Skipped entirely on idempotent replay (a duplicate reply key must not emit a 2nd event).
- * preview = redactControlText(content) truncated ≤120 chars (no secrets in the WS payload).
- */
-async function writeThreadReplyEventAndBroadcast(input: {
-  workroomId: string;
-  channelId: string;
-  parentMessageId: string;
-  messageId: string;
-  seq: bigint;
-  senderKind: string;
-  senderId: string;
-  content: string;
-  idempotent: boolean;
-}): Promise<void> {
-  // Idempotent replay → the reply already exists; do not re-publish.
-  if (input.idempotent) return;
-
-  const preview = redactControlText(input.content).slice(0, 120);
-
-  const event = await publishControlEvent({
-    workroomId: input.workroomId,
-    eventId: randomUUID(),
-    topic: 'thread.reply',
-    payload: {
-      channel_id: input.channelId,
-      parent_message_id: input.parentMessageId,
-      message_id: input.messageId,
-      seq: input.seq.toString(),
-      sender_kind: input.senderKind,
-      sender_id: input.senderId,
-      preview,
-    },
-  });
-
-  if (!event.idempotent) {
-    workroomBroadcaster.broadcast(input.workroomId, {
-      event_id: event.eventId,
-      workroom_id: event.workroomId,
-      seq: event.seq.toString(),
-      topic: event.topic,
-      payload: event.payloadJson as Record<string, unknown>,
-      created_at: event.createdAt.toISOString(),
-    });
-  }
-}

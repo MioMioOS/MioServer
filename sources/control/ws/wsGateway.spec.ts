@@ -237,6 +237,47 @@ describe('wsGateway — /api/v1/ws/control transport', () => {
     client.disconnect();
   });
 
+  it('user_sess_ token + workroom-member → subscribed (Slice 7 B2-e)', async () => {
+    mockTokenInWorkroom.mockResolvedValue({ ok: true, mode: 'user' });
+
+    const client = makeClient();
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => { client.disconnect(); reject(new Error('connect timeout')); }, 3000);
+      client.on('connect', () => { clearTimeout(timeout); resolve(); });
+      client.on('connect_error', (err: Error) => { clearTimeout(timeout); reject(err); });
+    });
+
+    client.emit('subscribe', { workroom_id: 'wroom-1', token: 'user_sess_valid' });
+    const result = await waitForSubscribed(client);
+
+    expect(result.workroom_id).toBe('wroom-1');
+    expect(mockTokenInWorkroom).toHaveBeenCalledWith('user_sess_valid', 'wroom-1');
+    expect(mockSubscribe).toHaveBeenCalled();
+    client.disconnect();
+  });
+
+  it('user_sess_ token + non-member workroom → FORBIDDEN + disconnect (Slice 7 B2-e)', async () => {
+    // tokenInWorkroom returns null when the user_sess_ holder is not a member of the
+    // requested workroom (no UserWorkroomMembership row). Same close behaviour as the
+    // other token classes — uniform anti-enumeration.
+    mockTokenInWorkroom.mockResolvedValue(null);
+
+    const client = makeClient();
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => { client.disconnect(); reject(new Error('connect timeout')); }, 3000);
+      client.on('connect', () => { clearTimeout(timeout); resolve(); });
+      client.on('connect_error', (err: Error) => { clearTimeout(timeout); reject(err); });
+    });
+
+    client.emit('subscribe', { workroom_id: 'wroom-other', token: 'user_sess_member_of_wroom_1' });
+    const result = await waitForErrorAndDisconnect(client);
+
+    expect(result.code).toBe('FORBIDDEN');
+    expect(result.disconnected).toBe(true);
+    expect(mockSubscribe).not.toHaveBeenCalled();
+    client.disconnect();
+  });
+
   // ── Auth failures → FORBIDDEN + disconnect ─────────────────────────────────
 
   it('invalid/expired token → FORBIDDEN error + disconnect', async () => {
