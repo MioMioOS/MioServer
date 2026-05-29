@@ -48,6 +48,103 @@ model Device {
   // Device linking (paired devices can see each other's sessions)
   linksAsSource DeviceLink[] @relation("LinkSource")
   linksAsTarget DeviceLink[] @relation("LinkTarget")
+
+  // Slice 7: bind to a User. Nullable for legacy chat-side rows pre-Slice-7
+  // (seed boot fills these in for the dogfood user). Hijack guard in /v1/auth.
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  // R2.3: bridge from the monitoring universe (Device/DeviceLink) to the workspace
+  // universe (ControlMachine). When a Mac that already enrolled a workspace later
+  // attaches MioIsland monitoring, the monitor Device links to its existing
+  // ControlMachine here — so NO new workspace opens. Null for phones / unbridged Macs.
+  controlMachineId String?         @map("control_machine_id") @db.Uuid
+  controlMachine   ControlMachine? @relation(fields: [controlMachineId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([controlMachineId])
+}
+
+/// Slice 7: unified email+password user identity.
+/// Replaces the dev_ctl_/op_sess_/op-pairing trio. A single user_session_token
+/// bearer authenticates every human Slock REST call.
+model User {
+  id                String   @id @default(cuid())
+  email             String   @unique
+  passwordHash      String   @map("password_hash") // bcrypt cost 12
+  /// R1: user-editable display name. Avatar is derived (identicon of displayName||email);
+  /// no avatar column yet — add avatar_blob_id only if/when custom upload ships.
+  displayName       String?  @map("display_name")
+  defaultWorkroomId String?  @map("default_workroom_id") @db.Uuid
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  sessions            UserSession[]
+  memberships         UserWorkroomMembership[]
+  devices             Device[]
+  // R4: human friendships (one canonical row per pair; query both sides).
+  friendshipsOwned    UserFriendship[]         @relation("FriendshipOwner")
+  friendshipsReceived UserFriendship[]         @relation("FriendshipFriend")
+
+  @@map("users")
+}
+
+/// R4 (minimal collaboration): human-to-human friendship. ONE canonical row per pair
+/// (userId = lexicographically smaller id, friendId = larger) so @@unique dedupes both
+/// directions. `requestedBy` records who initiated; `status` is pending|accepted.
+/// Friends are discovered by exact email (no search). Query a user's accepted friends:
+/// where (userId=me OR friendId=me) AND status='accepted'.
+model UserFriendship {
+  id          String   @id @default(cuid())
+  userId      String   @map("user_id")
+  friendId    String   @map("friend_id")
+  status      String   @default("pending") // pending | accepted
+  requestedBy String   @map("requested_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user   User @relation("FriendshipOwner", fields: [userId], references: [id], onDelete: Cascade)
+  friend User @relation("FriendshipFriend", fields: [friendId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, friendId])
+  @@index([friendId])
+  @@map("user_friendships")
+}
+
+/// Slice 7: (user, workroom, role). Role is 'owner' only in this slice;
+/// schema-ready for admin/member/guest later.
+model UserWorkroomMembership {
+  id         String   @id @default(cuid())
+  userId     String   @map("user_id")
+  workroomId String   @map("workroom_id") @db.Uuid
+  role       String   @default("owner")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, workroomId])
+  @@index([workroomId])
+  @@map("user_workroom_memberships")
+}
+
+/// Slice 7: bearer-token session. token_hash = sha256(user_sess_...).
+/// Sliding refresh: any 200 response bumps expiresAt to now+30d (throttled 12h).
+/// deviceId is optional — set when signin runs alongside a device JWT (iOS app).
+model UserSession {
+  id         String    @id @default(cuid())
+  userId     String    @map("user_id")
+  tokenHash  String    @unique @map("token_hash")
+  deviceId   String?   @map("device_id")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  expiresAt  DateTime  @map("expires_at")
+  lastUsedAt DateTime? @map("last_used_at")
+  revokedAt  DateTime? @map("revoked_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("user_sessions")
 }
 
 /// Links two devices together (bidirectional access).
@@ -317,7 +414,9 @@ model ControlMachine {
   lastSeenAt     DateTime?   @map("last_seen_at")
   createdAt      DateTime    @default(now()) @map("created_at")
 
-  sessions ControlSession[]
+  sessions      ControlSession[]
+  // R2.3: monitoring Devices bridged to this machine (see Device.controlMachineId).
+  linkedDevices Device[]
 
   @@map("control_machines")
 }
@@ -359,19 +458,20 @@ model ControlWorkroom {
 /// Channel within a workroom (S1). type: main | standard | dm. visibility: public | private.
 /// public channels are implicitly visible to all workroom members; private/dm require ControlChannelMember.
 model ControlChannel {
-  id             String    @id @default(uuid()) @db.Uuid
-  workroomId     String    @map("workroom_id") @db.Uuid
+  id             String                 @id @default(uuid()) @db.Uuid
+  workroomId     String                 @map("workroom_id") @db.Uuid
   name           String
-  type           String    // "main" | "standard" | "dm"
-  visibility     String    // "public" | "private"
+  type           String // "main" | "standard" | "dm"
+  visibility     String // "public" | "private"
   description    String?
-  createdBy      String    @map("created_by")          // opaque actor id (non-uuid; e.g. 'system' / operatorSubject)
-  archivedAt     DateTime? @map("archived_at")
-  createdAt      DateTime  @default(now()) @map("created_at")
-  lastActivityAt DateTime? @map("last_activity_at")
-  workroom       ControlWorkroom      @relation(fields: [workroomId], references: [id])
+  createdBy      String                 @map("created_by") // opaque actor id (non-uuid; e.g. 'system' / operatorSubject)
+  archivedAt     DateTime?              @map("archived_at")
+  createdAt      DateTime               @default(now()) @map("created_at")
+  lastActivityAt DateTime?              @map("last_activity_at")
+  workroom       ControlWorkroom        @relation(fields: [workroomId], references: [id])
   members        ControlChannelMember[]
   messages       ControlMessage[]
+
   @@index([workroomId, archivedAt])
   @@index([workroomId, type])
   @@map("control_channels")
@@ -379,11 +479,12 @@ model ControlChannel {
 
 /// Explicit member row for private/dm channels. public channels need no rows.
 model ControlChannelMember {
-  id        String   @id @default(uuid()) @db.Uuid
-  channelId String   @map("channel_id") @db.Uuid
-  memberId  String   @map("member_id")                // opaque actor id (agent/human/operatorSubject; non-uuid)
-  addedAt   DateTime @default(now()) @map("added_at")
+  id        String         @id @default(uuid()) @db.Uuid
+  channelId String         @map("channel_id") @db.Uuid
+  memberId  String         @map("member_id") // opaque actor id (agent/human/operatorSubject; non-uuid)
+  addedAt   DateTime       @default(now()) @map("added_at")
   channel   ControlChannel @relation(fields: [channelId], references: [id])
+
   @@unique([channelId, memberId])
   @@map("control_channel_members")
 }
@@ -432,6 +533,7 @@ model ControlAgent {
   updatedAt    DateTime   @updatedAt @map("updated_at")
 
   tasks            ControlTask[]                    @relation("TaskOwner")
+  createdTasks     ControlTask[]                    @relation("TaskCreator")
   actedActions     ControlAction[]                  @relation("ActionActor")
   createdArtifacts ControlArtifact[]                @relation("ArtifactCreator")
   verificationLogs ControlArtifactVerificationLog[]
@@ -451,11 +553,11 @@ model ControlMessage {
   id                   String          @id @default(uuid()) @db.Uuid
   workroomId           String          @map("workroom_id") @db.Uuid
   workroom             ControlWorkroom @relation(fields: [workroomId], references: [id])
-  channelId            String          @map("channel_id") @db.Uuid  // NOT NULL (DB enforced by s1_channelid_notnull migration)
-  seq                  BigInt          @default(0) @map("seq")       // per-channel monotone; nextChannelSeq assigns explicitly; default 0 is never relied upon
+  channelId            String          @map("channel_id") @db.Uuid // NOT NULL (DB enforced by s1_channelid_notnull migration)
+  seq                  BigInt          @default(0) @map("seq") // per-channel monotone; nextChannelSeq assigns explicitly; default 0 is never relied upon
   clientIdempotencyKey String?         @map("client_idempotency_key")
   senderKind           String          @map("sender_kind") // user | agent | system
-  senderId             String          @map("sender_id")             // opaque actor id (may be 'pairing:<uuid>' for op_sess_ human sends)
+  senderId             String          @map("sender_id") // opaque actor id (may be 'pairing:<uuid>' for op_sess_ human sends)
   content              String
   mentions             String[]
   hashRefs             Json            @default("{}") @map("hash_refs")
@@ -464,10 +566,10 @@ model ControlMessage {
   embeddedCardId       String?         @map("embedded_card_id") @db.Uuid
   threadReplyCount     Int             @default(0) @map("thread_reply_count")
   lastThreadReplyAt    DateTime?       @map("last_thread_reply_at")
-  parentMessageId      String?         @map("parent_message_id") @db.Uuid  // S2: null=top-level, non-null=reply to that parent message (no FK; control-plane self-ref convention)
+  parentMessageId      String?         @map("parent_message_id") @db.Uuid // S2: null=top-level, non-null=reply to that parent message (no FK; control-plane self-ref convention)
   createdAt            DateTime        @default(now()) @map("created_at")
 
-  channel           ControlChannel    @relation(fields: [channelId], references: [id])
+  channel           ControlChannel            @relation(fields: [channelId], references: [id])
   attachments       ControlAttachment[]
   thread            ControlThread?
   workingAgreements ControlWorkingAgreement[] @relation("AgreementSourceMessage")
@@ -502,6 +604,8 @@ model ControlAttachment {
   storageKey           String?         @map("storage_key")
   credentialAliasRef   String?         @map("credential_alias_ref")
   permissionScope      String          @default("members") @map("permission_scope")
+  data                 Bytes?          @map("data")
+  channelId            String?         @map("channel_id") @db.Uuid
   createdAt            DateTime        @default(now()) @map("created_at")
 
   @@index([workroomId])
@@ -584,24 +688,39 @@ model ControlSession {
 
 /// Task — work item with atomic CAS claim.
 model ControlTask {
-  id               String          @id @default(uuid()) @db.Uuid
-  workroomId       String          @map("workroom_id") @db.Uuid
-  workroom         ControlWorkroom @relation(fields: [workroomId], references: [id])
-  channelId        String?         @map("channel_id") @db.Uuid // Slock (S3): channel the task belongs to. nullable → existing rows safe
-  goalId           String?         @map("goal_id") @db.Uuid
-  sourceMessageId  String?         @map("source_message_id") @db.Uuid
-  title            String
-  description      String          @default("")
-  ownerRole        String?         @map("owner_role")
-  ownerInstanceId  String?         @map("owner_instance_id") @db.Uuid // FK → ControlAgent; CAS claim
-  ownerAgent       ControlAgent?   @relation("TaskOwner", fields: [ownerInstanceId], references: [id])
-  status           String          @default("todo")
+  id                String          @id @default(uuid()) @db.Uuid
+  workroomId        String          @map("workroom_id") @db.Uuid
+  workroom          ControlWorkroom @relation(fields: [workroomId], references: [id])
+  channelId         String?         @map("channel_id") @db.Uuid // Slock (S3): channel the task belongs to. nullable → existing rows safe
+  // Slock (S2): per-channel task number (1-based). null for workroom-level tasks (channelId=null).
+  // Partial unique index (channel_id, number) WHERE both non-null is in the migration SQL — not @@unique here.
+  number            Int?
+  goalId            String?         @map("goal_id") @db.Uuid
+  sourceMessageId   String?         @map("source_message_id") @db.Uuid
+  title             String
+  description       String          @default("")
+  ownerRole         String?         @map("owner_role")
+  ownerInstanceId   String?         @map("owner_instance_id") @db.Uuid // FK → ControlAgent; CAS claim
+  ownerAgent        ControlAgent?   @relation("TaskOwner", fields: [ownerInstanceId], references: [id])
+  creatorInstanceId String?         @map("creator_instance_id") @db.Uuid
+  creatorAgent      ControlAgent?   @relation("TaskCreator", fields: [creatorInstanceId], references: [id])
+  status            String          @default("todo")
   // todo | in_progress | waiting_approval | in_review | done | canceled
-  linkedSessionIds String[]        @map("linked_session_ids")
-  threadId         String?         @map("thread_id") @db.Uuid
-  thread           ControlThread?  @relation(fields: [threadId], references: [id])
-  createdAt        DateTime        @default(now()) @map("created_at")
-  updatedAt        DateTime        @updatedAt @map("updated_at")
+  // P3 reviewer-gate: # of adversarial-review rounds this task has entered. The
+  // done→in_review divert increments it; a re-submit at >= MAX_REVIEW_ROUNDS falls
+  // through to done (1-bounce cap — no review↔rework loop). See taskReview.ts.
+  reviewRound       Int             @default(0) @map("review_round")
+  linkedSessionIds  String[]        @map("linked_session_ids")
+  threadId          String?         @map("thread_id") @db.Uuid
+  thread            ControlThread?  @relation(fields: [threadId], references: [id])
+  // Bug-2 Thread feature: when set, this task is "attached" to that message;
+  // that message becomes the thread parent. iOS surfaces the task chip on the
+  // parent message. No FK (control-plane self-ref convention). v1: no DB-level
+  // uniqueness — server enforces "first wins" via ORDER BY created_at ASC LIMIT 1
+  // in the messages read path. See migration 20260527010000_bug2_task_parent_message.
+  parentMessageId   String?         @map("parent_message_id") @db.Uuid
+  createdAt         DateTime        @default(now()) @map("created_at")
+  updatedAt         DateTime        @updatedAt @map("updated_at")
 
   actions   ControlAction[]
   approvals ControlApproval[]
@@ -610,7 +729,9 @@ model ControlTask {
 
   @@index([workroomId, status])
   @@index([ownerInstanceId])
+  @@index([creatorInstanceId])
   @@index([channelId])
+  @@index([parentMessageId])
   @@map("control_tasks")
 }
 
@@ -698,22 +819,22 @@ model ControlApproval {
 /// Status semantics: action status is advanced to 'needs_human' on first reconcile;
 ///   subsequent reconcile calls only add evidence records (no state change, no duplicate events).
 model ControlActionReconciliation {
-  id         String        @id @default(uuid()) @db.Uuid
-  actionId   String        @map("action_id") @db.Uuid
-  action     ControlAction @relation(fields: [actionId], references: [id])
-  evidenceId String        @map("evidence_id") // stable file-based ID from daemon
-  reasonCode String        @map("reason_code") // controlled enum: fire_response_lost_token_unrecoverable | drain_deadline_exceeded
-  machineId  String        @map("machine_id") @db.Uuid // bound at issuance (verified, not from body)
+  id              String        @id @default(uuid()) @db.Uuid
+  actionId        String        @map("action_id") @db.Uuid
+  action          ControlAction @relation(fields: [actionId], references: [id])
+  evidenceId      String        @map("evidence_id") // stable file-based ID from daemon
+  reasonCode      String        @map("reason_code") // controlled enum: fire_response_lost_token_unrecoverable | drain_deadline_exceeded
+  machineId       String        @map("machine_id") @db.Uuid // bound at issuance (verified, not from body)
   // #59: optional runtime-produced warnings forwarded by the daemon (e.g.
   // CLAUDE_DELEGATION_CONFIG_NOT_PROVISIONED). Validated structure only:
   // [{ code, severity, message }]. Surfaced to control-plane as needs_human context.
-  runtimeWarnings Json?    @map("runtime_warnings")
+  runtimeWarnings Json?         @map("runtime_warnings")
   // #141: productized runtime output summary + already-redacted runtime log excerpt, reported by
   // the daemon at reconcile. Surfaced (re-redacted server-side as defense-in-depth) via GET /actions
   // for the CodeLight Evidence / Runtime Log pushed pages. NULL until the daemon backfills (#141 daemon side).
-  outputSummary  String?  @map("output_summary")
-  rawLogRedacted String?  @map("raw_log_redacted")
-  createdAt  DateTime      @default(now()) @map("created_at")
+  outputSummary   String?       @map("output_summary")
+  rawLogRedacted  String?       @map("raw_log_redacted")
+  createdAt       DateTime      @default(now()) @map("created_at")
 
   @@unique([actionId, evidenceId])
   @@map("control_action_reconciliations")
@@ -738,78 +859,30 @@ model ControlActionToken {
   @@map("control_action_tokens")
 }
 
-/// #32: Debug/dev-only READ-ONLY token for human UI (CodeLight) to call control-plane
-/// GET endpoints WITHOUT machine_token. Minted via root-only CLI/seed (HTTP issuance is
-/// disabled when NODE_ENV=production). Raw token returned once; only sha256 hash stored.
-/// scope fixed read_only; bound to a workroom; short TTL + revocable. Verify layer enforces
-/// GET allowlist + workroom-scope (reverse-lookup for /actions/:id) + uniform 403
-/// (anti-enumeration: never leak expired/revoked/out-of-scope/non-allowlist reason).
-model ControlDevToken {
+/// Slice 6 (post-Slice-7): zero-touch machine enrollment. Mac creates intent
+/// (no auth), an authenticated user approves it, Mac polls and atomically
+/// claims the delivered machine_token exactly once. Security model mirrors
+/// the previous control_operator_pairings: only sha256(opaque_code) stored;
+/// uniform 403 on any failure (anti-enumeration); CAS one-time consume;
+/// raw token returned exactly once via deliveredToken.
+///
+/// Slice 7: approver column renamed approved_by_op_sess → approved_by_user_id.
+model ControlMachineEnrollment {
   id                 String    @id @default(uuid()) @db.Uuid
-  tokenHash          String    @unique @map("token_hash")
-  orgId              String    @map("org_id") @db.Uuid
-  workroomId         String    @map("workroom_id") @db.Uuid
-  scope              String    @default("read_only")
-  createdByMachineId String?   @map("created_by_machine_id") @db.Uuid
+  codeHash           String    @unique @map("code_hash")
+  deviceName         String    @map("device_name")
+  platform           String
+  arch               String
   createdAt          DateTime  @default(now()) @map("created_at")
   expiresAt          DateTime  @map("expires_at")
-  revokedAt          DateTime? @map("revoked_at")
-
-  @@map("control_dev_tokens")
-}
-
-/// ControlOperatorSession (#86) — scoped operator WRITE credential (`op_sess_` class).
-/// SEPARATE class from ControlDevToken: dev_ctl_ is read-only allowlist; op_sess_ authorizes
-/// limited operator writes. Root/owner-only CLI mint; raw token printed once, only hash stored.
-/// V1 default allowed commands: acknowledge_needs_human + mark_reviewed (NOT approve/retry).
-///
-/// NOTE: anti-replay signing-key material is intentionally NOT stored here — that is the #87
-/// decision (encrypted symmetric MAC key vs asymmetric public key). Conflating the bearer-auth
-/// hash with a MAC verification key is the exact gap flagged in the #80/#85 reviews. #87 adds the
-/// signing-key column once the model is chosen. This row is bearer-auth + scope + lifecycle only.
-model ControlOperatorSession {
-  id                String    @id @default(uuid()) @db.Uuid
-  tokenHash         String    @unique @map("token_hash") // sha256(op_sess_...), never raw
-  orgId             String    @map("org_id") @db.Uuid
-  workroomId        String    @map("workroom_id") @db.Uuid
-  allowedCommands   String[]  @map("allowed_commands") // controlled command keys; V1 default ack+mark_reviewed
-  operatorSubjectId String    @map("operator_subject_id") // opaque operator identity (resolvable only in restricted forensics)
-  issuedBy          String    @map("issued_by") // who minted (CLI admin/owner id)
-  createdAt         DateTime  @default(now()) @map("created_at")
-  expiresAt         DateTime  @map("expires_at")
-  revokedAt         DateTime? @map("revoked_at")
-
-  @@index([workroomId])
-  @@map("control_operator_sessions")
-}
-
-/// ControlOperatorPairing (#153) — one-time opaque pairing handle for Mac→phone operator-session
-/// onboarding (the #151 "opaque pairing code/QR" model).
-///
-/// SECURITY (mint-at-redeem): create (machine_token-gated) stores ONLY the pairing INTENT +
-/// sha256(opaque code). The raw `op_sess_` is NOT generated or stored here — it is minted at
-/// REDEEM time (via mintOperatorSession) and returned exactly ONCE. So nothing reversible is ever
-/// stored (consistent with dev_ctl_ / op_sess_ / action_token).
-///
-/// redeem is UNAUTHENTICATED: the opaque code itself is the one-time bearer credential. Redemption
-/// is an atomic CAS consume (code_hash + not-expired + not-consumed + not-canceled). Any failure →
-/// uniform 403 PAIRING_NOT_REDEEMABLE (anti-enumeration: expired/used/wrong indistinguishable).
-model ControlOperatorPairing {
-  id                 String    @id @default(uuid()) @db.Uuid // pairing_id
-  codeHash           String    @unique @map("code_hash")      // sha256(opaque pairing code) — raw code never stored
-  orgId              String    @map("org_id") @db.Uuid
-  workroomId         String    @map("workroom_id") @db.Uuid
-  allowedCommands    String[]  @map("allowed_commands")        // intent: V1 commands to mint at redeem
-  ttlHours           Float     @map("ttl_hours")               // op_sess_ TTL (hours) to mint at redeem
-  scopeLabel         String    @map("scope_label")             // human label shown on the Mac QR (no secret)
-  createdByMachineId String    @map("created_by_machine_id") @db.Uuid
-  createdAt          DateTime  @default(now()) @map("created_at")
-  expiresAt          DateTime  @map("expires_at")              // pairing CODE expiry (short, e.g. 10 min)
-  consumedAt         DateTime? @map("consumed_at")
+  approvedAt         DateTime? @map("approved_at")
+  approvedByUserId   String?   @map("approved_by_user_id") // User.id (TEXT cuid); soft ref, no Prisma FK
+  approvedWorkroomId String?   @map("approved_workroom_id") @db.Uuid // ControlWorkroom.id; recorded at approve time so the no-auth GET poll can return workroom_id without re-resolving auth
+  machineId          String?   @map("machine_id") @db.Uuid
+  deliveredToken     String?   @map("delivered_token")
   canceledAt         DateTime? @map("canceled_at")
 
-  @@index([workroomId])
-  @@map("control_operator_pairings")
+  @@map("control_machine_enrollments")
 }
 
 /// ControlConnectionCredential (#179, Track 4) — the long-lived, refreshable ROOT credential for
@@ -860,12 +933,12 @@ model ControlConnectionCredential {
 /// V2 commands: approve, retry (added when #97 write endpoints are ready)
 model ControlOperatorAuditLog {
   id                   String   @id @default(uuid()) @db.Uuid
-  sessionId            String   @map("session_id") @db.Uuid     // ControlOperatorSession.id (no Prisma FK — consistent with rest of system)
+  sessionId            String   @map("session_id") @db.Uuid // ControlOperatorSession.id (no Prisma FK — consistent with rest of system)
   workroomId           String   @map("workroom_id") @db.Uuid
-  actionId             String?  @map("action_id") @db.Uuid      // nullable for future session-level commands
-  commandKey           String   @map("command_key")              // acknowledge_needs_human | mark_reviewed | approve | retry
-  operatorSubjectId    String   @map("operator_subject_id")     // opaque — copied from session; never raw token
-  outcome              String   @map("outcome")                  // succeeded | rejected_*
+  actionId             String?  @map("action_id") @db.Uuid // nullable for future session-level commands
+  commandKey           String   @map("command_key") // acknowledge_needs_human | mark_reviewed | approve | retry
+  operatorSubjectId    String   @map("operator_subject_id") // opaque — copied from session; never raw token
+  outcome              String   @map("outcome") // succeeded | rejected_*
   clientIdempotencyKey String   @unique @map("client_idempotency_key")
   decidedAt            DateTime @default(now()) @map("decided_at")
 
@@ -1106,4 +1179,85 @@ model ControlClientCursor {
   @@unique([userId, deviceId, scopeType, scopeId, topicGroup])
   @@index([userId, deviceId])
   @@map("control_client_cursors")
+}
+
+/// Reminder — Slock (S4.1). A scheduled nudge anchored to a channel surface.
+/// Plain FK columns (no Prisma relation fields), consistent with ControlMessage.senderId
+/// and other control-plane self-references. DB-level FKs live in the migration SQL.
+/// cadence null = one-shot; status: scheduled | fired | snoozed | canceled | done.
+model ControlReminder {
+  id              String    @id @default(uuid()) @db.Uuid
+  workroomId      String    @map("workroom_id") @db.Uuid
+  agentId         String    @map("agent_id") @db.Uuid // author
+  channelId       String    @map("channel_id") @db.Uuid // anchor surface
+  anchorMessageId String?   @map("anchor_message_id") @db.Uuid
+  title           String
+  fireAt          DateTime  @map("fire_at")
+  cadence         String? // null = one-shot
+  status          String    @default("scheduled")
+  version         Int       @default(1)
+  snoozedUntil    DateTime? @map("snoozed_until")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  @@index([agentId, status])
+  @@index([workroomId])
+  @@map("control_reminders")
+}
+
+/// Reminder event log — audit trail of reminder lifecycle transitions (created | fired | snoozed | ...).
+/// Cascades when the parent reminder is deleted.
+model ControlReminderEvent {
+  id         String   @id @default(uuid()) @db.Uuid
+  reminderId String   @map("reminder_id") @db.Uuid
+  kind       String
+  at         DateTime @default(now())
+  detail     Json?
+
+  @@index([reminderId])
+  @@map("control_reminder_events")
+}
+
+/// Prepared action — Slock (S4.2). An agent-proposed control action rendered as a
+/// card on a channel surface; a human operator fulfills or dismisses it.
+/// Plain FK columns (no Prisma relation fields), consistent with ControlReminder.
+/// DB-level FKs (workroom/channel/proposer) live in the migration SQL.
+/// type: channel:create | channel:add_member. status: proposed | fulfilled | dismissed.
+/// fulfilledByOperator is TEXT (operator subject ids look like `pairing:<uuid>`, not a bare uuid).
+/// cardMessageId / fulfilledResultId are soft refs (may dangle) — no FK.
+model ControlPreparedAction {
+  id                  String   @id @default(uuid()) @db.Uuid
+  workroomId          String   @map("workroom_id") @db.Uuid
+  channelId           String   @map("channel_id") @db.Uuid // the card surface
+  proposerAgentId     String   @map("proposer_agent_id") @db.Uuid // FK→ControlAgent
+  type                String // channel:create | channel:add_member
+  params              Json
+  status              String   @default("proposed") // proposed | fulfilled | dismissed
+  cardMessageId       String?  @map("card_message_id") @db.Uuid
+  fulfilledByOperator String?  @map("fulfilled_by_operator") // TEXT — operator subject ids look like `pairing:<uuid>`
+  fulfilledResultId   String?  @map("fulfilled_result_id") @db.Uuid
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  @@index([workroomId, status])
+  @@index([proposerAgentId])
+  @@map("control_prepared_actions")
+}
+
+/// Message reaction — Slock (S4.3). A user or agent reacting with an emoji to a control message.
+/// Plain FK columns (no Prisma relation fields), consistent with ControlReminder / ControlPreparedAction.
+/// DB-level FKs (message/workroom) live in the migration SQL.
+/// reactorKind: user | agent. reactorId is a soft ref (no FK — can be a user OR agent id).
+model ControlMessageReaction {
+  id          String   @id @default(uuid()) @db.Uuid
+  messageId   String   @map("message_id") @db.Uuid
+  workroomId  String   @map("workroom_id") @db.Uuid
+  reactorKind String   @map("reactor_kind") // user | agent
+  reactorId   String   @map("reactor_id") @db.Uuid
+  emoji       String
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@unique([messageId, reactorId, emoji])
+  @@index([messageId])
+  @@map("control_message_reactions")
 }
