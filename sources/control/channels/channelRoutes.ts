@@ -38,6 +38,7 @@ import { resolveUserSession } from '@/auth/userSession/resolveUserSession';
 import { USER_SESSION_TOKEN_PREFIX } from '@/auth/userSession/tokenMint';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { visibleChannels } from '@/control/channels/channelVisibility';
+import { generateIdenticon } from '@/control/profile/identicon';
 import { verifyMachineToken } from '@/machines/machineRoutes';
 import {
   createChannelCore,
@@ -305,11 +306,39 @@ export async function channelRoutes(app: FastifyInstance) {
       orderBy: { lastActivityAt: 'desc' },
     });
 
+    // Resolve each DM peer's display name + avatar so the client shows "Alex", not a raw id.
+    // Peers are human users (cuid) or agents (uuid) — batch-fetch both, identicon for avatar.
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const peerIds = [...new Set(
+      dmChannels
+        .map((ch) => ch.members.find((m) => m.memberId !== callerId)?.memberId)
+        .filter((x): x is string => !!x),
+    )];
+    const agentPeerIds = peerIds.filter((id) => UUID_RE.test(id));
+    const humanPeerIds = peerIds.filter((id) => !UUID_RE.test(id));
+    const [agentPeers, humanPeers] = await Promise.all([
+      agentPeerIds.length
+        ? db.controlAgent.findMany({ where: { id: { in: agentPeerIds } }, select: { id: true, name: true } })
+        : Promise.resolve([]),
+      humanPeerIds.length
+        ? db.user.findMany({ where: { id: { in: humanPeerIds } }, select: { id: true, email: true, displayName: true } })
+        : Promise.resolve([]),
+    ]);
+    const peerInfo = new Map<string, { name: string; avatar: string }>();
+    for (const a of agentPeers) peerInfo.set(a.id, { name: a.name, avatar: generateIdenticon(a.name || a.id) });
+    for (const u of humanPeers) {
+      const nm = u.displayName || u.email;
+      peerInfo.set(u.id, { name: nm, avatar: generateIdenticon(nm) });
+    }
+
     const dms = dmChannels.map((ch) => {
       const peer = ch.members.find((m) => m.memberId !== callerId)?.memberId ?? null;
+      const info = peer ? peerInfo.get(peer) : undefined;
       return {
         id: ch.id,
         peer_member_id: peer,
+        peer_display_name: info?.name ?? null,
+        peer_avatar: info?.avatar ?? null,
         unread_count: 0,
         last_activity_at: ch.lastActivityAt?.toISOString() ?? null,
       };
