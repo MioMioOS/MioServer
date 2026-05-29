@@ -197,30 +197,28 @@ export const machineEnrollmentRoutes: FastifyPluginAsync = async (app) => {
 
           const workroom = await tx.controlWorkroom.findUniqueOrThrow({ where: { id: workroomId } });
 
-          // ── ControlMachine REUSE-or-create (idempotency for the same physical mac) ──────────
-          // Strongest reuse signal available from an enrollment payload is the (org, displayName)
-          // pair plus any existing Device→ControlMachine bridge. A repeat enrollment of the same
-          // Mac (re-run of `mio-agent login`, or MioIsland attaching after a terminal enroll) must
-          // NOT spawn a duplicate workspace machine. We reuse the most recent bound machine in this
-          // org whose displayName matches, OR a machine already bridged from a monitoring Device.
+          // ── ControlMachine REUSE-or-create (SAFE same-mac idempotency) ──────────────────────
+          // An enrollment payload carries NO stable hardware id, so we must NOT guess "same
+          // physical Mac" from weak signals. In particular we do NOT reuse on displayName —
+          // hostnames collide across distinct Macs and that would let one enrollment hijack a
+          // DIFFERENT Mac's machine (and silently rebind its workspace). We reuse ONLY when there
+          // is exactly ONE unambiguous bridged machine for this user in this org (the R2.3
+          // monitoring↔workspace bridge via Device.controlMachineId set during a monitoring
+          // attach). More than one candidate → create a fresh machine rather than hijack an
+          // arbitrary one. (Robust multi-Mac identity needs a hardware fingerprint on the
+          // enrollment intent — tracked as future work.)
           let machineId: string | null = null;
-          const bridgedDevice = await tx.device.findFirst({
+          const bridged = await tx.device.findMany({
             where: {
               userId,
               controlMachineId: { not: null },
               controlMachine: { is: { orgId: workroom.orgId } },
             },
             select: { controlMachineId: true },
+            distinct: ['controlMachineId'],
           });
-          if (bridgedDevice?.controlMachineId) {
-            machineId = bridgedDevice.controlMachineId;
-          } else {
-            const existingMachine = await tx.controlMachine.findFirst({
-              where: { orgId: workroom.orgId, displayName: intent.deviceName },
-              orderBy: { createdAt: 'desc' },
-              select: { id: true },
-            });
-            if (existingMachine) machineId = existingMachine.id;
+          if (bridged.length === 1 && bridged[0].controlMachineId) {
+            machineId = bridged[0].controlMachineId;
           }
 
           if (machineId) {

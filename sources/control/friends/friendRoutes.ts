@@ -97,8 +97,10 @@ export async function friendRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'email is required' } });
     }
 
-    const target = await db.user.findUnique({
-      where: { email },
+    // Case-INSENSITIVE email match (emails are effectively case-insensitive; the iOS client
+    // lowercases input, so an exact match would 404 a mixed-case-registered user).
+    const target = await db.user.findFirst({
+      where: { email: { equals: email, mode: 'insensitive' } },
       select: { id: true, email: true, displayName: true },
     });
     if (!target) {
@@ -294,25 +296,32 @@ export async function friendRoutes(app: FastifyInstance) {
       return reply.code(403).send({ error: { code: 'NOT_FRIENDS', message: 'Target is not an accepted friend' } });
     }
 
-    // Grant workroom access (role 'member') if the friend isn't already a member.
-    // Idempotent: P2002 on the @@unique([userId, workroomId]) means already present.
-    try {
-      await db.userWorkroomMembership.create({
-        data: { userId: friendUserId, workroomId, role: 'member' },
+    // Atomic: add the channel membership AND grant workroom access in ONE transaction,
+    // so we never over-grant — if the channel-add fails/not-found the workroom 'member'
+    // grant is rolled back (previously the grant happened first and leaked when the
+    // channel-add then failed). Channel-add runs first; the membership grant only runs
+    // after it succeeds; a throw in either aborts both.
+    const result = await db.$transaction(async (tx) => {
+      const r = await addMemberCore({
+        workroomId,
+        channelId,
+        memberId: friendUserId,
+        actorId: myId,
+        db: tx,
       });
-    } catch (err) {
-      if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002')) {
-        throw err;
+      if (r.notFound) return r; // channel gone → no membership grant, nothing to roll back
+      // Grant workroom access (role 'member') if not already present.
+      // Idempotent: P2002 on the @@unique([userId, workroomId]) means already a member.
+      try {
+        await tx.userWorkroomMembership.create({
+          data: { userId: friendUserId, workroomId, role: 'member' },
+        });
+      } catch (err) {
+        if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002')) {
+          throw err;
+        }
       }
-    }
-
-    // Insert the channel membership (idempotent) + broadcast. memberId is the
-    // opaque actor id; humans use their user id directly.
-    const result = await addMemberCore({
-      workroomId,
-      channelId,
-      memberId: friendUserId,
-      actorId: myId,
+      return r;
     });
     if (result.notFound) {
       // Race: channel deleted between the lookup above and now.
