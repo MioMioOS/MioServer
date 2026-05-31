@@ -312,6 +312,18 @@ export async function addMemberCore(input: AddMemberCoreInput): Promise<AddMembe
 
   const memberKind = await lookupMemberKind(memberId, client);
 
+  // Adding a HUMAN to a channel grants them workroom membership (member role) so
+  // they can actually ACCESS the workspace and see the channel. Without this an
+  // invited person gets a channel-member row but every workroom read 403s and
+  // they see nothing. Never clobber an existing role (e.g. owner stays owner).
+  if (memberKind === 'user') {
+    await c.userWorkroomMembership.upsert({
+      where: { userId_workroomId: { userId: memberId, workroomId } },
+      create: { userId: memberId, workroomId, role: 'member' },
+      update: {},
+    });
+  }
+
   const events = [
     await publishChannelEvent(
       workroomId,
