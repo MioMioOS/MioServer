@@ -73,7 +73,10 @@ function bumpMachineLastSeenAt(machineId: string) {
  * (throttled). This is the single chokepoint every machine-authenticated path
  * passes through, so it is where real machine liveness is recorded.
  */
-export async function verifyMachineToken(authHeader: string | undefined) {
+export async function verifyMachineToken(
+  authHeader: string | undefined,
+  opts: { bump?: boolean } = {},
+) {
   if (!authHeader?.startsWith('Bearer ')) return null;
   const token = authHeader.slice(7);
   const hash = hashToken(token);
@@ -84,7 +87,10 @@ export async function verifyMachineToken(authHeader: string | undefined) {
       tokenExpiresAt: { gt: new Date() },
     },
   });
-  if (machine) bumpMachineLastSeenAt(machine.id);
+  // Default bumps lastSeenAt (the single liveness chokepoint). The going-offline
+  // heartbeat path passes { bump: false } so its explicit epoch write below is
+  // authoritative and can't race the throttled bump.
+  if (machine && opts.bump !== false) bumpMachineLastSeenAt(machine.id);
   return machine;
 }
 
@@ -142,6 +148,48 @@ export async function machineRoutes(app: FastifyInstance) {
       machine_token,  // Raw token — only returned at registration
       token_expires_at: machine.tokenExpiresAt.toISOString(),
     };
+  });
+
+  /**
+   * POST /api/v1/machines/heartbeat
+   * Machine-level liveness ping sent by the daemon on a fixed cadence REGARDLESS
+   * of whether any session is active. Before this, lastSeenAt was only bumped by
+   * session heartbeats / on-demand machine-token calls, so an idle-but-running
+   * daemon (logged in, no active session) silently aged past the 2-min online
+   * window and the phone wrongly showed it offline. This keeps an idle daemon
+   * visibly online.
+   *
+   * Body { going_offline: true } — sent on graceful shutdown (Ctrl+C / SIGTERM)
+   * so the phone flips to offline immediately instead of waiting out the window.
+   */
+  app.post('/api/v1/machines/heartbeat', {
+    schema: {
+      body: z.object({ going_offline: z.boolean().optional() }).optional(),
+    },
+  }, async (request, reply) => {
+    const goingOffline =
+      (request.body as { going_offline?: boolean } | undefined)?.going_offline === true;
+    // Offline path verifies WITHOUT the implicit bump so the epoch write wins.
+    const machine = await verifyMachineToken(request.headers.authorization, {
+      bump: !goingOffline,
+    });
+    if (!machine) {
+      return reply.code(401).send({
+        error: { code: 'INVALID_MACHINE_TOKEN', message: 'Invalid or expired machine token.' },
+      });
+    }
+    if (goingOffline) {
+      // Push lastSeenAt into the past → derived status is immediately offline.
+      // Also clear the throttle entry so a quick stop→start writes a fresh
+      // lastSeenAt on the very next heartbeat instead of being throttled (which
+      // would otherwise leave the machine showing offline for up to 60s).
+      await db.controlMachine.update({
+        where: { id: machine.id },
+        data: { lastSeenAt: new Date(0) },
+      });
+      machineLastSeenWriteAt.delete(machine.id);
+    }
+    return { ok: true, machine_id: machine.id };
   });
 
   /**
