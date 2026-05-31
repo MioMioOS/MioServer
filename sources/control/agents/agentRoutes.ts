@@ -208,6 +208,10 @@ export async function agentRoutes(app: FastifyInstance) {
           workspace: true, // it IS a ControlMachine → always a workspace daemon
           monitoring: managed, // session monitoring only when a MioIsland Device is bridged
         },
+        // Bridged monitoring Device ids — the phone reconciles its per-server
+        // linkedMacs (which carry deviceId) against these to fold a monitoring
+        // entry and its workspace daemon into ONE row (task #119/#113 merge).
+        device_ids: m.linkedDevices.map((d) => d.id),
       };
     });
 
