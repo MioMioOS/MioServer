@@ -175,17 +175,41 @@ export async function agentRoutes(app: FastifyInstance) {
 
     const machines = await db.controlMachine.findMany({
       where: { orgId: guard.workroomOrgId },
-      select: { id: true, displayName: true, platform: true, arch: true, lastSeenAt: true },
+      select: {
+        id: true,
+        displayName: true,
+        platform: true,
+        arch: true,
+        lastSeenAt: true,
+        // linkedDevices = monitoring Devices bridged to this ControlMachine
+        // (Device.controlMachineId). A terminal-only daemon (`mio-agent login`
+        // with no MioIsland) has NONE; a MioIsland-managed Mac registers a
+        // monitoring Device that bridges here. So presence of any linked Device
+        // means MioIsland is on that Mac → the daemon is controllable + that Mac
+        // also offers session monitoring.
+        linkedDevices: { select: { id: true } },
+      },
       orderBy: [{ lastSeenAt: 'desc' }, { createdAt: 'desc' }],
     });
 
-    const computers = machines.map((m) => ({
-      id: m.id,
-      name: computerName(m.displayName, m.id),
-      platform: m.platform,
-      arch: m.arch,
-      status: machineStatus(m.lastSeenAt),
-    }));
+    const computers = machines.map((m) => {
+      const managed = m.linkedDevices.length > 0;
+      return {
+        id: m.id,
+        name: computerName(m.displayName, m.id),
+        platform: m.platform,
+        arch: m.arch,
+        status: machineStatus(m.lastSeenAt),
+        // NEW: lets the phone distinguish MioIsland-managed (controllable +
+        // monitoring) from terminal-only daemons, and show a precise last-seen.
+        managed_by_mioisland: managed,
+        last_seen_at: m.lastSeenAt ? m.lastSeenAt.toISOString() : null,
+        capabilities: {
+          workspace: true, // it IS a ControlMachine → always a workspace daemon
+          monitoring: managed, // session monitoring only when a MioIsland Device is bridged
+        },
+      };
+    });
 
     return { computers };
   });
