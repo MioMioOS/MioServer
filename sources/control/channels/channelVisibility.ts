@@ -89,7 +89,22 @@ export async function visibleChannels(
     orderBy: { lastActivityAt: 'desc' },
   });
 
+  // A non-owner human (a "guest" invited to specific channels) sees ONLY the
+  // channels they're explicitly a member of — NOT every public channel in the
+  // workspace. Owners (and machine/agent viewers) get the full visibility rules
+  // below. This scopes an invited collaborator to exactly the channel(s) they
+  // were added to.
+  let guestScoped = false;
+  if (viewerKind !== 'machine') {
+    const mem = await db.userWorkroomMembership.findUnique({
+      where: { userId_workroomId: { userId: viewerId, workroomId } },
+      select: { role: true },
+    });
+    guestScoped = mem != null && mem.role !== 'owner';
+  }
+
   return channels.filter((ch) => {
+    if (guestScoped) return ch.members.length > 0; // guest: only their channels
     if (ch.visibility === 'public') return true;
     // private or dm: viewer (or owned agent) must be an explicit member
     return ch.members.length > 0;
