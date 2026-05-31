@@ -42,6 +42,13 @@ export interface ProvisionPersonalWorkspaceOptions {
     workroomName?: string;
     /** Human-facing org name; defaults to "Personal workspace". */
     orgName?: string;
+    /**
+     * Override the org slug (the idempotency key). Defaults to `personal-<userId>`.
+     * Enrollment passes a PER-ENROLLMENT slug so each computer gets its OWN
+     * workspace (1 computer = 1 workspace) instead of all machines sharing the
+     * user's single personal workspace. A unique slug always provisions fresh.
+     */
+    orgSlug?: string;
 }
 
 export interface ProvisionPersonalWorkspaceResult {
@@ -70,7 +77,7 @@ async function run(
     userId: string,
     opts: ProvisionPersonalWorkspaceOptions,
 ): Promise<ProvisionPersonalWorkspaceResult> {
-    const slug = personalOrgSlug(userId);
+    const slug = opts.orgSlug ?? personalOrgSlug(userId);
 
     const existingOrg = await tx.controlOrg.findUnique({ where: { slug } });
     if (existingOrg) {

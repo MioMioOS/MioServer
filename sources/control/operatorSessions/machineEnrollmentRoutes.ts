@@ -190,7 +190,17 @@ export const machineEnrollmentRoutes: FastifyPluginAsync = async (app) => {
             workroomId = requestedWorkroomId;
             workroomAlreadyBound = true;
           } else {
-            const provisioned = await provisionPersonalWorkspace(tx, userId);
+            // 1 computer = 1 workspace: provision a FRESH workspace for THIS
+            // enrollment (unique per-enrollment slug) named after the machine,
+            // instead of reusing the user's single shared personal workspace.
+            // (Re-login = a new intent = a new workspace; deduping a re-logged
+            // machine needs a hardware fingerprint — same pre-existing gap as
+            // machine reuse below.)
+            const provisioned = await provisionPersonalWorkspace(tx, userId, {
+              orgSlug: `machine-${intent.id}`,
+              orgName: intent.deviceName || 'Workspace',
+              workroomName: intent.deviceName || 'Workspace',
+            });
             workroomId = provisioned.workroomId;
             workroomAlreadyBound = false;
           }

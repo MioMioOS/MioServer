@@ -261,10 +261,22 @@ export async function agentRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: { code: 'INVALID_NAME', message: 'name is required' } });
     }
 
-    // Validate machine_id (non-empty + belongs to the workroom's org).
-    const machineId = typeof body?.machine_id === 'string' ? body.machine_id.trim() : '';
+    // machine_id is OPTIONAL (1 computer = 1 workspace): when omitted, auto-pick
+    // the workspace's single machine. The Create Agent UI no longer shows a
+    // computer picker — the workspace already determines the computer. When
+    // provided (back-compat / multi-machine legacy orgs), it must belong to the
+    // workroom's org.
+    let machineId = typeof body?.machine_id === 'string' ? body.machine_id.trim() : '';
     if (!machineId) {
-      return reply.code(400).send({ error: { code: 'INVALID_MACHINE_ID', message: 'machine_id is required' } });
+      const only = await db.controlMachine.findFirst({
+        where: { orgId: subject.workroomOrgId },
+        orderBy: { createdAt: 'asc' },
+        select: { id: true },
+      });
+      if (!only) {
+        return reply.code(409).send({ error: { code: 'NO_MACHINE', message: 'This workspace has no connected computer yet' } });
+      }
+      machineId = only.id;
     }
     const machine = await db.controlMachine.findUnique({ where: { id: machineId }, select: { orgId: true } });
     if (!machine || machine.orgId !== subject.workroomOrgId) {
