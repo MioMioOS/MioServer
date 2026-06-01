@@ -21,6 +21,16 @@
  *       daemon disconnects on its next call / refresh. (tokenHash is non-nullable in the schema,
  *       so we cannot null it; expiring + scrambling is the equivalent kill.)
  *
+ *   DELETE /api/v1/machines/:id                 (Bearer user_sess_)
+ *     → HARD-delete ONE ControlMachine the caller owns (same org-owner proxy as revoke). This is
+ *       the per-machine "remove this computer" action. It is deliberately NOT workroom-scoped:
+ *       leaving a workroom removes EVERY machine in that org from the phone's aggregated computer
+ *       list (one workroom can hold many machines), which read as "I deleted 1 computer and 3
+ *       vanished". Deleting the machine row removes exactly one. Child rows: Device.controlMachineId
+ *       is ON DELETE SET NULL (DB-level, automatic); ControlSession.machine_id has NO ON DELETE
+ *       clause (NO ACTION) so we null it explicitly first or the delete is FK-blocked.
+ *       ControlAgent.machine_id is a bare index column (no FK) — agents are left intact.
+ *
  * Auth: resolveUserSession on the raw Authorization header (the user_sess_ convention shared with
  * /v1/users/me and the workroom GET). No machine-token path here — these are phone-owner actions.
  */
@@ -162,5 +172,65 @@ export const workspaceMembershipRoutes: FastifyPluginAsync = async (app) => {
     });
 
     return reply.code(200).send({ machine_id: id, revoked: true });
+  });
+
+  /**
+   * DELETE /api/v1/machines/:id
+   *
+   * Hard-delete ONE ControlMachine the caller owns. Ownership is the SAME org-owner proxy as
+   * /revoke (no direct user→machine FK). Unlike "leave workroom" (workroom-scoped — drops every
+   * machine in the org from the phone's aggregated list), this removes exactly the one machine row.
+   *
+   * Responses:
+   *   200 { machine_id, deleted: true }
+   *   401 INVALID_SESSION
+   *   403 FORBIDDEN         — caller does not own this machine (no owner membership in its org)
+   *   404 MACHINE_NOT_FOUND
+   */
+  app.delete('/api/v1/machines/:id', async (req, reply) => {
+    const session = await resolveSession(req);
+    if (!session) return unauth(reply);
+
+    const { id } = req.params as { id: string };
+    const userId = session.userId;
+
+    const machine = await db.controlMachine.findUnique({
+      where: { id },
+      select: { id: true, orgId: true },
+    });
+    if (!machine) {
+      return reply.code(404).send({ error: { code: 'MACHINE_NOT_FOUND', message: 'Machine not found' } });
+    }
+
+    // Ownership: identical proxy to /revoke — caller must be an OWNER member of at least one
+    // workroom in this machine's org. (No direct user→machine FK; org-scoped owner membership.)
+    if (!machine.orgId) {
+      return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'You do not own this machine' } });
+    }
+    const orgWorkrooms = await db.controlWorkroom.findMany({
+      where: { orgId: machine.orgId },
+      select: { id: true },
+    });
+    const orgWorkroomIds = orgWorkrooms.map((w) => w.id);
+    const ownsViaWorkroom =
+      orgWorkroomIds.length === 0
+        ? null
+        : await db.userWorkroomMembership.findFirst({
+            where: { userId, role: 'owner', workroomId: { in: orgWorkroomIds } },
+            select: { id: true },
+          });
+    if (!ownsViaWorkroom) {
+      return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'You do not own this machine' } });
+    }
+
+    // Delete the one row. control_sessions.machine_id is a NO ACTION FK, so null it first (mirrors
+    // the SetNull intent; Device.control_machine_id is already ON DELETE SET NULL at the DB level).
+    // ControlAgent.machine_id is a bare index column (no FK) — left untouched, agents survive.
+    await db.$transaction(async (tx) => {
+      await tx.controlSession.updateMany({ where: { machineId: id }, data: { machineId: null } });
+      await tx.controlMachine.delete({ where: { id } });
+    });
+
+    return reply.code(200).send({ machine_id: id, deleted: true });
   });
 };
