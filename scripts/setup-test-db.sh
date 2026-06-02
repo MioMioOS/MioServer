@@ -84,6 +84,17 @@ for migration in "${CONTROL_PLANE_MIGRATIONS[@]}"; do
   psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$TEST_DB" -v ON_ERROR_STOP=1 -f "$migration"
 done
 
+# Post-subset schema patch.
+# `users.display_name` is added by 20260530020000_codelight_collab_foundation, which is NOT in
+# the subset above — that migration also ALTERs the app's `Device` table, which this control-plane
+# test DB intentionally does not create, so the whole file cannot be replayed here. But the Prisma
+# `User` model declares `displayName`, so its create() RETURNING references display_name and EVERY
+# user-creating integration spec fails ("column users.display_name does not exist") without it.
+# Re-apply just that column (idempotent) to keep the test DB in sync with the Prisma client.
+echo "==> Patching control-plane subset gaps (users.display_name)"
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$TEST_DB" -v ON_ERROR_STOP=1 \
+  -c 'ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;'
+
 echo "==> Test DB ready."
 echo "    DATABASE_URL=${DATABASE_URL}"
 echo "    Run integration tests with:  npm run test:integration"
