@@ -2,8 +2,9 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '@/storage/db';
 import { authMiddleware } from '@/auth/middleware';
+import { requireUser } from '@/auth/userSession/requireUser';
 import { allocateSessionSeqBatch } from '@/storage/seq';
-import { getAccessibleDeviceIdsForDevice, canDeviceAccessSession } from '@/auth/deviceAccess';
+import { getAccessibleDeviceIdsForDevice, canDeviceAccessSession, getAccessibleComputerIds, canAccessSession } from '@/auth/deviceAccess';
 import { eventRouter } from '@/socket/socketServer';
 
 export async function sessionRoutes(app: FastifyInstance) {
@@ -84,10 +85,13 @@ export async function sessionRoutes(app: FastifyInstance) {
     });
 
     // List sessions — only own + linked devices, active or recently active (24h)
+    // Account-scoped (account-only refactor): the phone reads with user_sess_,
+    // and sees sessions of every computer its account is linked to (via
+    // getAccessibleComputerIds). The legacy device-JWT + DeviceLink path is gone.
     app.get('/v1/sessions', {
-        preHandler: authMiddleware,
+        preHandler: requireUser(),
     }, async (request) => {
-        const accessibleIds = await getAccessibleDeviceIdsForDevice(request.deviceId!);
+        const accessibleIds = await getAccessibleComputerIds(request.user!.id);
         const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
         const sessions = await db.session.findMany({
             where: {
@@ -150,9 +154,10 @@ export async function sessionRoutes(app: FastifyInstance) {
         return session;
     });
 
-    // Get session messages — own + linked devices
+    // Get session messages — account-scoped (account-only refactor): the phone
+    // reads any session on a computer its account is linked to.
     app.get('/v1/sessions/:sessionId/messages', {
-        preHandler: authMiddleware,
+        preHandler: requireUser(),
         schema: {
             params: z.object({ sessionId: z.string() }),
             querystring: z.object({
@@ -165,7 +170,7 @@ export async function sessionRoutes(app: FastifyInstance) {
         const { sessionId } = request.params as { sessionId: string };
         const { after_seq, before_seq, limit } = request.query as { after_seq?: number; before_seq?: number; limit: number };
 
-        if (!await canDeviceAccessSession(request.deviceId!, sessionId)) {
+        if (!await canAccessSession(request.user!.id, sessionId)) {
             return reply.code(403).send({ error: 'Access denied' });
         }
 
