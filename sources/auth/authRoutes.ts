@@ -21,6 +21,8 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { verifySignature, createToken } from './crypto';
 import { resolveUserSession } from './userSession/resolveUserSession';
+import { verifyMachineToken } from '@/machines/machineRoutes';
+import { ensureShortCode } from '@/devices/devicesRoutes';
 import { db } from '@/storage/db';
 import { config } from '@/config';
 
@@ -101,5 +103,85 @@ export async function authRoutes(app: FastifyInstance) {
         const ttl = expiryDays && expiryDays > 0 ? expiryDays : config.tokenExpiryDays;
         const token = createToken(device.id, userSession.userId, config.masterSecret, ttl);
         return { success: true, token, deviceId: device.id, expiresInDays: ttl };
+    });
+
+    /**
+     * POST /v1/auth/machine — monitoring auth for the Mac daemon (MioIsland).
+     *
+     * The Slock daemon is machine-scoped: it has NO user_sess_, so it cannot use
+     * POST /v1/auth (which hard-requires one since Slice 7). But after workspace
+     * enrollment it DOES hold a `machine_token`. This endpoint exchanges that
+     * machine_token for a monitoring identity so ONE QR scan sets up both
+     * universes:
+     *   - verifies the Bearer machine_token → ControlMachine
+     *   - resolves the org OWNER (the enrolling user) via UserWorkroomMembership
+     *   - upserts a kind='mac' Device BRIDGED to the ControlMachine
+     *     (Device.controlMachineId — the R2.3 monitoring↔workspace bridge, which
+     *     also lets the enrollment machine-reuse lookup find this Mac), keyed by
+     *     a synthetic, stable publicKey `mtok:<machineId>` for idempotency
+     *   - lazily mints the permanent monitoring shortCode
+     *   - returns a device JWT (carrying deviceId + the owner userId) the daemon
+     *     uses to push live sessions, plus the shortCode the pairing QR embeds
+     *
+     * SECURITY: machine_token authority only; never logs the token. The minted
+     * Device is bound to the org owner's userId so the phone (same user) sees it.
+     */
+    app.post('/v1/auth/machine', async (request, reply) => {
+        const machine = await verifyMachineToken(request.headers.authorization);
+        if (!machine) {
+            return reply.code(401).send({ error: { code: 'INVALID_MACHINE_TOKEN' } });
+        }
+        if (!machine.orgId) {
+            // A machine registered but never bound into a workspace org has no
+            // owner to attribute the monitoring Device to.
+            return reply.code(409).send({ error: { code: 'MACHINE_NOT_IN_ORG' } });
+        }
+
+        // Resolve the org owner = the user who enrolled this machine's workspace.
+        // ControlOrg.ownerUserId is a synthetic uuid (no User FK, see
+        // provisionPersonalWorkspace), so the authoritative owner is the
+        // UserWorkroomMembership(role='owner') on a workroom of this org.
+        const workrooms = await db.controlWorkroom.findMany({
+            where: { orgId: machine.orgId },
+            select: { id: true },
+        });
+        const ownerMembership = workrooms.length
+            ? await db.userWorkroomMembership.findFirst({
+                  where: { workroomId: { in: workrooms.map((w) => w.id) }, role: 'owner' },
+                  orderBy: { createdAt: 'asc' },
+              })
+            : null;
+        if (!ownerMembership) {
+            return reply.code(409).send({ error: { code: 'NO_OWNER_FOR_MACHINE' } });
+        }
+        const ownerUserId = ownerMembership.userId;
+
+        const now = new Date();
+        // Synthetic, stable publicKey — the Mac monitoring identity has no
+        // ed25519 keypair (that was the legacy /v1/auth flow). Keying the upsert
+        // on the machine id keeps re-auth idempotent.
+        const syntheticPublicKey = `mtok:${machine.id}`;
+        const device = await db.device.upsert({
+            where: { publicKey: syntheticPublicKey },
+            create: {
+                publicKey: syntheticPublicKey,
+                name: machine.displayName ?? 'Mac',
+                kind: 'mac',
+                lastSeenAt: now,
+                userId: ownerUserId,
+                controlMachineId: machine.id,
+            },
+            update: {
+                lastSeenAt: now,
+                kind: 'mac',
+                userId: ownerUserId,
+                controlMachineId: machine.id,
+            },
+        });
+
+        const shortCode = await ensureShortCode(device.id);
+        const ttl = config.tokenExpiryDays;
+        const token = createToken(device.id, ownerUserId, config.masterSecret, ttl);
+        return { success: true, token, deviceId: device.id, shortCode, expiresInDays: ttl };
     });
 }

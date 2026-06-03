@@ -19,8 +19,12 @@ function generateShortCode(): string {
 /**
  * Lazily assign a permanent shortCode to a Mac device. Idempotent.
  * Returns the existing shortCode if already set, or a freshly generated unique one.
+ *
+ * Exported so the machine-token monitoring-auth path (`POST /v1/auth/machine`)
+ * can mint a shortCode for a Mac that authenticates with its enrollment
+ * machine_token instead of the legacy device keypair.
  */
-async function ensureShortCode(deviceId: string): Promise<string> {
+export async function ensureShortCode(deviceId: string): Promise<string> {
     const existing = await db.device.findUnique({
         where: { id: deviceId },
         select: { shortCode: true },
