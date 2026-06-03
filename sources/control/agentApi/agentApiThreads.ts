@@ -158,6 +158,7 @@ export async function agentApiThreads(app: FastifyInstance) {
       target?: unknown;
       content?: unknown;
       client_idempotency_key?: unknown;
+      attachment_ids?: unknown;
     } | null;
 
     if (!body?.parent_message_id || typeof body.parent_message_id !== 'string') {
@@ -176,6 +177,13 @@ export async function agentApiThreads(app: FastifyInstance) {
     const content = body.content;
     const clientIdempotencyKey =
       typeof body.client_idempotency_key === 'string' ? body.client_idempotency_key : null;
+    // Attachments: a thread reply may carry attachment ids (e.g. an agent posting
+    // an image with `mio message reply --attachment <id>`). Previously dropped here,
+    // leaving the file uploaded-but-invisible — the reply was stored with empty
+    // attachment_ids. Parse + forward to the transaction (mirrors the send path).
+    const attachmentIds = Array.isArray(body.attachment_ids)
+      ? body.attachment_ids.filter((x): x is string => typeof x === 'string')
+      : undefined;
 
     // Load parent → derive workroomId + channelId. Malformed uuid → P2023 caught as 404.
     let parent: { id: string; channelId: string; workroomId: string } | null = null;
@@ -211,6 +219,7 @@ export async function agentApiThreads(app: FastifyInstance) {
       content,
       clientIdempotencyKey,
       parentMessageId: parent.id,
+      ...(attachmentIds && attachmentIds.length > 0 ? { attachmentIds } : {}),
     });
 
     if (!result.ok) {
