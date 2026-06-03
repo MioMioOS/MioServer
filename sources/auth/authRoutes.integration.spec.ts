@@ -206,7 +206,10 @@ describe('POST /v1/auth — Slice 7 user-binding', () => {
         }
     });
 
-    it('T2 — hijack guard: publicKey owned by userA, userB tries → 409 DEVICE_OWNED_BY_OTHER_USER', async () => {
+    it('T2 — unconditional rebind: publicKey owned by userA, userB auths → 200, Device.userId becomes userB', async () => {
+        // Account-only refactor (CONTRACT §2.4): the hijack-409 guard is retired.
+        // The device keypair is a non-identity transport handle; a phone always
+        // rebinds to whoever is logged in. DEVICE_OWNED_BY_OTHER_USER no longer exists.
         const userA = await makeUserFixture();
         const userB = await makeUserFixture();
         const km = freshKeyMaterial();
@@ -222,9 +225,7 @@ describe('POST /v1/auth — Slice 7 user-binding', () => {
             });
 
             // userB submits a cryptographically-VALID request for the same
-            // publicKey (using A's keypair material — the signature is genuine,
-            // the request is just from B's user_sess_ token). The guard must
-            // refuse purely on ownership, NOT on signature.
+            // publicKey. It must succeed and rebind ownership to userB.
             const r = await app.inject({
                 method: 'POST',
                 url: '/v1/auth',
@@ -235,17 +236,13 @@ describe('POST /v1/auth — Slice 7 user-binding', () => {
                     signature: km.signatureB64,
                 },
             });
-            expect(r.statusCode).toBe(409);
-            expect((r.json() as { error: { code: string } }).error.code).toBe(
-                'DEVICE_OWNED_BY_OTHER_USER',
-            );
+            expect(r.statusCode).toBe(200);
 
-            // Post-state: Device.userId is still userA — the guard fired
-            // BEFORE upsert so no transient ownership flip occurred.
+            // Post-state: Device.userId is now userB — unconditional rebind.
             const after = await db.device.findUnique({
                 where: { publicKey: km.publicKeyB64 },
             });
-            expect(after!.userId).toBe(userA.userId);
+            expect(after!.userId).toBe(userB.userId);
         } finally {
             await db.device
                 .deleteMany({ where: { publicKey: km.publicKeyB64 } })

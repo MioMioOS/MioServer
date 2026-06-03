@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { db } from '@/storage/db';
 import { authMiddleware } from '@/auth/middleware';
 import { allocateSessionSeqBatch } from '@/storage/seq';
-import { getAccessibleDeviceIds, canAccessSession } from '@/auth/deviceAccess';
+import { getAccessibleDeviceIdsForDevice, canDeviceAccessSession } from '@/auth/deviceAccess';
 import { eventRouter } from '@/socket/socketServer';
 
 export async function sessionRoutes(app: FastifyInstance) {
@@ -32,7 +32,7 @@ export async function sessionRoutes(app: FastifyInstance) {
         // sequential version added ~30-80ms of pointless DB roundtrips on
         // every launch (the dominant cost on warm caches).
         const [accessible, preset] = await Promise.all([
-            getAccessibleDeviceIds(me),
+            getAccessibleDeviceIdsForDevice(me),
             db.launchPreset.findUnique({ where: { id: presetId } }),
         ]);
 
@@ -87,7 +87,7 @@ export async function sessionRoutes(app: FastifyInstance) {
     app.get('/v1/sessions', {
         preHandler: authMiddleware,
     }, async (request) => {
-        const accessibleIds = await getAccessibleDeviceIds(request.deviceId!);
+        const accessibleIds = await getAccessibleDeviceIdsForDevice(request.deviceId!);
         const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
         const sessions = await db.session.findMany({
             where: {
@@ -165,7 +165,7 @@ export async function sessionRoutes(app: FastifyInstance) {
         const { sessionId } = request.params as { sessionId: string };
         const { after_seq, before_seq, limit } = request.query as { after_seq?: number; before_seq?: number; limit: number };
 
-        if (!await canAccessSession(request.deviceId!, sessionId)) {
+        if (!await canDeviceAccessSession(request.deviceId!, sessionId)) {
             return reply.code(403).send({ error: 'Access denied' });
         }
 
@@ -213,7 +213,7 @@ export async function sessionRoutes(app: FastifyInstance) {
         const { sessionId } = request.params as { sessionId: string };
         const { messages } = request.body as { messages: Array<{ content: string; localId?: string }> };
 
-        if (!await canAccessSession(request.deviceId!, sessionId)) {
+        if (!await canDeviceAccessSession(request.deviceId!, sessionId)) {
             return reply.code(403).send({ error: 'Access denied' });
         }
 
@@ -313,7 +313,7 @@ export async function sessionRoutes(app: FastifyInstance) {
         const { sessionId } = request.params as { sessionId: string };
         const { metadata, expectedVersion } = request.body as { metadata: string; expectedVersion: number };
 
-        if (!await canAccessSession(request.deviceId!, sessionId)) {
+        if (!await canDeviceAccessSession(request.deviceId!, sessionId)) {
             return reply.code(403).send({ error: 'Access denied' });
         }
 

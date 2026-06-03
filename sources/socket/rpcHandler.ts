@@ -1,5 +1,5 @@
 import type { Socket } from 'socket.io';
-import { getAccessibleDeviceIds } from '@/auth/deviceAccess';
+import { getAccessibleDeviceIdsForDevice } from '@/auth/deviceAccess';
 
 // Maps "deviceId:method" → socket. Prevents cross-device hijacking.
 const rpcHandlers = new Map<string, Socket>();
@@ -28,7 +28,7 @@ export function registerRpcHandler(socket: Socket, deviceId: string) {
 
         // Fallback: find handler on a linked device only
         if (!handler) {
-            const linkedIds = new Set(await getAccessibleDeviceIds(deviceId));
+            const linkedIds = new Set(await getAccessibleDeviceIdsForDevice(deviceId));
             for (const [key, s] of rpcHandlers.entries()) {
                 const handlerDeviceId = key.split(':')[0];
                 if (key.endsWith(`:${data.method}`) && s.connected && linkedIds.has(handlerDeviceId)) {

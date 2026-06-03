@@ -1,21 +1,18 @@
 /**
- * Slice 7 — Task A5: device-keypair auth now binds the Device row to a User.
+ * POST /v1/auth — device-keypair registration (account-only identity refactor,
+ * 2026-06-03; CONTRACT §2.4).
  *
- * Every POST /v1/auth call MUST carry a valid `Authorization: Bearer user_sess_…`
- * (the user-side session token minted by /v1/users/signin). The handler:
+ * Every POST /v1/auth call MUST carry a valid `Authorization: Bearer user_sess_…`.
+ * The handler:
  *   1. Resolves the user_sess_ token → UserSession (401 MISSING_USER_SESSION if
  *      absent, 401 INVALID_SESSION if present-but-invalid/expired/revoked).
  *   2. Verifies the ed25519 challenge/signature against the supplied publicKey
  *      (unchanged, 401 'Invalid signature').
- *   3. Hijack guard — if a Device row already exists for this publicKey and is
- *      bound to a DIFFERENT user, refuse with 409 DEVICE_OWNED_BY_OTHER_USER.
- *      Fires BEFORE upsert so the row never enters a transient ownership state.
- *      Legacy rows with userId=NULL (chat-side installs from before Slice 7)
- *      rebind to the caller — that's the migration path.
- *   4. Upserts the Device with userId set, mints a JWT carrying both deviceId
- *      AND userId in its payload.
- *
- * Spec: docs/superpowers/specs/2026-05-26-slock-clone-slice7-user-auth-unification-design.md §6.1
+ *   3. Upserts the Device, UNCONDITIONALLY rebinding userId to the caller. The
+ *      hijack-409 guard is GONE — the device keypair is a non-identity transport
+ *      handle (push/socket target), not an ownership authority. Ownership lives
+ *      in AccountComputerLink. DEVICE_OWNED_BY_OTHER_USER is retired.
+ *   4. Mints a JWT carrying deviceId + userId in its payload.
  */
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
@@ -66,19 +63,12 @@ export async function authRoutes(app: FastifyInstance) {
             return reply.code(401).send({ error: 'Invalid signature' });
         }
 
-        // Step 3: hijack guard — fires BEFORE upsert so we never write a row
-        // into a half-transferred state. The check is on the EXISTING Device's
-        // userId, not on the signature: even a cryptographically-valid request
-        // is refused if the publicKey is already bound to someone else.
-        // userId=NULL (legacy chat-side install) is treated as rebindable —
-        // that's the upgrade path, see T3.
-        const existing = await db.device.findUnique({ where: { publicKey } });
-        if (existing && existing.userId !== null && existing.userId !== userSession.userId) {
-            return reply
-                .code(409)
-                .send({ error: { code: 'DEVICE_OWNED_BY_OTHER_USER' } });
-        }
-
+        // Step 3 (account-only refactor, CONTRACT §2.4): the hijack-409 guard is
+        // GONE. A phone keypair always rebinds to whoever is logged in — the
+        // device keypair is a non-identity transport handle now, not an
+        // ownership authority. `Device.userId` for kind='ios' is just "last
+        // logged-in account on this phone". The DEVICE_OWNED_BY_OTHER_USER code
+        // is retired; clients must remove all handling of it.
         const now = new Date();
         const device = await db.device.upsert({
             where: { publicKey },
@@ -111,50 +101,35 @@ export async function authRoutes(app: FastifyInstance) {
      * The Slock daemon is machine-scoped: it has NO user_sess_, so it cannot use
      * POST /v1/auth (which hard-requires one since Slice 7). But after workspace
      * enrollment it DOES hold a `machine_token`. This endpoint exchanges that
-     * machine_token for a monitoring identity so ONE QR scan sets up both
-     * universes:
+     * machine_token for a monitoring identity:
      *   - verifies the Bearer machine_token → ControlMachine
-     *   - resolves the org OWNER (the enrolling user) via UserWorkroomMembership
      *   - upserts a kind='mac' Device BRIDGED to the ControlMachine
      *     (Device.controlMachineId — the R2.3 monitoring↔workspace bridge, which
      *     also lets the enrollment machine-reuse lookup find this Mac), keyed by
      *     a synthetic, stable publicKey `mtok:<machineId>` for idempotency
      *   - lazily mints the permanent monitoring shortCode
-     *   - returns a device JWT (carrying deviceId + the owner userId) the daemon
-     *     uses to push live sessions, plus the shortCode the pairing QR embeds
+     *   - returns an OWNERLESS device JWT (userId claim = '') the daemon uses as
+     *     a push transport handle, plus the shortCode the pairing QR embeds
      *
-     * SECURITY: machine_token authority only; never logs the token. The minted
-     * Device is bound to the org owner's userId so the phone (same user) sees it.
+     * Account-only refactor (CONTRACT §2.6): the computer is OWNERLESS. We no
+     * longer resolve an org owner or bind Device.userId. Ownership is expressed
+     * solely via AccountComputerLink, set later by a phone scan.
+     *
+     * SECURITY: machine_token authority only; never logs the token.
      */
     app.post('/v1/auth/machine', async (request, reply) => {
         const machine = await verifyMachineToken(request.headers.authorization);
         if (!machine) {
             return reply.code(401).send({ error: { code: 'INVALID_MACHINE_TOKEN' } });
         }
-        if (!machine.orgId) {
-            // A machine registered but never bound into a workspace org has no
-            // owner to attribute the monitoring Device to.
-            return reply.code(409).send({ error: { code: 'MACHINE_NOT_IN_ORG' } });
-        }
 
-        // Resolve the org owner = the user who enrolled this machine's workspace.
-        // ControlOrg.ownerUserId is a synthetic uuid (no User FK, see
-        // provisionPersonalWorkspace), so the authoritative owner is the
-        // UserWorkroomMembership(role='owner') on a workroom of this org.
-        const workrooms = await db.controlWorkroom.findMany({
-            where: { orgId: machine.orgId },
-            select: { id: true },
-        });
-        const ownerMembership = workrooms.length
-            ? await db.userWorkroomMembership.findFirst({
-                  where: { workroomId: { in: workrooms.map((w) => w.id) }, role: 'owner' },
-                  orderBy: { createdAt: 'asc' },
-              })
-            : null;
-        if (!ownerMembership) {
-            return reply.code(409).send({ error: { code: 'NO_OWNER_FOR_MACHINE' } });
-        }
-        const ownerUserId = ownerMembership.userId;
+        // Account-only refactor (CONTRACT §2.6): the computer is OWNERLESS here.
+        // We no longer resolve an org owner and we no longer bind Device.userId.
+        // Ownership is expressed solely via AccountComputerLink, established later
+        // by a phone scan (POST /v1/pairing/computer). A fresh Mac with no
+        // workspace enrollment (machine.orgId == null) is still minted + given a
+        // shortCode so it is scannable before any workspace exists. The MACHINE_NOT_IN_ORG
+        // / NO_OWNER_FOR_MACHINE 409s are retired.
 
         const now = new Date();
         // Synthetic, stable publicKey — the Mac monitoring identity has no
@@ -168,20 +143,22 @@ export async function authRoutes(app: FastifyInstance) {
                 name: machine.displayName ?? 'Mac',
                 kind: 'mac',
                 lastSeenAt: now,
-                userId: ownerUserId,
+                userId: null,
                 controlMachineId: machine.id,
             },
             update: {
                 lastSeenAt: now,
                 kind: 'mac',
-                userId: ownerUserId,
+                userId: null,
                 controlMachineId: machine.id,
             },
         });
 
         const shortCode = await ensureShortCode(device.id);
         const ttl = config.tokenExpiryDays;
-        const token = createToken(device.id, ownerUserId, config.masterSecret, ttl);
+        // Ownerless: the JWT carries an empty userId claim. The daemon uses this
+        // token only as a push transport handle, never for authority.
+        const token = createToken(device.id, '', config.masterSecret, ttl);
         return { success: true, token, deviceId: device.id, shortCode, expiresInDays: ttl };
     });
 }

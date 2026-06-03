@@ -2,13 +2,14 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '@/storage/db';
 import { authMiddleware } from '@/auth/middleware';
-import { linkDevices, invalidateAccessCache } from '@/auth/deviceAccess';
+import { requireUser } from '@/auth/userSession/requireUser';
+import { invalidateAccessCache } from '@/auth/deviceAccess';
 import { eventRouter } from '@/socket/socketServer';
-import { checkAccess } from '@/subscription/subscriptionService';
+import { maskEmail } from '@/auth/maskEmail';
+import { sendPushToDevice } from '@/push/apns';
+import { config } from '@/config';
 
 // In-memory rate limiter for Mac /v1/pairing/redeem-code. 10 fails/hour/device.
-// Separate keyspace from /v1/subscription/redeem (iPhone-side, soon deprecated)
-// so a Mac brute-forcing can't be diluted by also having tried the iPhone path.
 const macRedeemFailures = new Map<string, { count: number; resetAt: number }>();
 
 function macIsRateLimited(deviceId: string): boolean {
@@ -32,345 +33,179 @@ function macClearFailures(deviceId: string): void {
     macRedeemFailures.delete(deviceId);
 }
 
-// Propagate a Mac's active trial to a freshly-paired iPhone.
-// Idempotent + safe: only acts when the source is a Mac with a non-expired
-// trialExpiresAt and the target is an iOS device. Lets pairing-after-redeem
-// hand off the entitlement automatically; the iPhone never had to ask.
-async function propagateMacSubscriptionToPhone(macId: string, phoneId: string): Promise<void> {
-    const mac = await db.device.findUnique({
-        where: { id: macId },
-        select: { kind: true, subscriptionStatus: true, trialExpiresAt: true },
-    });
-    if (!mac || mac.kind !== 'mac') return;
-    if (mac.subscriptionStatus !== 'active') return;
-    if (!mac.trialExpiresAt || mac.trialExpiresAt < new Date()) return;
+/// Same staleness window the rest of the system uses (mirrors notify.ts /
+/// sessionHandler.ts): JWT TTL + 1 day grace.
+function getStaleThresholdMs(): number {
+    const days = (config.tokenExpiryDays || 30) + 1;
+    return days * 24 * 60 * 60 * 1000;
+}
 
-    const result = await db.device.updateMany({
-        where: { id: phoneId, kind: 'ios' },
-        data: {
-            subscriptionStatus: 'active',
-            trialExpiresAt: mac.trialExpiresAt,
-        },
+/**
+ * Fire-and-forget APNs alert to every phone of a DISPLACED account after a
+ * force-takeover (CONTRACT §5). Master kill-switch + staleness apply; per-kind
+ * toggles do NOT (this is an account-security notice). Must run OUTSIDE the
+ * takeover transaction — a push failure must never roll back a committed takeover.
+ */
+async function notifyDisplacedAccount(oldUserId: string, computerId: string, computerName: string): Promise<void> {
+    const phones = await db.device.findMany({
+        where: { userId: oldUserId, kind: 'ios' },
+        select: { id: true, notificationsEnabled: true, lastSeenAt: true },
     });
-    if (result.count === 0) return;
-
-    const daysLeft = Math.max(
-        0,
-        Math.ceil((mac.trialExpiresAt.getTime() - Date.now()) / (24 * 60 * 60 * 1000))
-    );
-    eventRouter.emitToDevice(phoneId, 'subscription-updated', { status: 'active', daysLeft });
-    console.log(`[pairing-inherit] Phone ${phoneId} inherited trial from Mac ${macId} (until ${mac.trialExpiresAt.toISOString()})`);
+    const staleCutoff = Date.now() - getStaleThresholdMs();
+    const payload = {
+        title: 'Computer disconnected',
+        body: `“${computerName}” was linked to another account and is no longer connected to this account.`,
+        data: { kind: 'computer_taken_over', computerId },
+    };
+    for (const phone of phones) {
+        if (!phone.notificationsEnabled) continue;
+        if (phone.lastSeenAt && phone.lastSeenAt.getTime() < staleCutoff) continue;
+        sendPushToDevice(phone.id, payload, db).catch((err) =>
+            console.error('[takeover-notify] push failed', err)
+        );
+    }
 }
 
 export async function pairingRoutes(app: FastifyInstance) {
-
-    // Step 1: MioIsland creates a pairing request (authenticated)
-    // Stores the initiator's deviceId for later verification
-    app.post('/v1/pairing/request', {
-        preHandler: authMiddleware,
+    // ─────────────────────────────────────────────────────────────────────
+    // Scan / Pair — account↔computer (account-only identity refactor, §2.1).
+    // Replaces the retired device↔device redeem flow. Auth: user_sess_.
+    // ─────────────────────────────────────────────────────────────────────
+    app.post('/v1/pairing/computer', {
+        preHandler: requireUser(),
         schema: {
             body: z.object({
-                tempPublicKey: z.string(),
-                serverUrl: z.string(),
-                deviceName: z.string(),
-            }),
-        },
-    }, async (request) => {
-        const { tempPublicKey, serverUrl, deviceName } = request.body as {
-            tempPublicKey: string;
-            serverUrl: string;
-            deviceName: string;
-        };
-        const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
-
-        const pairing = await db.pairingRequest.upsert({
-            where: { tempPublicKey },
-            create: {
-                tempPublicKey,
-                serverUrl,
-                deviceName,
-                expiresAt,
-                // Store initiator's deviceId in responseDeviceId temporarily
-                // (will be overwritten when response comes in)
-                responseDeviceId: request.deviceId,
-            },
-            update: { serverUrl, deviceName, expiresAt, response: null, responseDeviceId: request.deviceId },
-        });
-
-        return { id: pairing.id, expiresAt: pairing.expiresAt.toISOString() };
-    });
-
-    // Step 2: CodeLight scans QR, responds (authenticated)
-    // This creates a DeviceLink between the two devices
-    app.post('/v1/pairing/respond', {
-        preHandler: authMiddleware,
-        schema: {
-            body: z.object({
-                tempPublicKey: z.string(),
-                response: z.string(),
+                code: z.string().min(4).max(12),
+                force: z.boolean().optional().default(false),
             }),
         },
     }, async (request, reply) => {
-        const { tempPublicKey, response } = request.body as {
-            tempPublicKey: string;
-            response: string;
-        };
+        try {
+            const current = request.user!.id;
+            const { code, force } = request.body as { code: string; force: boolean };
+            const normalized = code.toUpperCase().trim();
 
-        const pairing = await db.pairingRequest.findUnique({
-            where: { tempPublicKey },
-        });
-
-        if (!pairing) {
-            return reply.code(404).send({ error: 'Pairing request not found' });
-        }
-
-        if (pairing.expiresAt < new Date()) {
-            await db.pairingRequest.delete({ where: { id: pairing.id } });
-            return reply.code(410).send({ error: 'Pairing request expired' });
-        }
-
-        const initiatorDeviceId = pairing.responseDeviceId;
-        const responderDeviceId = request.deviceId!;
-
-        // Create device link (bidirectional access)
-        if (initiatorDeviceId && initiatorDeviceId !== responderDeviceId) {
-            await linkDevices(initiatorDeviceId, responderDeviceId);
-            console.log(`[pairing] Linked devices: ${initiatorDeviceId} <-> ${responderDeviceId}`);
-
-            // If either side is a Mac with an active trial, hand the trial to
-            // the other side. Function is a no-op when neither side qualifies.
-            await propagateMacSubscriptionToPhone(initiatorDeviceId, responderDeviceId);
-            await propagateMacSubscriptionToPhone(responderDeviceId, initiatorDeviceId);
-        }
-
-        // Update pairing with response
-        await db.pairingRequest.update({
-            where: { id: pairing.id },
-            data: { response, responseDeviceId: responderDeviceId },
-        });
-
-        return { success: true, linkedWith: initiatorDeviceId };
-    });
-
-    // Step 3: MioIsland polls for response
-    // Only the initiator can poll (verified by deviceId)
-    app.get('/v1/pairing/status', {
-        preHandler: authMiddleware,
-        schema: {
-            querystring: z.object({
-                tempPublicKey: z.string(),
-            }),
-        },
-    }, async (request, reply) => {
-        const { tempPublicKey } = request.query as { tempPublicKey: string };
-
-        const pairing = await db.pairingRequest.findUnique({
-            where: { tempPublicKey },
-        });
-
-        if (!pairing) {
-            return reply.code(404).send({ error: 'Not found' });
-        }
-
-        // Only the initiator can poll their own pairing request
-        if (pairing.responseDeviceId && pairing.response === null && pairing.responseDeviceId !== request.deviceId!) {
-            return reply.code(403).send({ error: 'Access denied' });
-        }
-
-        if (pairing.response) {
-            // Clean up — pairing complete
-            await db.pairingRequest.delete({ where: { id: pairing.id } });
-            return {
-                status: 'paired',
-                response: pairing.response,
-                responseDeviceId: pairing.responseDeviceId,
-            };
-        }
-
-        if (pairing.expiresAt < new Date()) {
-            await db.pairingRequest.delete({ where: { id: pairing.id } });
-            return { status: 'expired' };
-        }
-
-        return { status: 'pending' };
-    });
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Short-code pairing flow
-    //
-    // Each Mac has a permanent shortCode (Device.shortCode), lazy-allocated
-    // by POST /v1/devices/me. iPhone redeems the code here to establish a
-    // DeviceLink. The same code remains valid forever — pairing additional
-    // iPhones is just additional redeem calls.
-    // ─────────────────────────────────────────────────────────────────────
-
-    // iPhone redeems a Mac's permanent shortCode → links the two devices.
-    app.post('/v1/pairing/code/redeem', {
-        preHandler: authMiddleware,
-        schema: {
-            body: z.object({ code: z.string().min(4).max(12) }),
-        },
-    }, async (request, reply) => {
-        const { code } = request.body as { code: string };
-        const normalized = code.toUpperCase().trim();
-        const iosDeviceId = request.deviceId!;
-
-        const macDevice = await db.device.findUnique({
-            where: { shortCode: normalized },
-            select: { id: true, name: true, kind: true },
-        });
-        if (!macDevice) {
-            return reply.code(404).send({ error: 'Invalid code' });
-        }
-        if (macDevice.id === iosDeviceId) {
-            return reply.code(400).send({ error: 'Cannot pair with yourself' });
-        }
-        if (macDevice.kind !== 'mac') {
-            return reply.code(400).send({ error: 'Code does not belong to a Mac device' });
-        }
-
-        await linkDevices(macDevice.id, iosDeviceId);
-
-        console.log(`[pairing] Code-redeemed link: ${macDevice.id} <-> ${iosDeviceId}`);
-
-        // Inherit Mac trial if active.
-        await propagateMacSubscriptionToPhone(macDevice.id, iosDeviceId);
-
-        return {
-            macDeviceId: macDevice.id,
-            name: macDevice.name,
-            kind: macDevice.kind,
-        };
-    });
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Device link management
-    // ─────────────────────────────────────────────────────────────────────
-
-    // List all devices linked to the caller.
-    app.get('/v1/pairing/links', {
-        preHandler: authMiddleware,
-    }, async (request) => {
-        const myDeviceId = request.deviceId!;
-        const links = await db.deviceLink.findMany({
-            where: {
-                OR: [
-                    { sourceDeviceId: myDeviceId },
-                    { targetDeviceId: myDeviceId },
-                ],
-            },
-            include: {
-                sourceDevice: { select: { id: true, name: true, kind: true } },
-                targetDevice: { select: { id: true, name: true, kind: true } },
-            },
-            orderBy: { createdAt: 'desc' },
-        });
-
-        const links_out = links.map((l) => {
-            const peer = l.sourceDeviceId === myDeviceId ? l.targetDevice : l.sourceDevice;
-            return {
-                deviceId: peer.id,
-                name: peer.name,
-                kind: peer.kind,
-                createdAt: l.createdAt.toISOString(),
-            };
-        });
-
-        return links_out;
-    });
-
-    // Unlink the caller from a target device. Notifies the target via socket.
-    // After deleting the link, cascade-cleanup any device that no longer has
-    // ANY remaining DeviceLinks: drop its push tokens so we don't keep firing
-    // APNs alerts at an iPhone that thinks it's no longer paired. Without
-    // this, "unpair last Mac" left orphaned PushTokens that kept receiving
-    // alerts forever (the user's reported Bug 3).
-    app.delete('/v1/pairing/links/:targetDeviceId', {
-        preHandler: authMiddleware,
-        schema: {
-            params: z.object({ targetDeviceId: z.string() }),
-        },
-    }, async (request, reply) => {
-        const myDeviceId = request.deviceId!;
-        const { targetDeviceId } = request.params as { targetDeviceId: string };
-
-        const deleted = await db.deviceLink.deleteMany({
-            where: {
-                OR: [
-                    { sourceDeviceId: myDeviceId, targetDeviceId },
-                    { sourceDeviceId: targetDeviceId, targetDeviceId: myDeviceId },
-                ],
-            },
-        });
-
-        if (deleted.count === 0) {
-            return reply.code(404).send({ error: 'Link not found' });
-        }
-
-        // Drop cached access decisions so the unlinked device loses access immediately.
-        invalidateAccessCache();
-
-        // Cascade push-token cleanup for any device that just became unlinked.
-        for (const id of [myDeviceId, targetDeviceId]) {
-            const remaining = await db.deviceLink.count({
-                where: {
-                    OR: [
-                        { sourceDeviceId: id },
-                        { targetDeviceId: id },
-                    ],
-                },
+            const computer = await db.device.findUnique({
+                where: { shortCode: normalized },
+                select: { id: true, name: true, kind: true },
             });
-            if (remaining === 0) {
-                const tokenResult = await db.pushToken.deleteMany({ where: { deviceId: id } });
-                if (tokenResult.count > 0) {
-                    console.log(`[pairing] Cascade-deleted ${tokenResult.count} push tokens for ${id}`);
-                }
+            if (!computer) {
+                return reply.code(404).send({ error: { code: 'INVALID_CODE' } });
             }
-        }
+            if (computer.kind !== 'mac') {
+                return reply.code(400).send({ error: { code: 'NOT_A_MAC' } });
+            }
+            const computerId = computer.id;
+            const computerOut = { computerId, name: computer.name, kind: computer.kind };
 
-        // Notify the other side so it can clean local state
-        eventRouter.emitToDevice(targetDeviceId, 'link-removed', {
-            sourceDeviceId: myDeviceId,
-        });
+            const existing = await db.accountComputerLink.findUnique({ where: { computerId } });
 
-        // If either side is a Mac whose inherited-trial banner depended on
-        // this link, push a fresh subscription-updated so the Mac re-evaluates
-        // (it may now drop back to "未激活" or pick up a different linked
-        // iPhone's trial).
-        for (const id of [myDeviceId, targetDeviceId]) {
-            const peer = await db.device.findUnique({
-                where: { id },
-                select: { kind: true },
-            });
-            if (peer?.kind === 'mac') {
-                const access = await checkAccess(id);
-                const source =
-                    access.reason === 'inherited_from_phone'
-                        ? 'inherited'
-                        : access.reason === 'mac_redeemed'
-                          ? 'redeem_code'
-                          : null;
-                eventRouter.emitToDevice(id, 'subscription-updated', {
-                    status: access.status,
-                    expiresAt: access.expiresAt ?? null,
-                    source,
-                    daysLeft: access.daysLeft ?? null,
+            // Branch 1: no link → create.
+            if (!existing) {
+                await db.accountComputerLink.create({ data: { userId: current, computerId } });
+                invalidateAccessCache();
+                return reply.code(200).send({ status: 'linked', computer: computerOut });
+            }
+
+            // Branch 2: same account → idempotent.
+            if (existing.userId === current) {
+                return reply.code(200).send({ status: 'already_linked_self', computer: computerOut });
+            }
+
+            // Branch 3: other account, no force → refuse with masked email.
+            if (!force) {
+                const owner = await db.user.findUnique({
+                    where: { id: existing.userId },
+                    select: { email: true },
+                });
+                const maskedEmail = owner ? maskEmail(owner.email) : '***';
+                return reply.code(409).send({
+                    error: { code: 'ALREADY_LINKED_OTHER_ACCOUNT', maskedEmail, computerId },
                 });
             }
-        }
 
-        console.log(`[pairing] Unlinked ${myDeviceId} <-> ${targetDeviceId}`);
-        return { ok: true };
+            // Branch 4: other account + force → takeover (§4), atomic.
+            const oldUserId = existing.userId;
+            const owner = await db.user.findUnique({
+                where: { id: oldUserId },
+                select: { email: true },
+            });
+            const displacedMaskedEmail = owner ? maskEmail(owner.email) : '***';
+
+            try {
+                await db.$transaction(async (tx) => {
+                    // Step 1: CAS re-read.
+                    const link = await tx.accountComputerLink.findUnique({ where: { computerId } });
+                    if (!link || link.userId !== oldUserId) {
+                        throw Object.assign(new Error('takeover_race'), { code: 'TAKEOVER_RACE' });
+                    }
+
+                    // Step 2: delete old link.
+                    await tx.accountComputerLink.delete({ where: { computerId } });
+
+                    // Step 3: transfer workspace owner membership old → new.
+                    const dev = await tx.device.findUnique({
+                        where: { id: computerId },
+                        select: { controlMachineId: true },
+                    });
+                    if (dev?.controlMachineId) {
+                        const cmachine = await tx.controlMachine.findUnique({
+                            where: { id: dev.controlMachineId },
+                            select: { orgId: true },
+                        });
+                        if (cmachine?.orgId) {
+                            const workrooms = await tx.controlWorkroom.findMany({
+                                where: { orgId: cmachine.orgId },
+                                select: { id: true },
+                            });
+                            const wkIds = workrooms.map((w) => w.id);
+                            if (wkIds.length > 0) {
+                                // Conflict guard (UNIQUE(userId, workroomId)): drop the
+                                // new user's pre-existing rows in these workrooms FIRST,
+                                // then move old → new. Ordering is mandatory.
+                                await tx.userWorkroomMembership.deleteMany({
+                                    where: { workroomId: { in: wkIds }, userId: current },
+                                });
+                                await tx.userWorkroomMembership.updateMany({
+                                    where: { workroomId: { in: wkIds }, userId: oldUserId, role: 'owner' },
+                                    data: { userId: current },
+                                });
+                            }
+                        }
+                    }
+
+                    // Step 4: create new link.
+                    await tx.accountComputerLink.create({ data: { userId: current, computerId } });
+                });
+            } catch (err: any) {
+                if (err?.code === 'TAKEOVER_RACE') {
+                    return reply.code(409).send({ error: { code: 'TAKEOVER_RACE' } });
+                }
+                throw err;
+            }
+
+            // Post-commit, best-effort.
+            invalidateAccessCache();
+            notifyDisplacedAccount(oldUserId, computerId, computer.name).catch((err) =>
+                console.error('[takeover] notify failed', err)
+            );
+
+            return reply.code(200).send({
+                status: 'taken_over',
+                computer: computerOut,
+                displacedMaskedEmail,
+            });
+        } catch (err: any) {
+            console.error('[pairing/computer] unexpected error:', err);
+            return reply.code(500).send({ error: { code: 'SERVER_ERROR' } });
+        }
     });
 
     // ─────────────────────────────────────────────────────────────────────
-    // Mac-side trial redemption (replaces App-side /v1/subscription/redeem
-    // which Apple flagged as Guideline 3.1.1 violation — paid-feature unlock
-    // outside IAP). Mac inputs a FREE-XXXXXXXX code, Mac gets the trial,
-    // any iPhone paired to this Mac inherits the entitlement automatically.
+    // Mac-side trial redemption (orthogonal to account pairing; KEPT).
+    // Mac inputs a FREE-XXXXXXXX code, gets a trial. Auth: device JWT (Mac).
     //
     // Error envelope is stable: { error: <machine-readable-key>, message: <human> }.
-    // Clients should switch on `error`, not on HTTP status.
     // ─────────────────────────────────────────────────────────────────────
     app.post('/v1/pairing/redeem-code', {
         preHandler: authMiddleware,
@@ -392,8 +227,6 @@ export async function pairingRoutes(app: FastifyInstance) {
         }
 
         // Confirm the caller is a Mac. Phones can't redeem (Apple rule).
-        // Also fetch existing trialExpiresAt so we can stack new duration on
-        // top of any unexpired remaining trial (additive, not replacing).
         const device = await db.device.findUnique({
             where: { id: macDeviceId },
             select: { kind: true, trialExpiresAt: true, subscriptionStatus: true },
@@ -439,36 +272,10 @@ export async function pairingRoutes(app: FastifyInstance) {
             });
         }
 
-        // Stacking semantics: new duration is added ON TOP of the EFFECTIVE
-        // remaining trial — which for a Mac includes any trial inherited from
-        // linked iPhones (`getLongestLinkedPhoneTrial` inside checkAccess).
-        //
-        // Why effective and not just self trial:
-        //   User's mental model is "I see N days, I redeem M days, I should
-        //   see N+M days." If a Mac shows 14 days inherited from a paired
-        //   iPhone and you redeem a 3-day code, the user expects 17 days, not
-        //   3 (which is what a self-only check would give since the Mac's own
-        //   trialExpiresAt is empty/expired). Honoring the inheritance source
-        //   makes the redeem button behave consistently with the displayed
-        //   remaining time, regardless of where that time came from.
-        //
-        // checkAccess for a Mac returns max(self trial, longest linked iPhone
-        // trial), so this single call gives the correct baseTime for all
-        // four edge cases:
-        //   - self only           → baseTime = self expiry
-        //   - inherited only      → baseTime = longest iPhone expiry
-        //   - both (self < inh)   → baseTime = inherited (longer wins)
-        //   - both (self > inh)   → baseTime = self
-        //   - neither (or expired)→ baseTime = now
-        const access = await checkAccess(macDeviceId);
-        const effectiveExpiresAt = access.expiresAt
-            ? new Date(access.expiresAt)
-            : null;
+        // Stack new duration on top of the Mac's own unexpired trial.
         const now = Date.now();
-        const baseTime =
-            effectiveExpiresAt && effectiveExpiresAt.getTime() > now
-                ? effectiveExpiresAt.getTime()
-                : now;
+        const selfExpiry = device.trialExpiresAt ? device.trialExpiresAt.getTime() : 0;
+        const baseTime = selfExpiry > now ? selfExpiry : now;
         const grantedUntil = new Date(baseTime + redeemCode.durationDays * 24 * 60 * 60 * 1000);
 
         // Atomic exhausted-check + bump + write inside a transaction so
@@ -510,66 +317,23 @@ export async function pairingRoutes(app: FastifyInstance) {
 
         macClearFailures(macDeviceId);
 
-        // Propagate to every iPhone already paired to this Mac, both as
-        // persistent device state (so a later reconnect sees active) and
-        // as a live socket event (so an in-app screen updates immediately).
-        const links = await db.deviceLink.findMany({
-            where: {
-                OR: [
-                    { sourceDeviceId: macDeviceId },
-                    { targetDeviceId: macDeviceId },
-                ],
-            },
-            select: { sourceDeviceId: true, targetDeviceId: true },
-        });
-
         const daysLeft = Math.max(
             0,
             Math.ceil((grantedUntil.getTime() - Date.now()) / (24 * 60 * 60 * 1000))
         );
-
-        // Build the canonical socket payload. Same payload shape goes to the
-        // Mac itself (so its banner refreshes live) and to every linked iPhone
-        // (so AppState picks it up — iPhone reads daysLeft already, ignores
-        // expiresAt/source extras).
         const expiresAtISO = grantedUntil.toISOString();
-        const socketPayload = {
+
+        // Self-broadcast so the Mac's own UI reflects the new state without
+        // having to re-fetch /v1/subscription/status.
+        eventRouter.emitToDevice(macDeviceId, 'subscription-updated', {
             status: 'trial',
             expiresAt: expiresAtISO,
             source: 'redeem_code',
             daysLeft,
-        };
-
-        // Self-broadcast so the Mac's own UI reflects the new state without
-        // having to re-fetch /v1/subscription/status.
-        eventRouter.emitToDevice(macDeviceId, 'subscription-updated', socketPayload);
-
-        let propagated = 0;
-        for (const l of links) {
-            const peerId = l.sourceDeviceId === macDeviceId ? l.targetDeviceId : l.sourceDeviceId;
-            // Stack on the iPhone side too: never shrink a longer existing
-            // trial. updateMany with conditional WHERE ensures the iPhone's
-            // trialExpiresAt only moves forward, never backward.
-            const updated = await db.device.updateMany({
-                where: {
-                    id: peerId,
-                    kind: 'ios',
-                    OR: [
-                        { trialExpiresAt: null },
-                        { trialExpiresAt: { lt: grantedUntil } },
-                    ],
-                },
-                data: { subscriptionStatus: 'active', trialExpiresAt: grantedUntil },
-            });
-            if (updated.count > 0) {
-                propagated++;
-                eventRouter.emitToDevice(peerId, 'subscription-updated', socketPayload);
-            }
-        }
+        });
 
         console.log(
-            `[pairing-redeem] Mac ${macDeviceId} redeemed ${normalized}, ` +
-            `granted ${redeemCode.durationDays}d, propagated to ${propagated} iPhone(s)`
+            `[pairing-redeem] Mac ${macDeviceId} redeemed ${normalized}, granted ${redeemCode.durationDays}d`
         );
 
         return {
@@ -579,11 +343,6 @@ export async function pairingRoutes(app: FastifyInstance) {
         };
 
         } catch (err: any) {
-            // Stable envelope for any unexpected failure (DB down, prisma
-            // engine crash, etc.). Client switches on `error`, so giving them
-            // server_error here keeps them on the same code path as for known
-            // errors and prevents falling back to Fastify's default 500 body
-            // which has a different shape.
             console.error(`[pairing-redeem] Unexpected error for Mac ${macDeviceId}:`, err);
             return reply.code(500).send({
                 error: 'server_error',

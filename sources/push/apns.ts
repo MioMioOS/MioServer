@@ -190,30 +190,30 @@ export async function sendPush(deviceToken: string, payload: PushPayload): Promi
 /**
  * Send push to all tokens for a device.
  *
- * Defense-in-depth: before pushing we verify the device still has at least
- * one active DeviceLink. If not (e.g. the iPhone was unpaired but its push
- * tokens lingered for some reason), we drop the push and self-heal by
- * deleting the orphaned tokens. This is the last line of defence behind the
- * cascade cleanup in DELETE /v1/pairing/links — if we ever miss the cascade
- * (server crash mid-unlink, manual DB edits, etc.) this still stops the
- * "unpaired but still receiving alerts" failure mode.
+ * Account-only refactor (CONTRACT §5): the old DeviceLink precondition is gone
+ * (DeviceLink is retired). The self-heal intent is preserved with an
+ * account-scoped check: if the device row no longer exists OR its master
+ * notifications kill-switch is off, we drop the push and clean orphaned tokens.
+ * A phone that has logged out / been deleted no longer has a Device row, so its
+ * lingering push tokens still get reaped here — closing the "uninstalled but
+ * still receiving alerts" failure mode without coupling to DeviceLink.
  */
 export async function sendPushToDevice(
     deviceId: string,
     payload: PushPayload,
     db: any
 ): Promise<void> {
-    const linkCount = await db.deviceLink.count({
-        where: {
-            OR: [
-                { sourceDeviceId: deviceId },
-                { targetDeviceId: deviceId },
-            ],
-        },
+    const device = await db.device.findUnique({
+        where: { id: deviceId },
+        select: { notificationsEnabled: true },
     });
-    if (linkCount === 0) {
+    if (!device) {
         const cleaned = await db.pushToken.deleteMany({ where: { deviceId } });
-        console.log(`[sendPushToDevice] device=${deviceId.substring(0, 10)} has 0 DeviceLinks — orphaned, cleaned ${cleaned.count} tokens, skipped push`);
+        console.log(`[sendPushToDevice] device=${deviceId.substring(0, 10)} no longer exists — orphaned, cleaned ${cleaned.count} tokens, skipped push`);
+        return;
+    }
+    if (!device.notificationsEnabled) {
+        console.log(`[sendPushToDevice] device=${deviceId.substring(0, 10)} notifications master OFF — skipped push`);
         return;
     }
 

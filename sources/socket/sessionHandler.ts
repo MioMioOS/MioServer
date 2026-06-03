@@ -2,7 +2,7 @@ import type { Socket } from 'socket.io';
 import { db } from '@/storage/db';
 import { allocateSessionSeq } from '@/storage/seq';
 import type { EventRouter } from './eventRouter';
-import { canAccessSession, getAccessibleDeviceIds } from '@/auth/deviceAccess';
+import { canDeviceAccessSession, getAccessibleDeviceIdsForDevice } from '@/auth/deviceAccess';
 import { sendPushToDevice, sendLiveActivityUpdate } from '@/push/apns';
 import { deleteBlob } from '@/blob/blobStore';
 import { config } from '@/config';
@@ -105,24 +105,17 @@ async function notifyLinkedIPhones(params: {
     sessionId: string;
 }) {
     const { macDeviceId, kind, title, subtitle, body, sessionId } = params;
-    // Find iPhones linked to this Mac — check both directions since DeviceLink is symmetric.
-    const links = await db.deviceLink.findMany({
-        where: {
-            OR: [
-                { sourceDeviceId: macDeviceId },
-                { targetDeviceId: macDeviceId },
-            ],
-        },
+    // Account-only refactor: the iPhones that care about this Mac are the
+    // phones of the ACCOUNT that owns it via AccountComputerLink (CONTRACT §5).
+    const ownerLinks = await db.accountComputerLink.findMany({
+        where: { computerId: macDeviceId },
+        select: { userId: true },
     });
-    const iPhoneIds = new Set<string>();
-    for (const link of links) {
-        if (link.sourceDeviceId !== macDeviceId) iPhoneIds.add(link.sourceDeviceId);
-        if (link.targetDeviceId !== macDeviceId) iPhoneIds.add(link.targetDeviceId);
-    }
-    if (iPhoneIds.size === 0) return;
+    const ownerUserIds = ownerLinks.map((l) => l.userId);
+    if (ownerUserIds.length === 0) return;
 
     const devices = await db.device.findMany({
-        where: { id: { in: Array.from(iPhoneIds) }, kind: 'ios' },
+        where: { userId: { in: ownerUserIds }, kind: 'ios' },
         select: {
             id: true,
             notificationsEnabled: true,
@@ -134,7 +127,7 @@ async function notifyLinkedIPhones(params: {
     });
 
     const staleCutoff = Date.now() - getStaleThresholdMs();
-    console.log(`[notify] kind=${kind} mac=${macDeviceId.substring(0,10)} linkedIphones=${iPhoneIds.size} candidates=${devices.length}`);
+    console.log(`[notify] kind=${kind} mac=${macDeviceId.substring(0,10)} ownerAccounts=${ownerUserIds.length} candidates=${devices.length}`);
     for (const d of devices) {
         // Master kill-switch — if the iPhone has flipped its top-level
         // notifications toggle off, skip without checking per-kind flags.
@@ -183,7 +176,7 @@ export function registerSessionHandler(
     }, callback?: (result: any) => void) => {
         try {
             // Verify device can access this session
-            if (!await canAccessSession(deviceId, data.sid)) {
+            if (!await canDeviceAccessSession(deviceId, data.sid)) {
                 console.log(`[sessionHandler] Access denied: device ${deviceId} → session ${data.sid}`);
                 callback?.({ error: 'Access denied' });
                 return;
@@ -248,7 +241,7 @@ export function registerSessionHandler(
                     console.log(`[Phase] session=${data.sid.substring(0,10)} phase=${phaseSummary.phase} tool=${phaseSummary.toolName || '-'}`);
 
                     // Find GLOBAL Live Activity tokens — only for iPhones linked to this Mac.
-                    const linkedIds = await getAccessibleDeviceIds(deviceId);
+                    const linkedIds = await getAccessibleDeviceIdsForDevice(deviceId);
                     const globalTokens = await db.liveActivityToken.findMany({
                         where: { sessionId: '__global__', deviceId: { in: linkedIds } },
                     });
@@ -364,7 +357,7 @@ export function registerSessionHandler(
         metadata: string;
         expectedVersion: number;
     }, callback?: (result: any) => void) => {
-        if (!await canAccessSession(deviceId, data.sid)) {
+        if (!await canDeviceAccessSession(deviceId, data.sid)) {
             callback?.({ result: 'denied' });
             return;
         }
@@ -396,7 +389,7 @@ export function registerSessionHandler(
 
     socket.on('session-alive', async (data: { sid: string }) => {
         // Alive is read-only status — allow if device can access session
-        if (!await canAccessSession(deviceId, data.sid)) return;
+        if (!await canDeviceAccessSession(deviceId, data.sid)) return;
 
         await db.session.update({
             where: { id: data.sid },
@@ -411,7 +404,7 @@ export function registerSessionHandler(
     });
 
     socket.on('session-end', async (data: { sid: string }) => {
-        if (!await canAccessSession(deviceId, data.sid)) return;
+        if (!await canDeviceAccessSession(deviceId, data.sid)) return;
 
         await db.session.update({
             where: { id: data.sid },

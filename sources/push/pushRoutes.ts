@@ -2,7 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '@/storage/db';
 import { authMiddleware } from '@/auth/middleware';
-import { canAccessSession } from '@/auth/deviceAccess';
+import { canDeviceAccessSession } from '@/auth/deviceAccess';
 
 export async function pushRoutes(app: FastifyInstance) {
 
@@ -134,7 +134,7 @@ export async function pushRoutes(app: FastifyInstance) {
         const deviceId = request.deviceId!;
 
         // __global__ is a special session ID for the global Live Activity — always allowed.
-        if (sessionId !== '__global__' && !await canAccessSession(deviceId, sessionId)) {
+        if (sessionId !== '__global__' && !await canDeviceAccessSession(deviceId, sessionId)) {
             return reply.code(403).send({ error: 'Access denied' });
         }
 

@@ -1,6 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { authMiddleware } from '@/auth/middleware';
-import { getAccessibleDeviceIds } from '@/auth/deviceAccess';
+import { getAccessibleDeviceIdsForDevice } from '@/auth/deviceAccess';
 import { putCapabilities, getCapabilities, type CapabilitySnapshot } from './capabilityStore';
 
 export async function capabilityRoutes(app: FastifyInstance) {
@@ -23,7 +23,7 @@ export async function capabilityRoutes(app: FastifyInstance) {
     app.get('/v1/capabilities', {
         preHandler: authMiddleware,
     }, async (request, reply) => {
-        const accessibleIds = await getAccessibleDeviceIds(request.deviceId!);
+        const accessibleIds = await getAccessibleDeviceIdsForDevice(request.deviceId!);
         for (const id of accessibleIds) {
             const snap = getCapabilities(id);
             if (snap) return snap;

@@ -79,9 +79,10 @@ model User {
   createdAt         DateTime @default(now()) @map("created_at")
   updatedAt         DateTime @updatedAt @map("updated_at")
 
-  sessions            UserSession[]
-  memberships         UserWorkroomMembership[]
-  devices             Device[]
+  sessions             UserSession[]
+  memberships          UserWorkroomMembership[]
+  devices              Device[]
+  accountComputerLinks AccountComputerLink[]
   // R4: human friendships (one canonical row per pair; query both sides).
   friendshipsOwned    UserFriendship[]         @relation("FriendshipOwner")
   friendshipsReceived UserFriendship[]         @relation("FriendshipFriend")
@@ -164,6 +165,25 @@ model DeviceLink {
   // every socket message did a full DeviceLink scan.
   @@index([sourceDeviceId])
   @@index([targetDeviceId])
+}
+
+/// Account↔Computer ownership edge (account-only identity refactor, 2026-06-03).
+/// Replaces DeviceLink for monitoring visibility. A computer is owned by AT MOST
+/// one account at a time: UNIQUE(computerId). Visibility queries hit userId.
+/// computerId references Device.id where kind='mac' (soft ref; no Prisma relation
+/// to keep the hot visibility query a single indexed lookup and to avoid cascade
+/// coupling — deletion handled explicitly in takeover/unlink paths).
+model AccountComputerLink {
+  id         String   @id @default(cuid())
+  userId     String   @map("user_id") // User.id (cuid)
+  computerId String   @map("computer_id") // Device.id where kind='mac' (cuid)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([computerId]) // single-account-ownership
+  @@index([userId]) // visibility: links by account
+  @@map("account_computer_links")
 }
 
 model Session {
@@ -559,7 +579,14 @@ model ControlMessage {
   senderKind           String          @map("sender_kind") // user | agent | system
   senderId             String          @map("sender_id") // opaque actor id (may be 'pairing:<uuid>' for op_sess_ human sends)
   content              String
+  // AGENT mentions only. The live Postgres column is `uuid[]` (see add_control_plane
+  // migration) — it can ONLY hold ControlAgent.id (uuid). Human users have cuid ids
+  // which would crash this column; they go in userMentions below.
   mentions             String[]
+  // S2 (Task #121): HUMAN (real-person) mentions. User.id is a cuid, NOT a uuid, so it
+  // cannot live in the uuid[] `mentions` column. This is a plain text[] column. The
+  // activity feed + mention-push match a human viewer's user.id against this array.
+  userMentions         String[]        @map("user_mentions")
   hashRefs             Json            @default("{}") @map("hash_refs")
   attachmentIds        String[]        @map("attachment_ids")
   embeddedCardType     String?         @map("embedded_card_type")

@@ -9,6 +9,7 @@ import { authRoutes } from '@/auth/authRoutes';
 import { userSessionRoutes } from '@/auth/userSession/userSessionRoutes';
 import { pairingRoutes } from '@/pairing/pairingRoutes';
 import { devicesRoutes } from '@/devices/devicesRoutes';
+import { computersRoutes } from '@/devices/computersRoutes';
 import { sessionRoutes } from '@/session/sessionRoutes';
 import { pushRoutes } from '@/push/pushRoutes';
 import { blobRoutes } from '@/blob/blobRoutes';
@@ -87,6 +88,7 @@ export async function startApi() {
     await app.register(userSessionRoutes);
     await app.register(pairingRoutes);
     await app.register(devicesRoutes);
+    await app.register(computersRoutes);
     await app.register(sessionRoutes);
     await app.register(pushRoutes);
     await app.register(blobRoutes);

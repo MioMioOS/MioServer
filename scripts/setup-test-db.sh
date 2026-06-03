@@ -78,6 +78,7 @@ CONTROL_PLANE_MIGRATIONS=(
   "prisma/migrations/20260529000000_s6_machine_enrollment/migration.sql"
   "prisma/migrations/20260530000000_user_auth_unification/migration.sql"
   "prisma/migrations/20260530010000_p3_reviewer_gate_review_round/migration.sql"
+  "prisma/migrations/20260601000000_s2_human_mentions/migration.sql"
 )
 for migration in "${CONTROL_PLANE_MIGRATIONS[@]}"; do
   echo "==> Applying ${migration}"

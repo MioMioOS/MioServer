@@ -2,7 +2,8 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '@/storage/db';
 import { authMiddleware } from '@/auth/middleware';
-import { getAccessibleDeviceIds } from '@/auth/deviceAccess';
+import { requireUser } from '@/auth/userSession/requireUser';
+import { getAccessibleComputerIds } from '@/auth/deviceAccess';
 
 // Charset excludes I, L, O, 0, 1 to avoid visual confusion.
 const SHORT_CODE_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -124,19 +125,19 @@ export async function devicesRoutes(app: FastifyInstance) {
         return { ok: true, count: presets.length };
     });
 
-    // iPhone fetches a paired Mac's presets.
+    // iPhone fetches a linked computer's presets. Account-scoped (CONTRACT §2.3):
+    // `:deviceId` is the mac computerId; access is gated by the account's links.
     app.get('/v1/devices/:deviceId/presets', {
-        preHandler: authMiddleware,
+        preHandler: requireUser(),
         schema: {
             params: z.object({ deviceId: z.string() }),
         },
     }, async (request, reply) => {
-        const me = request.deviceId!;
         const { deviceId: targetId } = request.params as { deviceId: string };
 
-        const accessible = await getAccessibleDeviceIds(me);
+        const accessible = await getAccessibleComputerIds(request.user!.id);
         if (!accessible.includes(targetId)) {
-            return reply.code(403).send({ error: 'Not linked to that device' });
+            return reply.code(403).send({ error: { code: 'NOT_LINKED' } });
         }
 
         const presets = await db.launchPreset.findMany({
@@ -188,21 +189,20 @@ export async function devicesRoutes(app: FastifyInstance) {
         return { ok: true, count: projects.length };
     });
 
-    // iPhone fetches a paired Mac's recent projects.
+    // iPhone fetches a linked computer's recent projects. Account-scoped.
     app.get('/v1/devices/:deviceId/projects', {
-        preHandler: authMiddleware,
+        preHandler: requireUser(),
         schema: {
             params: z.object({ deviceId: z.string() }),
             querystring: z.object({ limit: z.coerce.number().int().min(1).max(100).default(30) }),
         },
     }, async (request, reply) => {
-        const me = request.deviceId!;
         const { deviceId: targetId } = request.params as { deviceId: string };
         const { limit } = request.query as { limit: number };
 
-        const accessible = await getAccessibleDeviceIds(me);
+        const accessible = await getAccessibleComputerIds(request.user!.id);
         if (!accessible.includes(targetId)) {
-            return reply.code(403).send({ error: 'Not linked to that device' });
+            return reply.code(403).send({ error: { code: 'NOT_LINKED' } });
         }
 
         const projects = await db.knownProject.findMany({

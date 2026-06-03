@@ -1,6 +1,7 @@
 import { Server as HttpServer } from 'http';
 import { Server } from 'socket.io';
 import { verifyToken } from '@/auth/crypto';
+import { resolveUserSession } from '@/auth/userSession/resolveUserSession';
 import { bumpLastSeenAt } from '@/auth/middleware';
 import { config } from '@/config';
 import { EventRouter, type ClientConnection } from './eventRouter';
@@ -33,6 +34,42 @@ export function startSocket(server: HttpServer) {
             return;
         }
 
+        // ── Identity resolution (account-only refactor, CONTRACT §2.7) ───────
+        //
+        // Two distinct connectors share /v1/updates:
+        //   - Phone SUBSCRIBER connects with a user_sess_ token. We key the
+        //     connection by userId; its visible computers = the account's
+        //     AccountComputerLink set. It does NOT register publisher handlers.
+        //   - Mac PUBLISHER (daemon) connects with its device JWT (deviceId =
+        //     Device(mac).id, ownerless). It pushes session updates and
+        //     registers RPC handlers as before.
+        //
+        // We prefer the user_sess_ interpretation when the token carries the
+        // user-session prefix; otherwise fall back to a device JWT.
+        const userSession = token.startsWith('user_sess_')
+            ? await resolveUserSession('Bearer ' + token)
+            : null;
+
+        if (userSession) {
+            // Phone subscriber plane.
+            const connection: ClientConnection = {
+                connectionType: clientType === 'session-scoped' ? 'session-scoped' : 'user-scoped',
+                socket,
+                userId: userSession.userId,
+                sessionId,
+            };
+            eventRouter.addConnection(connection);
+
+            // Lightweight ping for client-side latency measurement.
+            socket.on('ping', (_data, ack) => { if (typeof ack === 'function') ack({}); });
+
+            socket.on('disconnect', () => {
+                eventRouter.removeConnection(connection);
+            });
+            return;
+        }
+
+        // Mac publisher plane — device JWT.
         const payload = verifyToken(token, config.masterSecret);
         if (!payload) {
             socket.disconnect();
@@ -84,7 +121,7 @@ export function startSocket(server: HttpServer) {
             sessionId,
         };
 
-        eventRouter.addConnection(payload.deviceId, connection);
+        eventRouter.addConnection(connection);
         // Touch lastSeenAt so notifyLinkedIPhones can tell this device is
         // still alive even if the user only ever talks via the socket.
         bumpLastSeenAt(payload.deviceId);
@@ -96,7 +133,7 @@ export function startSocket(server: HttpServer) {
         registerRpcHandler(socket, payload.deviceId);
 
         socket.on('disconnect', () => {
-            eventRouter.removeConnection(payload.deviceId, connection);
+            eventRouter.removeConnection(connection);
             if (trackedTransactionId) {
                 concurrencyGuard.removeConnection(trackedTransactionId, socket.id);
             }

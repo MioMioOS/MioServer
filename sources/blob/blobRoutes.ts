@@ -1,6 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { authMiddleware } from '@/auth/middleware';
-import { getAccessibleDeviceIds } from '@/auth/deviceAccess';
+import { getAccessibleDeviceIdsForDevice } from '@/auth/deviceAccess';
 import { putBlob, readBlob, getBlob } from './blobStore';
 
 const MAX_BLOB_BYTES = 8 * 1024 * 1024; // 8 MB per blob
@@ -60,7 +60,7 @@ export async function blobRoutes(app: FastifyInstance) {
         if (!rec) {
             return reply.code(404).send({ error: 'Blob not found' });
         }
-        const accessible = await getAccessibleDeviceIds(request.deviceId!);
+        const accessible = await getAccessibleDeviceIdsForDevice(request.deviceId!);
         if (!accessible.includes(rec.deviceId)) {
             return reply.code(403).send({ error: 'Access denied' });
         }
