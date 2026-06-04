@@ -1067,7 +1067,9 @@ export async function messageRoutes(app: FastifyInstance) {
       where: {
         workroomId: wid,
         channelId: { in: visibleChannelIds },
-        parentMessageId: null,
+        // NB: no parentMessageId filter — task lifecycle system messages are often
+        // posted INSIDE the task thread (a reply), so restricting to top-level would
+        // drop most "📋 created" / "→ done" events.
         senderKind: 'system',
         OR: [{ content: { startsWith: '📋' } }, { content: { endsWith: '→ done' } }],
       },
@@ -1077,7 +1079,7 @@ export async function messageRoutes(app: FastifyInstance) {
         id: true, channelId: true, workroomId: true, parentMessageId: true,
         content: true, createdAt: true,
       },
-    });
+    }); // taskRows
 
     // Join ControlActivityState for the `handled` flag across both sources.
     const allIds = [...mentionRows.map((r) => r.id), ...taskRows.map((r) => r.id)];
@@ -1114,7 +1116,7 @@ export async function messageRoutes(app: FastifyInstance) {
       return {
         id: `act_${r.id}`, message_id: r.id, handled: handledByMessage.get(r.id) ?? false,
         type: done ? 'task_done' : 'task_started',
-        workroom_id: r.workroomId, channel_id: r.channelId, thread_id: null,
+        workroom_id: r.workroomId, channel_id: r.channelId, thread_id: r.parentMessageId ?? null,
         title: done ? 'Task completed' : 'New task',
         body: previewText(r.content, 200), created_at: r.createdAt,
       };
