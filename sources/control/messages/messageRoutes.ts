@@ -52,6 +52,19 @@ import { writeEventAndBroadcast } from './writeEventAndBroadcast';
 import { writeThreadReplyEventAndBroadcast } from './writeThreadReplyEventAndBroadcast';
 import { resolveSenderDisplayNames, formatMessage, resolveAttachedTasks, resolveAttachmentMetadata } from './messageFormatting';
 import { classifyAndMaybeCreateTask } from '@/control/classify/classifyAndMaybeCreateTask';
+import { splitMentions } from './splitMentions';
+import { notifyMentionedUsers, type DeepLinkType } from '@/control/notifications/notify';
+import { redactControlText } from '@/control/redaction/redactControlText';
+
+/**
+ * Shape a message body into a short, secret-redacted notification/activity preview.
+ * Reuses the same redaction the WS broadcast preview uses (no tokens/paths/credentials
+ * leak into a push or the activity feed), then truncates to `max` chars.
+ */
+function previewText(content: string, max = 200): string {
+  const redacted = redactControlText(content).trim();
+  return redacted.length > max ? `${redacted.slice(0, max - 1)}…` : redacted;
+}
 
 const MAX_PAGE_SIZE = 100;
 
@@ -226,6 +239,44 @@ async function fetchFormattedMessage(id: string) {
     attachedTask: attached.get(row.id) ?? null,
     attachmentMetadata,
   });
+}
+
+/**
+ * Resolve "@<agent display name>" mentions written as plain text in a message body
+ * into ControlAgent ids, scoped to the agents that are members of this channel.
+ *
+ * The composer inserts the agent's display name (e.g. "@UI设计师") as plain text and
+ * sends no ids, so agent mentions never populated `mentions`. The daemon's wake/route
+ * logic keys off `mentions`, so without this an @-addressed agent is never triggered.
+ * Matching is by `@` + (displayName || name) substring against the channel's agent
+ * members (longest names first so "@PM Lead" wins over "@PM").
+ */
+async function resolveContentAgentMentions(channelId: string, content: string): Promise<string[]> {
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const members = await db.controlChannelMember.findMany({
+    where: { channelId },
+    select: { memberId: true },
+  });
+  const agentIds = members.map((m) => m.memberId).filter((id) => uuidRe.test(id));
+  if (agentIds.length === 0) return [];
+  const agents = await db.controlAgent.findMany({
+    where: { id: { in: agentIds } },
+    select: { id: true, displayName: true, name: true },
+  });
+  // Build (label, id) pairs, longest label first to avoid prefix collisions.
+  const pairs: Array<{ label: string; id: string }> = [];
+  for (const a of agents) {
+    for (const label of [a.displayName, a.name]) {
+      const t = label?.trim();
+      if (t) pairs.push({ label: t, id: a.id });
+    }
+  }
+  pairs.sort((x, y) => y.label.length - x.label.length);
+  const hits = new Set<string>();
+  for (const { label, id } of pairs) {
+    if (content.includes('@' + label)) hits.add(id);
+  }
+  return [...hits];
 }
 
 export async function messageRoutes(app: FastifyInstance) {
@@ -468,13 +519,25 @@ export async function messageRoutes(app: FastifyInstance) {
       clientIdempotencyKey = typeof body.client_idempotency_key === 'string' ? body.client_idempotency_key : null;
     }
 
+    // Task #121 S2: clients send ONE flat `mentions` array of opaque ids. Classify by
+    // shape — uuid → agent (stored in mentions uuid[]), cuid → human (stored in user_mentions text[]).
+    const { agentMentions, userMentions } = splitMentions(body.mentions);
+
+    // Mention parsing: the composer inserts "@<agent display name>" as PLAIN TEXT and
+    // sends no ids, so agent mentions never reached `mentions` (the daemon's wake/route
+    // logic depends on it). Resolve @names in the content against this channel's agents
+    // and merge — server-side so it works for every client without an id round-trip.
+    const contentAgentMentions = await resolveContentAgentMentions(cid, body.content);
+    const mergedAgentMentions = [...new Set([...agentMentions, ...contentAgentMentions])];
+
     const result = await sendMessageTransaction({
       channelId: cid,
       workroomId: wid,
       senderKind,
       senderId,
       content: body.content,
-      mentions: Array.isArray(body.mentions) ? (body.mentions as string[]) : [],
+      mentions: mergedAgentMentions,
+      userMentions,
       embeddedCardType: typeof body.embedded_card_type === 'string' ? body.embedded_card_type : null,
       embeddedCardId: typeof body.embedded_card_id === 'string' ? body.embedded_card_id : null,
       clientIdempotencyKey,
@@ -514,6 +577,21 @@ export async function messageRoutes(app: FastifyInstance) {
     // Post-commit write-before-broadcast (runs AFTER classifier so the task +
     // system message are persisted before the daemon sees the original message).
     await writeEventAndBroadcast(result);
+
+    // Task #121 S4: mention push for HUMAN mentions (uuid agent mentions ride the WS
+    // broadcast + daemon path; humans need APNs). Mentions are NOT gated by the
+    // completion/approval toggles — a direct @-mention is always relevant. Skipped on
+    // idempotent replay (a retried send must not double-notify). Fire-and-forget.
+    if (!result.idempotent && userMentions.length > 0) {
+      const senderUserId = senderKind === 'user' ? senderId : null;
+      notifyMentionedUsers({
+        mentionedUserIds: userMentions,
+        senderUserId,
+        target: { workroomId: wid, channelId: cid, messageId: result.id, threadId: null },
+        title: 'You were mentioned',
+        body: previewText(body.content, 200),
+      }).catch((err) => console.error('[messages] mention push failed', err));
+    }
 
     // S2 §2-C: return the FULL message wire shape (re-fetched) + idempotent flag.
     return reply.code(201).send({
@@ -699,7 +777,8 @@ export async function messageRoutes(app: FastifyInstance) {
     }
 
     const content = body.content;
-    const mentions = Array.isArray(body.mentions) ? (body.mentions as string[]) : [];
+    // Task #121 S2: classify mentions by shape (uuid agent / cuid human).
+    const { agentMentions, userMentions } = splitMentions(body.mentions);
 
     // Load the parent → derive channelId (404 if missing / not in this workroom).
     const parent = await db.controlMessage.findUnique({
@@ -716,7 +795,8 @@ export async function messageRoutes(app: FastifyInstance) {
       senderKind,
       senderId,
       content,
-      mentions,
+      mentions: agentMentions,
+      userMentions,
       clientIdempotencyKey,
       parentMessageId: parentId,
     });
@@ -922,26 +1002,47 @@ export async function messageRoutes(app: FastifyInstance) {
 
     const callerKeys = await resolveActivityCallerKeys(guard.actor);
 
-    // The DB column `mentions` is UUID[]; non-uuid keys (e.g. user.id is a cuid this slice)
-    // would crash the query. Filter to uuid-shape only — for user actors with a cuid id this
-    // collapses to an empty filter and the feed is vacuous (per Slice 7 spec; user-mention
-    // semantics for activity are deferred per controller decision 5).
+    // AGENT mention match: the `mentions` column is UUID[]; non-uuid keys would crash the
+    // query, so filter to uuid-shape only. Machine actors match here (machine.id + agent ids).
     const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const uuidCallerKeys = callerKeys.filter((k) => uuidRe.test(k));
-    if (uuidCallerKeys.length === 0) {
+
+    // HUMAN mention match (Task #121 S2): a user actor's cuid user.id is matched against the
+    // user_mentions text[] column. Machine actors never have a cuid user.id, so this is empty
+    // for them. This is what makes @real-person reach the activity feed.
+    const userMentionKeys =
+      guard.actor.kind === 'user' ? [guard.actor.userId] : [];
+
+    // No mention key of any kind → empty feed (avoids a `mentions OR user_mentions` query
+    // with two empty arrays, which would match every message).
+    if (uuidCallerKeys.length === 0 && userMentionKeys.length === 0) {
       return { activity: [] };
     }
+
+    const mentionOr: Prisma.ControlMessageWhereInput[] = [];
+    if (uuidCallerKeys.length > 0) mentionOr.push({ mentions: { hasSome: uuidCallerKeys } });
+    if (userMentionKeys.length > 0) mentionOr.push({ userMentions: { hasSome: userMentionKeys } });
 
     const rows = await db.controlMessage.findMany({
       where: {
         workroomId: wid,
         channelId: { in: visibleChannelIds },
         parentMessageId: null,
-        mentions: { hasSome: uuidCallerKeys },
+        OR: mentionOr,
       },
       orderBy: { createdAt: 'desc' },
       take: 50,
-      select: { id: true },
+      // Deep-link enrichment (Task #121): the client needs channel/workroom/thread to
+      // route workspace→channel→thread. content fuels the activity item title/body.
+      select: {
+        id: true,
+        channelId: true,
+        workroomId: true,
+        parentMessageId: true,
+        content: true,
+        mentions: true,
+        userMentions: true,
+      },
     });
 
     // Join ControlActivityState for the `handled` flag. subjectId is the actor's primary id
@@ -959,11 +1060,26 @@ export async function messageRoutes(app: FastifyInstance) {
       for (const s of states) handledByMessage.set(s.messageId, s.handled);
     }
 
-    let activity = rows.map((r) => ({
-      id: `act_${r.id}`,
-      message_id: r.id,
-      handled: handledByMessage.get(r.id) ?? false,
-    }));
+    // Classify each item's deep-link type: a human-mention match → mention_human,
+    // otherwise an agent-mention match → mention_ai (mirrors the APNs `type` field so the
+    // client can route the same way whether the trigger arrived via push or via this feed).
+    let activity = rows.map((r) => {
+      const isHumanMention =
+        userMentionKeys.length > 0 && r.userMentions.some((m) => userMentionKeys.includes(m));
+      const type: DeepLinkType = isHumanMention ? 'mention_human' : 'mention_ai';
+      return {
+        id: `act_${r.id}`,
+        message_id: r.id,
+        handled: handledByMessage.get(r.id) ?? false,
+        // Shared deep-link contract (matches the APNs custom payload field set).
+        type,
+        workroom_id: r.workroomId,
+        channel_id: r.channelId,
+        thread_id: r.parentMessageId ?? null,
+        title: type === 'mention_human' ? 'You were mentioned' : 'Agent mention',
+        body: previewText(r.content, 200),
+      };
+    });
 
     if (filter === 'unread') {
       activity = activity.filter((a) => !a.handled);
@@ -1014,6 +1130,80 @@ export async function messageRoutes(app: FastifyInstance) {
     });
 
     return reply.code(200).send({ ok: true });
+  });
+
+  /**
+   * POST /api/v1/workrooms/:wid/activity/read-all  (Task #121)
+   *
+   * Mark ALL of the caller's currently-unhandled activity (mention) items in this workroom
+   * as handled in one shot. Complements the per-message POST .../activity/:messageId/handled.
+   *
+   * Auth (Slice 7): user_sess_ (workroom OWNER) OR machine_token, via authorizeMessageWrite.
+   * subjectId: user.id for user actor, machine.id for machine actor.
+   *
+   * Implementation: recompute the caller's mention set in this workroom (same match logic as
+   * GET /activity — agent uuid mentions and/or human cuid user_mentions, restricted to visible
+   * channels), then upsert a handled=true ControlActivityState row for each. Idempotent:
+   * already-handled items stay handled; calling twice is a no-op. Returns { ok: true, marked }.
+   */
+  app.post('/api/v1/workrooms/:wid/activity/read-all', async (request, reply) => {
+    const { wid } = request.params as { wid: string };
+
+    // Resolve the caller's read actor (member/machine) to compute their mention set,
+    // then a write subject (owner/machine) for the activity-state subjectId.
+    const guard = await resolveMessageReadActor(request, wid);
+    if (!guard.ok) return reply.code(guard.status).send({ error: guard.error });
+
+    const auth = await authorizeMessageWrite(request, { workroomId: wid, command: 'mark_reviewed' });
+    if (!auth.ok) return reply.code(auth.status).send(auth.body);
+
+    // Restrict to visible channels (consistent with GET /activity).
+    const visible = await visibleChannels({ viewerId: guard.viewerId, viewerKind: guard.actor.kind }, wid);
+    const visibleChannelIds = visible.map((ch) => ch.id);
+    if (visibleChannelIds.length === 0) {
+      return reply.code(200).send({ ok: true, marked: 0 });
+    }
+
+    const callerKeys = await resolveActivityCallerKeys(guard.actor);
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const uuidCallerKeys = callerKeys.filter((k) => uuidRe.test(k));
+    const userMentionKeys = guard.actor.kind === 'user' ? [guard.actor.userId] : [];
+
+    if (uuidCallerKeys.length === 0 && userMentionKeys.length === 0) {
+      return reply.code(200).send({ ok: true, marked: 0 });
+    }
+
+    const mentionOr: Prisma.ControlMessageWhereInput[] = [];
+    if (uuidCallerKeys.length > 0) mentionOr.push({ mentions: { hasSome: uuidCallerKeys } });
+    if (userMentionKeys.length > 0) mentionOr.push({ userMentions: { hasSome: userMentionKeys } });
+
+    const rows = await db.controlMessage.findMany({
+      where: {
+        workroomId: wid,
+        channelId: { in: visibleChannelIds },
+        parentMessageId: null,
+        OR: mentionOr,
+      },
+      select: { id: true },
+    });
+    if (rows.length === 0) {
+      return reply.code(200).send({ ok: true, marked: 0 });
+    }
+
+    // Upsert handled=true for every matched message under the caller's subject.
+    // Sequential upserts inside one $transaction so a partial failure rolls back cleanly.
+    const subjectId = auth.subject.subjectId;
+    await db.$transaction(
+      rows.map((r) =>
+        db.controlActivityState.upsert({
+          where: { subjectId_messageId: { subjectId, messageId: r.id } },
+          create: { subjectId, messageId: r.id, handled: true },
+          update: { handled: true },
+        }),
+      ),
+    );
+
+    return reply.code(200).send({ ok: true, marked: rows.length });
   });
 }
 
