@@ -538,4 +538,119 @@ describe('DELETE /v1/users/me', () => {
             await f.cleanup();
         }
     });
+
+    // --- POST /v1/users/register --------------------------------------------
+
+    describe('POST /v1/users/register', () => {
+        const INVITE = 'TEST_INVITE_CODE';
+        let prevInvite: string | undefined;
+        const created: string[] = [];
+
+        beforeAll(() => {
+            prevInvite = process.env.REGISTER_INVITE_CODE;
+            process.env.REGISTER_INVITE_CODE = INVITE;
+        });
+        afterAll(async () => {
+            if (prevInvite === undefined) delete process.env.REGISTER_INVITE_CODE;
+            else process.env.REGISTER_INVITE_CODE = prevInvite;
+            await db.userSession
+                .deleteMany({ where: { userId: { in: created } } })
+                .catch(() => {});
+            await db.user.deleteMany({ where: { id: { in: created } } }).catch(() => {});
+        });
+
+        async function register(payload: Record<string, unknown>) {
+            return app.inject({
+                method: 'POST',
+                url: '/v1/users/register',
+                payload,
+            });
+        }
+
+        it('creates an account + session and returns the signin envelope', async () => {
+            const email = `reg-${randomUUID()}@example.test`;
+            const r = await register({
+                email,
+                password: 'correct-horse-battery',
+                display_name: 'Kris',
+                invite_code: INVITE,
+            });
+            expect(r.statusCode).toBe(201);
+            const body = r.json();
+            expect(body.token).toMatch(/^user_sess_/);
+            expect(body.user.email).toBe(email);
+            expect(body.user.display_name).toBe('Kris');
+            expect(body.user.avatar).toBeTruthy();
+            expect(body.default_workroom_id).toBeNull();
+            expect(body.workrooms).toEqual([]);
+
+            const user = await db.user.findUnique({ where: { email } });
+            expect(user).not.toBeNull();
+            created.push(user!.id);
+            // Password stored hashed, not plaintext.
+            expect(user!.passwordHash).not.toBe('correct-horse-battery');
+            expect(
+                await db.userSession.count({ where: { userId: user!.id } }),
+            ).toBe(1);
+        });
+
+        it('rejects a wrong / missing invite code with 403 before body checks', async () => {
+            const bad = await register({
+                email: 'x@example.test',
+                password: 'short',
+                invite_code: 'WRONG',
+            });
+            expect(bad.statusCode).toBe(403);
+            expect(bad.json().error.code).toBe('INVALID_INVITE');
+
+            const missing = await register({
+                email: 'x@example.test',
+                password: 'whatever-long-enough',
+            });
+            expect(missing.statusCode).toBe(403);
+        });
+
+        it('409 on duplicate email', async () => {
+            const email = `dup-${randomUUID()}@example.test`;
+            const first = await register({
+                email,
+                password: 'correct-horse-battery',
+                invite_code: INVITE,
+            });
+            expect(first.statusCode).toBe(201);
+            created.push((await db.user.findUnique({ where: { email } }))!.id);
+
+            const second = await register({
+                email,
+                password: 'correct-horse-battery',
+                invite_code: INVITE,
+            });
+            expect(second.statusCode).toBe(409);
+            expect(second.json().error.code).toBe('EMAIL_EXISTS');
+        });
+
+        it('400 on bad email / short password / blank display_name', async () => {
+            const badEmail = await register({
+                email: 'not-an-email',
+                password: 'correct-horse-battery',
+                invite_code: INVITE,
+            });
+            expect(badEmail.statusCode).toBe(400);
+
+            const shortPw = await register({
+                email: `pw-${randomUUID()}@example.test`,
+                password: 'short',
+                invite_code: INVITE,
+            });
+            expect(shortPw.statusCode).toBe(400);
+
+            const blankName = await register({
+                email: `nm-${randomUUID()}@example.test`,
+                password: 'correct-horse-battery',
+                display_name: '   ',
+                invite_code: INVITE,
+            });
+            expect(blankName.statusCode).toBe(400);
+        });
+    });
 });

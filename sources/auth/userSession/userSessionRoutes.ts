@@ -22,7 +22,7 @@
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify';
 import { Prisma } from '@prisma/client';
 import { db } from '@/storage/db';
-import { verifyPassword, DUMMY_PASSWORD_HASH } from './passwordHash';
+import { verifyPassword, hashPassword, DUMMY_PASSWORD_HASH } from './passwordHash';
 import {
     mintUserSessionToken,
     hashUserSessionToken,
@@ -242,6 +242,118 @@ export const userSessionRoutes: FastifyPluginAsync = async (app) => {
             user: buildMe(user),
             default_workroom_id: user.defaultWorkroomId,
             workrooms,
+        });
+    });
+
+    // POST /v1/users/register — public signup, gated by a shared invite code.
+    //   body: { email, password, display_name?, invite_code }
+    // Returns the SAME envelope as signin so the client reuses its post-login
+    // landing logic verbatim. A fresh account has no workrooms / no default —
+    // it lands on the same "scan a Mac to get started" empty state as any
+    // existing account that hasn't linked a computer yet.
+    //
+    // Invite gate: a single shared code in env (REGISTER_INVITE_CODE). When the
+    // env var is unset, registration is CLOSED (every attempt → 403) — fail
+    // closed so a misconfigured deploy can't accidentally open public signup.
+    // One-time / multi-code support would mean a dedicated invite table; out of
+    // scope for this slice (see footer).
+    app.post('/v1/users/register', async (req, reply) => {
+        // IP gate first (same rationale as signin — don't leak state via 429).
+        const ip = req.ip;
+        if (!rateLimitOk(ip)) {
+            reply.header('Retry-After', String(Math.ceil(RL_WINDOW_MS / 1000)));
+            return reply.code(429).send({ error: { code: 'RATE_LIMITED' } });
+        }
+
+        const body = req.body as {
+            email?: unknown;
+            password?: unknown;
+            display_name?: unknown;
+            invite_code?: unknown;
+        } | null;
+
+        // Invite gate before any body validation — an attacker without the code
+        // learns nothing about field rules.
+        const expectedInvite = process.env.REGISTER_INVITE_CODE;
+        if (
+            !expectedInvite ||
+            !body ||
+            typeof body.invite_code !== 'string' ||
+            body.invite_code.trim() !== expectedInvite
+        ) {
+            return reply.code(403).send({ error: { code: 'INVALID_INVITE' } });
+        }
+
+        if (
+            typeof body.email !== 'string' ||
+            typeof body.password !== 'string'
+        ) {
+            return reply.code(400).send({ error: { code: 'INVALID_BODY' } });
+        }
+        const email = body.email.trim().toLowerCase();
+        const password = body.password;
+        // Email: minimal shape check (one @, non-empty sides). Full RFC
+        // validation is pointless without a verification round-trip.
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            return reply
+                .code(400)
+                .send({ error: { code: 'INVALID_BODY', field: 'email' } });
+        }
+        if (password.length < 8) {
+            return reply
+                .code(400)
+                .send({ error: { code: 'INVALID_BODY', field: 'password' } });
+        }
+        // display_name optional; when present must be a non-blank string within
+        // bounds (mirrors PATCH /me validation).
+        let displayName: string | null = null;
+        if (body.display_name !== undefined && body.display_name !== null) {
+            if (
+                typeof body.display_name !== 'string' ||
+                body.display_name.trim().length === 0 ||
+                body.display_name.trim().length > DISPLAY_NAME_MAX_LEN
+            ) {
+                return reply
+                    .code(400)
+                    .send({ error: { code: 'INVALID_BODY', field: 'display_name' } });
+            }
+            displayName = body.display_name.trim();
+        }
+
+        const passwordHash = await hashPassword(password);
+
+        let user: { id: string; email: string; displayName: string | null; defaultWorkroomId: string | null };
+        try {
+            user = await db.user.create({
+                data: { email, passwordHash, displayName },
+                select: { id: true, email: true, displayName: true, defaultWorkroomId: true },
+            });
+        } catch (err) {
+            // Unique violation on email → 409. Anything else bubbles to 500.
+            if (
+                err instanceof Prisma.PrismaClientKnownRequestError &&
+                err.code === 'P2002'
+            ) {
+                return reply.code(409).send({ error: { code: 'EMAIL_EXISTS' } });
+            }
+            throw err;
+        }
+
+        const rawToken = mintUserSessionToken();
+        await db.userSession.create({
+            data: {
+                userId: user.id,
+                tokenHash: hashUserSessionToken(rawToken),
+                expiresAt: new Date(Date.now() + SESSION_TTL_MS),
+            },
+        });
+
+        // Fresh account: no memberships yet → workrooms [] and default null.
+        return reply.code(201).send({
+            token: rawToken,
+            user: buildMe(user),
+            default_workroom_id: user.defaultWorkroomId,
+            workrooms: [],
         });
     });
 
