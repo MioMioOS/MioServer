@@ -242,41 +242,63 @@ async function fetchFormattedMessage(id: string) {
 }
 
 /**
- * Resolve "@<agent display name>" mentions written as plain text in a message body
- * into ControlAgent ids, scoped to the agents that are members of this channel.
+ * Resolve "@<name>" mentions written as plain text in a message body into ids,
+ * scoped to the members of this channel. Returns BOTH agent mentions (uuid →
+ * ControlAgent, drive the daemon wake/route) and human mentions (cuid → User,
+ * drive the human's activity feed).
  *
- * The composer inserts the agent's display name (e.g. "@UI设计师") as plain text and
- * sends no ids, so agent mentions never populated `mentions`. The daemon's wake/route
- * logic keys off `mentions`, so without this an @-addressed agent is never triggered.
- * Matching is by `@` + (displayName || name) substring against the channel's agent
- * members (longest names first so "@PM Lead" wins over "@PM").
+ * The composer inserts the member's display name (e.g. "@UI设计师" / "@Kris") as
+ * plain text and sends no ids, so mentions never populated. Matching is by `@` +
+ * (displayName || name || email || email-local-part) substring against the
+ * channel's members, longest label first to avoid prefix collisions.
  */
-async function resolveContentAgentMentions(channelId: string, content: string): Promise<string[]> {
+async function resolveContentMentions(
+  channelId: string,
+  content: string,
+): Promise<{ agentIds: string[]; userIds: string[] }> {
   const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const members = await db.controlChannelMember.findMany({
     where: { channelId },
     select: { memberId: true },
   });
-  const agentIds = members.map((m) => m.memberId).filter((id) => uuidRe.test(id));
-  if (agentIds.length === 0) return [];
-  const agents = await db.controlAgent.findMany({
-    where: { id: { in: agentIds } },
-    select: { id: true, displayName: true, name: true },
-  });
-  // Build (label, id) pairs, longest label first to avoid prefix collisions.
-  const pairs: Array<{ label: string; id: string }> = [];
-  for (const a of agents) {
-    for (const label of [a.displayName, a.name]) {
-      const t = label?.trim();
-      if (t) pairs.push({ label: t, id: a.id });
+  const agentMemberIds = members.map((m) => m.memberId).filter((id) => uuidRe.test(id));
+  const userMemberIds = members.map((m) => m.memberId).filter((id) => !uuidRe.test(id));
+
+  // (label → id, kind) pairs across agents + users; match longest labels first.
+  const pairs: Array<{ label: string; id: string; kind: 'agent' | 'user' }> = [];
+
+  if (agentMemberIds.length > 0) {
+    const agents = await db.controlAgent.findMany({
+      where: { id: { in: agentMemberIds } },
+      select: { id: true, displayName: true, name: true },
+    });
+    for (const a of agents) {
+      for (const label of [a.displayName, a.name]) {
+        const t = label?.trim();
+        if (t) pairs.push({ label: t, id: a.id, kind: 'agent' });
+      }
     }
   }
-  pairs.sort((x, y) => y.label.length - x.label.length);
-  const hits = new Set<string>();
-  for (const { label, id } of pairs) {
-    if (content.includes('@' + label)) hits.add(id);
+  if (userMemberIds.length > 0) {
+    const users = await db.user.findMany({
+      where: { id: { in: userMemberIds } },
+      select: { id: true, displayName: true, email: true },
+    });
+    for (const u of users) {
+      const labels = [u.displayName?.trim(), u.email, u.email.split('@')[0]].filter(
+        (x): x is string => !!x,
+      );
+      for (const label of labels) pairs.push({ label, id: u.id, kind: 'user' });
+    }
   }
-  return [...hits];
+
+  pairs.sort((x, y) => y.label.length - x.label.length);
+  const agentIds = new Set<string>();
+  const userIds = new Set<string>();
+  for (const { label, id, kind } of pairs) {
+    if (content.includes('@' + label)) (kind === 'agent' ? agentIds : userIds).add(id);
+  }
+  return { agentIds: [...agentIds], userIds: [...userIds] };
 }
 
 export async function messageRoutes(app: FastifyInstance) {
@@ -527,8 +549,9 @@ export async function messageRoutes(app: FastifyInstance) {
     // sends no ids, so agent mentions never reached `mentions` (the daemon's wake/route
     // logic depends on it). Resolve @names in the content against this channel's agents
     // and merge — server-side so it works for every client without an id round-trip.
-    const contentAgentMentions = await resolveContentAgentMentions(cid, body.content);
-    const mergedAgentMentions = [...new Set([...agentMentions, ...contentAgentMentions])];
+    const contentMentions = await resolveContentMentions(cid, body.content);
+    const mergedAgentMentions = [...new Set([...agentMentions, ...contentMentions.agentIds])];
+    const mergedUserMentions = [...new Set([...userMentions, ...contentMentions.userIds])];
 
     const result = await sendMessageTransaction({
       channelId: cid,
@@ -537,7 +560,7 @@ export async function messageRoutes(app: FastifyInstance) {
       senderId,
       content: body.content,
       mentions: mergedAgentMentions,
-      userMentions,
+      userMentions: mergedUserMentions,
       embeddedCardType: typeof body.embedded_card_type === 'string' ? body.embedded_card_type : null,
       embeddedCardId: typeof body.embedded_card_id === 'string' ? body.embedded_card_id : null,
       clientIdempotencyKey,
@@ -1013,73 +1036,93 @@ export async function messageRoutes(app: FastifyInstance) {
     const userMentionKeys =
       guard.actor.kind === 'user' ? [guard.actor.userId] : [];
 
-    // No mention key of any kind → empty feed (avoids a `mentions OR user_mentions` query
-    // with two empty arrays, which would match every message).
-    if (uuidCallerKeys.length === 0 && userMentionKeys.length === 0) {
-      return { activity: [] };
-    }
-
     const mentionOr: Prisma.ControlMessageWhereInput[] = [];
     if (uuidCallerKeys.length > 0) mentionOr.push({ mentions: { hasSome: uuidCallerKeys } });
     if (userMentionKeys.length > 0) mentionOr.push({ userMentions: { hasSome: userMentionKeys } });
 
-    const rows = await db.controlMessage.findMany({
+    // Mention messages — skip the query entirely when the caller has no mention keys
+    // (an empty `OR` would otherwise match everything). Task events below still surface.
+    const mentionRows =
+      mentionOr.length > 0
+        ? await db.controlMessage.findMany({
+            where: {
+              workroomId: wid,
+              channelId: { in: visibleChannelIds },
+              parentMessageId: null,
+              OR: mentionOr,
+            },
+            orderBy: { createdAt: 'desc' },
+            take: 50,
+            select: {
+              id: true, channelId: true, workroomId: true, parentMessageId: true,
+              content: true, createdAt: true, mentions: true, userMentions: true,
+            },
+          })
+        : [];
+
+    // Task lifecycle events — surfaced to EVERY member of the visible channels (not gated
+    // on mentions). The taskMessageBridge posts canonical system messages: created →
+    // "📋 … new task created: #N …", completed → "task #N → done". Match those two.
+    const taskRows = await db.controlMessage.findMany({
       where: {
         workroomId: wid,
         channelId: { in: visibleChannelIds },
         parentMessageId: null,
-        OR: mentionOr,
+        senderKind: 'system',
+        OR: [{ content: { startsWith: '📋' } }, { content: { endsWith: '→ done' } }],
       },
       orderBy: { createdAt: 'desc' },
       take: 50,
-      // Deep-link enrichment (Task #121): the client needs channel/workroom/thread to
-      // route workspace→channel→thread. content fuels the activity item title/body.
       select: {
-        id: true,
-        channelId: true,
-        workroomId: true,
-        parentMessageId: true,
-        content: true,
-        mentions: true,
-        userMentions: true,
+        id: true, channelId: true, workroomId: true, parentMessageId: true,
+        content: true, createdAt: true,
       },
     });
 
-    // Join ControlActivityState for the `handled` flag. subjectId is the actor's primary id
-    // (user.id for users; machine.id for machines — agent-id-only matches share the same
-    // machine subject for handled state, per the POST /handled write).
+    // Join ControlActivityState for the `handled` flag across both sources.
+    const allIds = [...mentionRows.map((r) => r.id), ...taskRows.map((r) => r.id)];
     const handledByMessage = new Map<string, boolean>();
-    if (rows.length > 0) {
+    if (allIds.length > 0) {
       const states = await db.controlActivityState.findMany({
-        where: {
-          subjectId: guard.viewerId,
-          messageId: { in: rows.map((r) => r.id) },
-        },
+        where: { subjectId: guard.viewerId, messageId: { in: allIds } },
         select: { messageId: true, handled: true },
       });
       for (const s of states) handledByMessage.set(s.messageId, s.handled);
     }
 
-    // Classify each item's deep-link type: a human-mention match → mention_human,
-    // otherwise an agent-mention match → mention_ai (mirrors the APNs `type` field so the
-    // client can route the same way whether the trigger arrived via push or via this feed).
-    let activity = rows.map((r) => {
+    type ActivityItem = {
+      id: string; message_id: string; handled: boolean; type: string;
+      workroom_id: string; channel_id: string; thread_id: string | null;
+      title: string; body: string; created_at: Date;
+    };
+
+    const mentionItems: ActivityItem[] = mentionRows.map((r) => {
       const isHumanMention =
         userMentionKeys.length > 0 && r.userMentions.some((m) => userMentionKeys.includes(m));
       const type: DeepLinkType = isHumanMention ? 'mention_human' : 'mention_ai';
       return {
-        id: `act_${r.id}`,
-        message_id: r.id,
-        handled: handledByMessage.get(r.id) ?? false,
-        // Shared deep-link contract (matches the APNs custom payload field set).
-        type,
-        workroom_id: r.workroomId,
-        channel_id: r.channelId,
+        id: `act_${r.id}`, message_id: r.id, handled: handledByMessage.get(r.id) ?? false,
+        type, workroom_id: r.workroomId, channel_id: r.channelId,
         thread_id: r.parentMessageId ?? null,
         title: type === 'mention_human' ? 'You were mentioned' : 'Agent mention',
-        body: previewText(r.content, 200),
+        body: previewText(r.content, 200), created_at: r.createdAt,
       };
     });
+
+    const taskItems: ActivityItem[] = taskRows.map((r) => {
+      const done = r.content.trimEnd().endsWith('→ done');
+      return {
+        id: `act_${r.id}`, message_id: r.id, handled: handledByMessage.get(r.id) ?? false,
+        type: done ? 'task_done' : 'task_started',
+        workroom_id: r.workroomId, channel_id: r.channelId, thread_id: null,
+        title: done ? 'Task completed' : 'New task',
+        body: previewText(r.content, 200), created_at: r.createdAt,
+      };
+    });
+
+    let activity = [...mentionItems, ...taskItems]
+      .sort((a, b) => b.created_at.getTime() - a.created_at.getTime())
+      .slice(0, 50);
 
     if (filter === 'unread') {
       activity = activity.filter((a) => !a.handled);
