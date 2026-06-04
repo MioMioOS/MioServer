@@ -1014,7 +1014,11 @@ export async function messageRoutes(app: FastifyInstance) {
     if (!guard.ok) return reply.code(guard.status).send({ error: guard.error });
 
     const { filter: rawFilter } = request.query as { filter?: string };
-    const filter = rawFilter === 'unread' ? 'unread' : 'all'; // all == mentions for MVP
+    // all      → mentions + task lifecycle events
+    // mentions → mentions ONLY (no task events)
+    // unread   → (mentions + task events) not yet handled
+    const filter: 'all' | 'unread' | 'mentions' =
+      rawFilter === 'unread' ? 'unread' : rawFilter === 'mentions' ? 'mentions' : 'all';
 
     // Restrict to channels the viewer can see (anti-enumeration consistent with the timeline).
     const visible = await visibleChannels({ viewerId: guard.viewerId, viewerKind: guard.actor.kind }, wid);
@@ -1036,8 +1040,13 @@ export async function messageRoutes(app: FastifyInstance) {
     const userMentionKeys =
       guard.actor.kind === 'user' ? [guard.actor.userId] : [];
 
+    // The "mentions" tab means literally "messages that @-mention ME" → human
+    // user_mentions only (agent @-mentions are about agents, not the caller). "all"/
+    // "unread" still include agent mentions of the caller.
     const mentionOr: Prisma.ControlMessageWhereInput[] = [];
-    if (uuidCallerKeys.length > 0) mentionOr.push({ mentions: { hasSome: uuidCallerKeys } });
+    if (filter !== 'mentions' && uuidCallerKeys.length > 0) {
+      mentionOr.push({ mentions: { hasSome: uuidCallerKeys } });
+    }
     if (userMentionKeys.length > 0) mentionOr.push({ userMentions: { hasSome: userMentionKeys } });
 
     // Mention messages — skip the query entirely when the caller has no mention keys
@@ -1063,15 +1072,17 @@ export async function messageRoutes(app: FastifyInstance) {
     // Task lifecycle events — surfaced to EVERY member of the visible channels (not gated
     // on mentions). The taskMessageBridge posts canonical system messages: created →
     // "📋 … new task created: #N …", completed → "task #N → done". Match those two.
-    const taskRows = await db.controlMessage.findMany({
+    const taskRows = filter === 'mentions' ? [] : await db.controlMessage.findMany({
       where: {
         workroomId: wid,
         channelId: { in: visibleChannelIds },
         // NB: no parentMessageId filter — task lifecycle system messages are often
         // posted INSIDE the task thread (a reply), so restricting to top-level would
-        // drop most "📋 created" / "→ done" events.
+        // drop most "→ in_progress" / "→ done" events.
+        // "开始" = a task actually STARTS work (claimed → in_progress); creation ("📋 …
+        // new task created") is intentionally EXCLUDED (too noisy, not a "start").
         senderKind: 'system',
-        OR: [{ content: { startsWith: '📋' } }, { content: { endsWith: '→ done' } }],
+        OR: [{ content: { endsWith: '→ in_progress' } }, { content: { endsWith: '→ done' } }],
       },
       orderBy: { createdAt: 'desc' },
       take: 50,
