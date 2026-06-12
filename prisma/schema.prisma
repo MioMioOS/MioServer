@@ -455,6 +455,11 @@ model ControlWorkroom {
   createdBy     String     @map("created_by") @db.Uuid
   createdAt     DateTime   @default(now()) @map("created_at")
   archivedAt    DateTime?  @map("archived_at")
+  /// Monotone event-seq counter for control_event_logs. Allocation is a single
+  /// `UPDATE ... SET event_seq = event_seq + 1 RETURNING` — replaces the old
+  /// FOR UPDATE + SELECT MAX(seq) scan whose lock window grew with table size
+  /// and convoyed every event publisher in the workroom (pool-exhaustion risk).
+  eventSeq      BigInt     @default(0) @map("event_seq")
 
   goals             ControlGoal[]
   messages          ControlMessage[]
@@ -488,6 +493,9 @@ model ControlChannel {
   archivedAt     DateTime?              @map("archived_at")
   createdAt      DateTime               @default(now()) @map("created_at")
   lastActivityAt DateTime?              @map("last_activity_at")
+  /// Monotone message-seq counter (same pool-stability rationale as
+  /// ControlWorkroom.eventSeq — replaces FOR UPDATE + MAX(seq) in nextChannelSeq).
+  messageSeq     BigInt                 @default(0) @map("message_seq")
   workroom       ControlWorkroom        @relation(fields: [workroomId], references: [id])
   members        ControlChannelMember[]
   messages       ControlMessage[]
@@ -582,13 +590,17 @@ model ControlMessage {
   // AGENT mentions only. The live Postgres column is `uuid[]` (see add_control_plane
   // migration) — it can ONLY hold ControlAgent.id (uuid). Human users have cuid ids
   // which would crash this column; they go in userMentions below.
-  mentions             String[]
+  // @default([]) on the array columns is REQUIRED to match the hand-written
+  // migrations (DEFAULT '{}'): without it, a db-push/migrate-dev database gets
+  // NOT NULL columns with NO default, and inserts that omit the field 500 with
+  // P2011 (verified live 2026-06-12). Keep schema and migration SQL in lockstep.
+  mentions             String[]        @default([])
   // S2 (Task #121): HUMAN (real-person) mentions. User.id is a cuid, NOT a uuid, so it
   // cannot live in the uuid[] `mentions` column. This is a plain text[] column. The
   // activity feed + mention-push match a human viewer's user.id against this array.
-  userMentions         String[]        @map("user_mentions")
+  userMentions         String[]        @default([]) @map("user_mentions")
   hashRefs             Json            @default("{}") @map("hash_refs")
-  attachmentIds        String[]        @map("attachment_ids")
+  attachmentIds        String[]        @default([]) @map("attachment_ids")
   embeddedCardType     String?         @map("embedded_card_type")
   embeddedCardId       String?         @map("embedded_card_id") @db.Uuid
   threadReplyCount     Int             @default(0) @map("thread_reply_count")

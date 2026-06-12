@@ -239,16 +239,44 @@ export async function machineRoutes(app: FastifyInstance) {
       where: { orgId: org_id, machineId: machine.id },
       select: { id: true },
     });
-    if (!existingAgent) {
-      await db.controlAgent.create({
-        data: {
-          orgId: org_id,
-          machineId: machine.id,
-          name: displayName,
-          displayName,
-          role: 'other',
-          status: 'online',
-        },
+    const agentId =
+      existingAgent?.id ??
+      (
+        await db.controlAgent.create({
+          data: {
+            orgId: org_id,
+            machineId: machine.id,
+            name: displayName,
+            displayName,
+            role: 'other',
+            status: 'online',
+          },
+          select: { id: true },
+        })
+      ).id;
+
+    // Join the agent into each org workroom's default (oldest public) channel.
+    // Without this, a freshly enrolled workspace shows the agent in MEMBERS but
+    // the agent is in no channel — the daemon's per-agent channel filter
+    // (inboxCoordinator) then delivers nothing, so the agent never replies and
+    // the workspace reads as dead. Idempotent via the (channelId, memberId)
+    // unique key; users can still remove the agent from a channel later (this
+    // only re-adds on a RE-bind, which is a rare re-enrollment path).
+    const orgWorkrooms = await db.controlWorkroom.findMany({
+      where: { orgId: org_id, archivedAt: null },
+      select: { id: true },
+    });
+    for (const wr of orgWorkrooms) {
+      const defaultChannel = await db.controlChannel.findFirst({
+        where: { workroomId: wr.id, visibility: 'public', archivedAt: null },
+        orderBy: { createdAt: 'asc' },
+        select: { id: true },
+      });
+      if (!defaultChannel) continue;
+      await db.controlChannelMember.upsert({
+        where: { channelId_memberId: { channelId: defaultChannel.id, memberId: agentId } },
+        create: { channelId: defaultChannel.id, memberId: agentId },
+        update: {},
       });
     }
 

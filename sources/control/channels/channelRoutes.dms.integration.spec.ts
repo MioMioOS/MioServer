@@ -172,6 +172,9 @@ describe('GET /api/v1/workrooms/:wid/dms (real DB)', () => {
     expect(body.dms[0]).toEqual({
       id: DM_WITH_MACHINE,
       peer_member_id: PEER_ID,
+      // PEER_ID has no ControlAgent row in this fixture → identity fields resolve null.
+      peer_display_name: null,
+      peer_avatar: null,
       unread_count: 0,
       last_activity_at: '2026-05-23T00:00:00.000Z',
     });
@@ -186,6 +189,8 @@ describe('GET /api/v1/workrooms/:wid/dms (real DB)', () => {
     expect(body.dms[0]).toEqual({
       id: DM_WITH_USER,
       peer_member_id: PEER_ID,
+      peer_display_name: null,
+      peer_avatar: null,
       unread_count: 0,
       last_activity_at: '2026-05-21T00:00:00.000Z',
     });

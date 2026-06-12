@@ -32,6 +32,9 @@ vi.mock('@/storage/db', () => ({
     controlWorkroom: { findUnique: vi.fn() },
     controlChannel: { findMany: vi.fn() },
     userWorkroomMembership: { findUnique: vi.fn() },
+    // peer identity resolution (peer_display_name / peer_avatar)
+    controlAgent: { findMany: vi.fn() },
+    user: { findMany: vi.fn() },
   },
 }));
 
@@ -60,6 +63,8 @@ const mockedDb = db as unknown as {
   controlWorkroom: { findUnique: ReturnType<typeof vi.fn> };
   controlChannel: { findMany: ReturnType<typeof vi.fn> };
   userWorkroomMembership: { findUnique: ReturnType<typeof vi.fn> };
+  controlAgent: { findMany: ReturnType<typeof vi.fn> };
+  user: { findMany: ReturnType<typeof vi.fn> };
 };
 
 function machineHeader(): Record<string, string> {
@@ -77,6 +82,8 @@ describe('GET /api/v1/workrooms/:wid/dms', () => {
     mockedAccess.mockResolvedValue({ ok: true, workroomOrgId: 'org-1' });
     mockedResolveUserSession.mockResolvedValue(null); // disable user path by default
     mockedDb.controlChannel.findMany.mockResolvedValue([]);
+    mockedDb.controlAgent.findMany.mockResolvedValue([]);
+    mockedDb.user.findMany.mockResolvedValue([]);
   });
 
   it('returns dm channels with peer_member_id = the OTHER member (machine mode)', async () => {
@@ -102,6 +109,9 @@ describe('GET /api/v1/workrooms/:wid/dms', () => {
     expect(body.dms[0]).toEqual({
       id: DM1,
       peer_member_id: 'agent-peer',
+      // identity lookups are mocked empty → fields resolve null
+      peer_display_name: null,
+      peer_avatar: null,
       unread_count: 0,
       last_activity_at: '2026-05-23T00:00:00.000Z',
     });
@@ -167,6 +177,8 @@ describe('GET /api/v1/workrooms/:wid/dms', () => {
 
   it('returns an empty list when there are no dm channels', async () => {
     mockedDb.controlChannel.findMany.mockResolvedValue([]);
+    mockedDb.controlAgent.findMany.mockResolvedValue([]);
+    mockedDb.user.findMany.mockResolvedValue([]);
 
     const app = await buildApp();
     const res = await app.inject({

@@ -1,4 +1,5 @@
 import { db } from '@/storage/db';
+import { startPoolWatchdog } from '@/storage/poolWatchdog';
 import { startApi } from '@/api';
 import { startSocket } from '@/socket/socketServer';
 import { attachControlPlaneWs } from '@/control/ws/wsGateway';
@@ -16,6 +17,11 @@ async function main() {
 
     await db.$connect();
     console.log('Database connected');
+
+    // Pool-exhaustion watchdog: probes the main pool, captures pg_stat_activity
+    // through a reserved diagnostic connection when wedged, and self-heals via
+    // clean exit (pm2 restarts). See poolWatchdog.ts for the incident history.
+    startPoolWatchdog();
 
     // Slice 7 §4.4: first-boot seed of the dogfood user + migration attribution
     // of pre-Slice-7 workrooms/devices. Runs AFTER DB connect and BEFORE

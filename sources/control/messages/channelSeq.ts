@@ -2,23 +2,26 @@
  * Per-channel monotonic seq allocator for ControlMessage.
  *
  * GUARANTEES:
- * 1. SELECT … FOR UPDATE on the ControlChannel row serializes concurrent seq allocations
- *    for the same channel, preventing races.
- * 2. COALESCE(MAX(seq), 0) + 1 computed inside the same transaction as the lock.
- * 3. UNIQUE(channelId, seq) on ControlMessage is the DB-level backstop; any collision
- *    (e.g. a resumed transaction that somehow races past the lock) will throw P2002, which
- *    the caller should handle by retrying with a new seq.
+ * 1. Allocation is `UPDATE control_channels SET message_seq = message_seq + 1` —
+ *    a single-row indexed update. The channel row lock is taken by the UPDATE and
+ *    held until the caller's transaction commits, which serializes concurrent
+ *    allocations AND orders seq with commit visibility (a catch-up reader's
+ *    `seq > cursor` can never skip a late-committing message).
+ * 2. The previous design ran SELECT … FOR UPDATE + COALESCE(MAX(seq),0)+1 over
+ *    control_messages INSIDE the lock — the critical section grew with message
+ *    volume and convoyed every sender in the channel, each waiter pinning a pool
+ *    connection (2026-06-12 pool-stability work).
+ * 3. UNIQUE(channelId, seq) on ControlMessage is the DB-level backstop; any
+ *    collision throws P2002, which the caller should handle by retrying.
  *
- * This is intentionally a PER-CHANNEL counter, NOT the workroom-level event-log seq.
- * See spec §3.3: "per-channel seq 是净新基建".
- *
- * ⚠️ Raw queries MUST cast channel_id to ::uuid (Prisma @db.Uuid columns require explicit cast).
+ * This is intentionally a PER-CHANNEL counter, NOT the workroom-level event-log
+ * seq. See spec §3.3: "per-channel seq 是净新基建".
  *
  * Usage:
  *   const seq = await nextChannelSeq(tx, channelId);
  *
- * The caller MUST already be inside a Prisma $transaction so the lock + SELECT + INSERT
- * are atomic.
+ * The caller MUST already be inside a Prisma $transaction so the allocation and
+ * the message INSERT are atomic (and so the lock-until-commit ordering holds).
  */
 
 import type { PrismaClient } from '@prisma/client';
@@ -27,27 +30,27 @@ type TxClient = Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transa
 
 /**
  * Allocate and return the next monotonic seq for the given channel.
- *
- * Acquires a FOR UPDATE lock on the ControlChannel row (serializes concurrent callers),
- * then computes COALESCE(MAX(seq), 0) + 1 from existing messages.
- *
  * MUST be called inside a Prisma $transaction.
+ *
+ * Self-healing: the counter is clamped to MAX(seq) of existing rows on every
+ * allocation (index-only O(log n) lookup), so out-of-band inserts that bypassed
+ * the counter (test fixtures, backfill scripts) can never make the allocator
+ * hand out a colliding seq.
  */
 export async function nextChannelSeq(tx: TxClient, channelId: string): Promise<bigint> {
-  // Lock the channel row to serialize concurrent seq allocation.
-  // ::uuid cast is required — Prisma @db.Uuid columns use uuid type in Postgres.
-  await tx.$queryRaw`
-    SELECT id FROM control_channels
-    WHERE id = ${channelId}::uuid
-    FOR UPDATE
+  const rows = await tx.$queryRaw<[{ message_seq: bigint }] | []>`
+    UPDATE control_channels c
+    SET message_seq = GREATEST(
+          c.message_seq,
+          COALESCE((SELECT MAX(m.seq) FROM control_messages m WHERE m.channel_id = c.id), 0)
+        ) + 1
+    WHERE c.id = ${channelId}::uuid
+    RETURNING message_seq
   `;
-
-  // Compute next seq from existing messages in this channel.
-  const [row] = await tx.$queryRaw<[{ next_seq: bigint }]>`
-    SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
-    FROM control_messages
-    WHERE channel_id = ${channelId}::uuid
-  `;
-
-  return row.next_seq;
+  if (!rows.length) {
+    // Phantom channel — caller should have verified existence; fail loud rather
+    // than silently minting seq for a row that doesn't exist.
+    throw new Error(`nextChannelSeq: channel ${channelId} not found`);
+  }
+  return rows[0].message_seq;
 }

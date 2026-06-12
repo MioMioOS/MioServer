@@ -224,10 +224,16 @@ describe('S5 activity feed — GET (Slice 7 B2-d)', () => {
     expect(activityIds(res.body)).not.toContain(MSG_REPLY_MENTION);
   });
 
-  it('filter=mentions == filter=all (MVP)', async () => {
+  it('machine caller: filter=all carries agent mentions; filter=mentions is human-@me only (empty here)', async () => {
+    // 2026-06-04 semantics change: the "mentions" tab means "messages that @-mention ME
+    // as a human" (user_mentions only). A machine caller has no cuid user.id, so its
+    // mentions tab is empty; its agent mentions still surface under all/unread.
     const all = await injectGet(`/api/v1/workrooms/${WORKROOM_ID}/activity?filter=all`, machineHeader());
     const mentions = await injectGet(`/api/v1/workrooms/${WORKROOM_ID}/activity?filter=mentions`, machineHeader());
-    expect(activityIds(all.body).sort()).toEqual(activityIds(mentions.body).sort());
+    expect(activityIds(all.body)).toContain(MSG_MENTION_MACHINE);
+    expect(activityIds(all.body)).toContain(MSG_MENTION_AGENT);
+    expect(activityIds(mentions.body)).not.toContain(MSG_MENTION_MACHINE);
+    expect(activityIds(mentions.body)).not.toContain(MSG_MENTION_AGENT);
   });
 
   it('user-owner activity feed is vacuous this slice (user.id is cuid; mentions column is UUID[])', async () => {

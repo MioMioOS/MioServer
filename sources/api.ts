@@ -23,6 +23,7 @@ import { workroomRoutes } from '@/control/workrooms/workroomRoutes';
 import { channelRoutes } from '@/control/channels/channelRoutes';
 import { messageRoutes } from '@/control/messages/messageRoutes';
 import { memberRoutes } from '@/control/members/memberRoutes';
+import { humanMemberRoutes } from '@/control/members/humanMemberRoutes';
 import { agentRoutes } from '@/control/agents/agentRoutes';
 import { searchRoutes } from '@/control/search/searchRoutes';
 import { taskRoutes } from '@/control/tasks/taskRoutes';
@@ -104,6 +105,7 @@ export async function startApi() {
     await app.register(friendRoutes);
     await app.register(messageRoutes);
     await app.register(memberRoutes);
+    await app.register(humanMemberRoutes);
     await app.register(agentRoutes);
     await app.register(searchRoutes);
     await app.register(taskRoutes);

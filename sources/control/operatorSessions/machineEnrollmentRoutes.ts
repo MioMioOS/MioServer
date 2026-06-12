@@ -207,6 +207,28 @@ export const machineEnrollmentRoutes: FastifyPluginAsync = async (app) => {
 
           const workroom = await tx.controlWorkroom.findUniqueOrThrow({ where: { id: workroomId } });
 
+          // A workspace with NO channels is unusable in the app (HOME is empty and
+          // there is nowhere to send a message), and provisionPersonalWorkspace
+          // deliberately stays schema-minimal. Ensure at least one public channel
+          // exists — covers fresh provisions AND self-heals older empty workrooms
+          // on re-enrollment.
+          const hasChannel = await tx.controlChannel.findFirst({
+            where: { workroomId, archivedAt: null },
+            select: { id: true },
+          });
+          if (!hasChannel) {
+            await tx.controlChannel.create({
+              data: {
+                workroomId,
+                name: 'general',
+                type: 'standard',
+                visibility: 'public',
+                createdBy: 'system',
+                lastActivityAt: now,
+              },
+            });
+          }
+
           // ── ControlMachine REUSE-or-create (SAFE same-mac idempotency) ──────────────────────
           // An enrollment payload carries NO stable hardware id, so we must NOT guess "same
           // physical Mac" from weak signals. In particular we do NOT reuse on displayName —
@@ -265,8 +287,12 @@ export const machineEnrollmentRoutes: FastifyPluginAsync = async (app) => {
           workroom_id: result.workroomId,
           workroom_already_bound: result.workroomAlreadyBound,
         });
-      } catch {
-        // Any failure inside the tx (CAS loss, FK violation, etc.) → uniform 403.
+      } catch (err) {
+        // Any failure inside the tx (CAS loss, FK violation, etc.) → uniform 403 to the
+        // CALLER (anti-enumeration), but log the real cause — a swallowed exception here
+        // turned a schema bug into an undiagnosable "Not redeemable" during the
+        // 2026-06-12 multi-user fix.
+        request.log.error({ err }, 'enrollment approve failed');
         return fail403();
       }
     },

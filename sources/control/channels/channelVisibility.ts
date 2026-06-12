@@ -89,18 +89,21 @@ export async function visibleChannels(
     orderBy: { lastActivityAt: 'desc' },
   });
 
-  // A non-owner human (a "guest" invited to specific channels) sees ONLY the
-  // channels they're explicitly a member of — NOT every public channel in the
-  // workspace. Owners (and machine/agent viewers) get the full visibility rules
-  // below. This scopes an invited collaborator to exactly the channel(s) they
-  // were added to.
+  // Channel scoping by membership role (Slack semantics):
+  //   - 'owner' / 'member' → all public channels + explicitly-joined private ones.
+  //     ('member' is what humanMemberRoutes invites mint — a full workspace member.
+  //     The original rule scoped EVERY non-owner to explicit channels only, which
+  //     made an invited friend see an empty workspace even with public channels.)
+  //   - 'guest'            → ONLY channels they're an explicit member of, public
+  //     included. Reserved for per-channel collaborators; no route mints it today.
+  // Machine/agent viewers get the full rules below.
   let guestScoped = false;
   if (viewerKind !== 'machine') {
     const mem = await db.userWorkroomMembership.findUnique({
       where: { userId_workroomId: { userId: viewerId, workroomId } },
       select: { role: true },
     });
-    guestScoped = mem != null && mem.role !== 'owner';
+    guestScoped = mem?.role === 'guest';
   }
 
   return channels.filter((ch) => {

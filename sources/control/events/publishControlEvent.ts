@@ -5,18 +5,26 @@
  * Direct `db.controlEventLog.create()` calls are forbidden (bypass the seq gate).
  *
  * Guarantees:
- * 1. Seq allocation is atomic: FOR UPDATE on workroom row serializes concurrent
- *    publishes; COALESCE(MAX(seq),0)+1 computed inside the same transaction.
- * 2. UNIQUE(workroom_id, seq) is a DB-level backstop against any race.
- * 3. event_id @unique enables idempotent retries (same event_id → no-op, returns existing).
- * 4. Write-before-broadcast: the event is persisted before this function returns.
+ * 1. Seq allocation is atomic AND ordered with commit visibility: the allocation
+ *    UPDATE takes the workroom row lock, which is then held until the enclosing
+ *    transaction commits — so commit order == seq order and a catch-up reader's
+ *    `seq > cursor` can never skip an event that commits late. (This ordering is
+ *    load-bearing; a free-running sequence would reintroduce the missed-event race.)
+ * 2. Allocation is `UPDATE control_workrooms SET event_seq = event_seq + 1` —
+ *    a single-row indexed update. The previous design ran SELECT MAX(seq) over
+ *    control_event_logs INSIDE the lock, so the critical section grew with event
+ *    volume and convoyed every publisher in the workroom, each waiter pinning a
+ *    pool connection (2026-06-12 pool-stability work).
+ * 3. UNIQUE(workroom_id, seq) is a DB-level backstop against any race.
+ * 4. event_id @unique enables idempotent retries (same event_id → no-op, returns existing).
+ * 5. Write-before-broadcast: the event is persisted before this function returns.
  *    WS fanout is the caller's responsibility (post-commit).
  *
  * Usage inside a Prisma transaction (pass the tx client):
- *   const event = await publishControlEvent(tx, workroomId, eventId, topic, payload);
+ *   const event = await publishControlEventInTx(tx, { workroomId, eventId, topic, payload });
  *
  * Usage outside a transaction (creates its own):
- *   const event = await publishControlEvent(db, workroomId, eventId, topic, payload);
+ *   const event = await publishControlEvent({ workroomId, eventId, topic, payload });
  */
 
 import { Prisma, PrismaClient } from '@prisma/client';
@@ -42,15 +50,52 @@ export interface ControlEventResult {
   idempotent: boolean;   // true if event_id already existed
 }
 
+function toResult(row: {
+  id: string; eventId: string; workroomId: string; seq: bigint;
+  topic: string; payloadJson: Prisma.JsonValue; createdAt: Date;
+}, idempotent: boolean): ControlEventResult {
+  return {
+    id: row.id,
+    eventId: row.eventId,
+    workroomId: row.workroomId,
+    seq: row.seq.toString(),
+    topic: row.topic,
+    payloadJson: row.payloadJson,
+    createdAt: row.createdAt,
+    idempotent,
+  };
+}
+
+/**
+ * Allocate the next event seq for a workroom: one self-healing UPDATE that takes
+ * the workroom row lock (held until the enclosing tx commits — the ordering
+ * guarantee) and clamps the counter to MAX(seq) of existing rows (index-only
+ * O(log n)) so out-of-band inserts can never cause a collision.
+ */
+async function allocateEventSeq(tx: TxClient, workroomId: string): Promise<bigint> {
+  const rows = await tx.$queryRaw<[{ event_seq: bigint }] | []>`
+    UPDATE control_workrooms w
+    SET event_seq = GREATEST(
+          w.event_seq,
+          COALESCE((SELECT MAX(e.seq) FROM control_event_logs e WHERE e.workroom_id = w.id), 0)
+        ) + 1
+    WHERE w.id = ${workroomId}::uuid
+    RETURNING event_seq
+  `;
+  if (!rows.length) {
+    throw new Error(`publishControlEvent: workroom ${workroomId} not found`);
+  }
+  return rows[0].event_seq;
+}
+
 /**
  * Publish a single event inside an existing Prisma transaction.
  * Use this when you need to emit an event as part of a larger atomic operation
- * (e.g., action fire also emits action.fired event).
+ * (e.g., a message write that also emits message.created).
  *
- * The caller MUST be inside a $transaction that has already locked the workroom row:
- *   await tx.$queryRaw`SELECT id FROM control_workrooms WHERE id = ${wid}::uuid FOR UPDATE`
- *
- * If you cannot guarantee the lock is held, use publishControlEventStandalone instead.
+ * The allocation UPDATE itself takes the workroom row lock (held until the
+ * caller's transaction commits) — callers no longer need a separate
+ * `SELECT ... FOR UPDATE` first, though issuing one remains harmless.
  */
 export async function publishControlEventInTx(
   tx: TxClient,
@@ -58,28 +103,16 @@ export async function publishControlEventInTx(
 ): Promise<ControlEventResult> {
   const { workroomId, eventId, topic, payload } = input;
 
-  // Check idempotency first (before computing seq)
+  // Check idempotency first (before allocating a seq — a replayed event must
+  // not burn a counter slot or take the workroom lock for nothing).
   const existing = await tx.controlEventLog.findFirst({ where: { eventId } });
-  if (existing) {
-    return {
-      id: existing.id,
-      eventId: existing.eventId,
-      workroomId: existing.workroomId,
-      seq: existing.seq.toString(),
-      topic: existing.topic,
-      payloadJson: existing.payloadJson,
-      createdAt: existing.createdAt,
-      idempotent: true,
-    };
-  }
+  if (existing) return toResult(existing, true);
 
-  // Compute next seq (caller must hold FOR UPDATE on workroom row)
-  const seqResult = await tx.$queryRaw<[{ next_seq: bigint }]>`
-    SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
-    FROM control_event_logs
-    WHERE workroom_id = ${workroomId}::uuid
-  `;
-  const nextSeq = seqResult[0].next_seq;
+  // Allocate: single-row UPDATE; row lock is held from here to caller commit,
+  // which is exactly the ordering guarantee catch-up readers rely on.
+  // Self-healing: clamped to MAX(seq) so out-of-band event inserts (fixtures,
+  // backfills) can never make the counter hand out a colliding seq.
+  const nextSeq = await allocateEventSeq(tx, workroomId);
 
   const created = await tx.controlEventLog.create({
     data: {
@@ -91,21 +124,15 @@ export async function publishControlEventInTx(
     },
   });
 
-  return {
-    id: created.id,
-    eventId: created.eventId,
-    workroomId: created.workroomId,
-    seq: created.seq.toString(),
-    topic: created.topic,
-    payloadJson: created.payloadJson,
-    createdAt: created.createdAt,
-    idempotent: false,
-  };
+  return toResult(created, false);
 }
 
 /**
- * Publish a single event with its own transaction + workroom row lock.
+ * Publish a single event with its own (minimal) transaction.
  * Use this for standalone event publishing (HTTP endpoint, background jobs).
+ *
+ * The idempotency pre-check runs OUTSIDE the transaction so the workroom row
+ * lock window is just allocation + insert (two fast indexed statements).
  *
  * Handles idempotency via event_id @unique:
  * If a P2002 (unique violation) occurs on either seq or event_id, the existing
@@ -114,33 +141,31 @@ export async function publishControlEventInTx(
 export async function publishControlEvent(input: ControlEventInput): Promise<ControlEventResult> {
   const { workroomId, eventId, topic, payload } = input;
 
+  // Idempotency fast-path before touching the lock at all.
+  const existing = await db.controlEventLog.findFirst({ where: { eventId } });
+  if (existing) return toResult(existing, true);
+
   try {
     const result = await db.$transaction(async (tx) => {
-      // Lock workroom row to serialize seq allocation for this workroom
-      await tx.$queryRaw`
-        SELECT id FROM control_workrooms
-        WHERE id = ${workroomId}::uuid
-        FOR UPDATE
-      `;
-      return publishControlEventInTx(tx, { workroomId, eventId, topic, payload });
+      const nextSeq = await allocateEventSeq(tx, workroomId);
+      const created = await tx.controlEventLog.create({
+        data: {
+          workroomId,
+          seq: nextSeq,
+          eventId,
+          topic,
+          payloadJson: payload as Prisma.InputJsonObject,
+        },
+      });
+      return toResult(created, false);
     });
     return result;
   } catch (err) {
-    // P2002: event_id or (workroom_id, seq) unique violation — return existing
+    // P2002: event_id unique violation — a concurrent publish of the SAME
+    // event_id won the race between our pre-check and the insert. Return it.
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-      const existing = await db.controlEventLog.findFirst({ where: { eventId } });
-      if (existing) {
-        return {
-          id: existing.id,
-          eventId: existing.eventId,
-          workroomId: existing.workroomId,
-          seq: existing.seq.toString(),
-          topic: existing.topic,
-          payloadJson: existing.payloadJson,
-          createdAt: existing.createdAt,
-          idempotent: true,
-        };
-      }
+      const raced = await db.controlEventLog.findFirst({ where: { eventId } });
+      if (raced) return toResult(raced, true);
     }
     throw err;
   }

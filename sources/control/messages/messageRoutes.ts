@@ -128,7 +128,8 @@ async function resolveMessageReadActor(
 
 /**
  * Write subject for message writes (send, reply, save/unsave, mark-handled).
- *   - user_sess_ → must be a workroom OWNER (Slice 7 §6.2). Non-owner → 403; non-member → 403.
+ *   - user_sess_ → must be a workroom MEMBER (any role; owner-only was lifted when
+ *     invited human members landed — see humanMemberRoutes). Non-member → 403.
  *   - machine_token → must have org access to the workroom.
  *   - missing / invalid → 401.
  *
@@ -179,9 +180,11 @@ async function authorizeMessageWrite(
     if (!mem) {
       return { ok: false, status: 403, body: { error: { code: 'FORBIDDEN', message: 'Forbidden' } } };
     }
-    if (mem.role !== 'owner') {
-      return { ok: false, status: 403, body: { error: { code: 'FORBIDDEN', message: 'Forbidden' } } };
-    }
+    // ANY membership role may write messages (send / save / mark-reviewed). The
+    // original owner-only gate predates invited human members (humanMemberRoutes):
+    // with it, an invited 'member' could read a channel but never speak in it.
+    // Admin-grade writes (channels, tasks, enrollment) remain owner-only via
+    // requireUserWrite — this gate is messaging-plane only.
     return {
       ok: true,
       subject: { kind: 'user', userId: session.userId, subjectId: session.userId },

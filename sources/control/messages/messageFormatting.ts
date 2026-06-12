@@ -17,7 +17,10 @@ import { serverToSlockStatus } from '@/control/tasks/slockTaskStatus';
 /**
  * Resolve sender display names in a batch (no N+1).
  * For `agent` senderKind: look up ControlAgent.displayName / name.
- * For `user` or `system` senderKind: no agent row; return null (client renders kind as label).
+ * For `user` senderKind: look up User.displayName (fallback: email local part).
+ *   Before invited human members existed every user message rendered nameless;
+ *   with two humans in a channel that is unusable, so user senders resolve too.
+ * For `system` senderKind: no row; return null (client renders kind as label).
  *
  * Returns a map from senderId → display name string.
  * Missing or unresolvable senders → absent from map (caller converts to null).
@@ -26,6 +29,23 @@ export async function resolveSenderDisplayNames(
   senders: Array<{ senderId: string; senderKind: string }>,
 ): Promise<Map<string, string>> {
   const result = new Map<string, string>();
+
+  // Human senders: senderId is User.id (cuid). Resolve displayName, falling back
+  // to the email local part so a name always renders.
+  const userIds = [
+    ...new Set(senders.filter((s) => s.senderKind === 'user').map((s) => s.senderId)),
+  ];
+  if (userIds.length > 0) {
+    const users = await db.user.findMany({
+      where: { id: { in: userIds } },
+      select: { id: true, displayName: true, email: true },
+    });
+    for (const u of users) {
+      const label = u.displayName?.trim() || u.email.split('@')[0];
+      if (label) result.set(u.id, label);
+    }
+  }
+
   // ControlAgent.id is @db.Uuid; senderId is opaque text (may be a non-uuid like
   // 'kris' or 'pairing:<uuid>'). Filter to uuid-shaped ids before querying, else
   // Prisma throws P2023 (Inconsistent column data) on the uuid column. Non-uuid
