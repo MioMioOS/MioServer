@@ -23,6 +23,11 @@ import { resolveUserSession } from '@/auth/userSession/resolveUserSession';
 import { USER_SESSION_TOKEN_PREFIX } from '@/auth/userSession/tokenMint';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { verifyMachineToken } from '@/machines/machineRoutes';
+// Single source of truth for the image MIME allowlist (defined in blobRoutes.ts).
+import { ALLOWED_MIME } from '@/blob/blobRoutes';
+
+const MAX_DECODED_BYTES = 8 * 1024 * 1024;   // same caps as the agent-api upload route
+const MAX_WIRE_BYTES = 12 * 1024 * 1024;
 
 /**
  * Resolve a workroom-scoped read actor (user_sess_ MEMBER or machine_token with
@@ -126,5 +131,105 @@ export async function userAttachments(app: FastifyInstance) {
       .header('Content-Disposition', `inline; filename="${safeFilename}"`)
       .header('Content-Length', String(buf.length))
       .send(buf);
+  });
+
+  /**
+   * POST /api/v1/workrooms/:wid/channels/:cid/attachments — human upload.
+   *
+   * Body (JSON, per-route bodyLimit 12 MiB): { filename, mime_type, data_base64 }
+   * Mirrors the agent-api upload caps (ALLOWED_MIME, ≤8 MiB decoded). user_sess_
+   * only — machines have /internal/agent-api/attachments. Private channels
+   * require the caller to be a channel member (same guest scoping as reads).
+   *
+   * Responses:
+   *   201 { attachment_id, filename, mime_type, size_bytes }
+   *   400 INVALID_BODY · 401 · 403 FORBIDDEN · 404 (workroom/channel, uniform)
+   *   413 PAYLOAD_TOO_LARGE · 415 UNSUPPORTED_MIME
+   */
+  app.post('/api/v1/workrooms/:wid/channels/:cid/attachments', {
+    bodyLimit: MAX_WIRE_BYTES,
+  }, async (request, reply) => {
+    const { wid, cid } = request.params as { wid: string; cid: string };
+
+    // ── Step 1: user_sess_ membership auth (no machine path for this route) ──
+    const authHeader = request.headers.authorization;
+    if (!authHeader?.startsWith(`Bearer ${USER_SESSION_TOKEN_PREFIX}`)) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
+    }
+    const session = await resolveUserSession(authHeader);
+    if (!session) {
+      return reply.code(401).send({ error: { code: 'INVALID_SESSION', message: 'Invalid or expired session' } });
+    }
+    const mem = await db.userWorkroomMembership.findUnique({
+      where: { userId_workroomId: { userId: session.userId, workroomId: wid } },
+    });
+    if (!mem) {
+      return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
+    }
+
+    // ── Step 2: channel guard (workroom scope + private-channel membership) ──
+    let channel: { id: string; workroomId: string; visibility: string } | null = null;
+    try {
+      channel = await db.controlChannel.findUnique({
+        where: { id: cid },
+        select: { id: true, workroomId: true, visibility: true },
+      });
+    } catch {
+      return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+    }
+    if (!channel || channel.workroomId !== wid) {
+      return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+    }
+    if (channel.visibility === 'private') {
+      const cm = await db.controlChannelMember.findUnique({
+        where: { channelId_memberId: { channelId: cid, memberId: session.userId } },
+      });
+      if (!cm) {
+        return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
+      }
+    }
+
+    // ── Step 3: body validation (same shape/caps as agent-api upload) ────────
+    const body = request.body as { filename?: unknown; mime_type?: unknown; data_base64?: unknown } | null;
+    if (!body?.filename || typeof body.filename !== 'string' || body.filename.trim() === '') {
+      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'filename is required' } });
+    }
+    if (!body.mime_type || typeof body.mime_type !== 'string') {
+      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'mime_type is required' } });
+    }
+    if (!body.data_base64 || typeof body.data_base64 !== 'string') {
+      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'data_base64 is required' } });
+    }
+    if (!ALLOWED_MIME.has(body.mime_type)) {
+      return reply.code(415).send({ error: { code: 'UNSUPPORTED_MIME', message: `Unsupported mime type: ${body.mime_type}` } });
+    }
+    const buf = Buffer.from(body.data_base64, 'base64');
+    if (buf.length === 0) {
+      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'data_base64 decoded to zero bytes' } });
+    }
+    if (buf.length > MAX_DECODED_BYTES) {
+      return reply.code(413).send({ error: { code: 'PAYLOAD_TOO_LARGE', message: 'Decoded data exceeds 8 MiB limit' } });
+    }
+
+    // ── Step 4: create row ────────────────────────────────────────────────────
+    const attachment = await db.controlAttachment.create({
+      data: {
+        workroomId: wid,
+        channelId: cid,
+        uploaderKind: 'user',
+        uploaderId: session.userId,
+        filename: body.filename,
+        mimeType: body.mime_type,
+        sizeBytes: BigInt(buf.length),
+        data: buf,
+      },
+    });
+
+    return reply.code(201).send({
+      attachment_id: attachment.id,
+      filename: body.filename,
+      mime_type: body.mime_type,
+      size_bytes: buf.length,
+    });
   });
 }

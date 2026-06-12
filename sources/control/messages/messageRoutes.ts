@@ -499,6 +499,49 @@ export async function messageRoutes(app: FastifyInstance) {
    * Post-commit: publishAndBroadcast('message.created') with redacted+truncated preview.
    * Broadcast failure is non-fatal (client catches up via GET).
    */
+  /**
+   * Validate client-supplied attachment_ids for a send: ≤10 ids, every id must
+   * exist, live in this workroom, and have been uploaded by this sender —
+   * attaching someone else's upload is rejected (anti-confused-deputy).
+   * Returns the normalized id list, or an error descriptor.
+   */
+  async function validateAttachmentIds(
+    raw: unknown,
+    workroomId: string,
+    senderKind: string,
+    senderId: string,
+  ): Promise<{ ok: true; ids: string[] | undefined } | { ok: false; status: number; code: string; message: string }> {
+    if (raw === undefined || raw === null) return { ok: true, ids: undefined };
+    if (!Array.isArray(raw) || raw.some((x) => typeof x !== 'string')) {
+      return { ok: false, status: 400, code: 'INVALID_BODY', message: 'attachment_ids must be an array of strings' };
+    }
+    const ids = [...new Set(raw as string[])];
+    if (ids.length === 0) return { ok: true, ids: undefined };
+    if (ids.length > 10) {
+      return { ok: false, status: 400, code: 'INVALID_BODY', message: 'at most 10 attachments per message' };
+    }
+    let rows: Array<{ id: string; workroomId: string; uploaderKind: string; uploaderId: string }> = [];
+    try {
+      rows = await db.controlAttachment.findMany({
+        where: { id: { in: ids } },
+        select: { id: true, workroomId: true, uploaderKind: true, uploaderId: true },
+      });
+    } catch {
+      return { ok: false, status: 404, code: 'ATTACHMENT_NOT_FOUND', message: 'Attachment not found' };
+    }
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    for (const id of ids) {
+      const r = byId.get(id);
+      if (!r || r.workroomId !== workroomId) {
+        return { ok: false, status: 404, code: 'ATTACHMENT_NOT_FOUND', message: 'Attachment not found' };
+      }
+      if (r.uploaderKind !== senderKind || r.uploaderId !== senderId) {
+        return { ok: false, status: 403, code: 'FORBIDDEN', message: 'Attachment was uploaded by another member' };
+      }
+    }
+    return { ok: true, ids };
+  }
+
   app.post('/api/v1/workrooms/:wid/channels/:cid/messages', async (request, reply) => {
     const { wid, cid } = request.params as { wid: string; cid: string };
 
@@ -508,6 +551,7 @@ export async function messageRoutes(app: FastifyInstance) {
     const body = request.body as {
       content?: unknown;
       mentions?: unknown;
+      attachment_ids?: unknown;
       embedded_card_type?: unknown;
       embedded_card_id?: unknown;
       client_idempotency_key?: unknown;
@@ -556,6 +600,12 @@ export async function messageRoutes(app: FastifyInstance) {
     const mergedAgentMentions = [...new Set([...agentMentions, ...contentMentions.agentIds])];
     const mergedUserMentions = [...new Set([...userMentions, ...contentMentions.userIds])];
 
+    // S8 human-attachment sends: attachment_ids ride the same wire field agents use.
+    const att = await validateAttachmentIds(body.attachment_ids, wid, senderKind, senderId);
+    if (!att.ok) {
+      return reply.code(att.status).send({ error: { code: att.code, message: att.message } });
+    }
+
     const result = await sendMessageTransaction({
       channelId: cid,
       workroomId: wid,
@@ -564,6 +614,7 @@ export async function messageRoutes(app: FastifyInstance) {
       content: body.content,
       mentions: mergedAgentMentions,
       userMentions: mergedUserMentions,
+      attachmentIds: att.ids,
       embeddedCardType: typeof body.embedded_card_type === 'string' ? body.embedded_card_type : null,
       embeddedCardId: typeof body.embedded_card_id === 'string' ? body.embedded_card_id : null,
       clientIdempotencyKey,
@@ -771,6 +822,7 @@ export async function messageRoutes(app: FastifyInstance) {
     const body = request.body as {
       content?: unknown;
       mentions?: unknown;
+      attachment_ids?: unknown;
       client_idempotency_key?: unknown;
       agent_id?: unknown;
     } | null;
@@ -815,6 +867,11 @@ export async function messageRoutes(app: FastifyInstance) {
       return reply.code(404).send({ error: { code: 'THREAD_NOT_FOUND', message: 'Thread not found' } });
     }
 
+    const attReply = await validateAttachmentIds(body.attachment_ids, wid, senderKind, senderId);
+    if (!attReply.ok) {
+      return reply.code(attReply.status).send({ error: { code: attReply.code, message: attReply.message } });
+    }
+
     const result = await sendMessageTransaction({
       channelId: parent.channelId,
       workroomId: wid,
@@ -823,6 +880,7 @@ export async function messageRoutes(app: FastifyInstance) {
       content,
       mentions: agentMentions,
       userMentions,
+      attachmentIds: attReply.ids,
       clientIdempotencyKey,
       parentMessageId: parentId,
     });
@@ -849,6 +907,20 @@ export async function messageRoutes(app: FastifyInstance) {
       content,
       idempotent: result.idempotent,
     });
+
+    // Push @-mentions for thread replies too — without this, mentioning someone
+    // inside a thread stored user_mentions but never notified them (the top-level
+    // send path notifies; the thread path did not). threadId = the parent so the
+    // deep link opens the thread. Fire-and-forget; skipped on idempotent replay.
+    if (!result.idempotent && userMentions.length > 0) {
+      void notifyMentionedUsers({
+        mentionedUserIds: userMentions,
+        senderUserId: senderKind === 'user' ? senderId : null,
+        target: { workroomId: wid, channelId: parent.channelId, messageId: result.id, threadId: parentId },
+        title: 'You were mentioned',
+        body: previewText(body.content, 200),
+      });
+    }
 
     return reply.code(201).send({
       ...(await fetchFormattedMessage(result.id))!,

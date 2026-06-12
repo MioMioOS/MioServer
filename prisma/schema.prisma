@@ -632,7 +632,9 @@ model ControlAttachment {
   message              ControlMessage? @relation(fields: [messageId], references: [id])
   threadReplyId        String?         @map("thread_reply_id") @db.Uuid
   uploaderKind         String          @map("uploader_kind") // user | agent | daemon
-  uploaderId           String          @map("uploader_id") @db.Uuid
+  // text (not uuid): agent uploaders are uuid ControlAgent.ids, HUMAN uploaders
+  // are cuid User.ids (S8 human-attachment uploads) — same split as mentions.
+  uploaderId           String          @map("uploader_id")
   filename             String
   mimeType             String          @map("mime_type")
   sizeBytes            BigInt          @map("size_bytes")
