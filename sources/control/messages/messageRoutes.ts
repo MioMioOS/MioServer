@@ -1158,6 +1158,7 @@ export async function messageRoutes(app: FastifyInstance) {
             select: {
               id: true, channelId: true, workroomId: true, parentMessageId: true,
               content: true, createdAt: true, mentions: true, userMentions: true,
+              senderKind: true, senderId: true,
             },
           })
         : [];
@@ -1196,9 +1197,16 @@ export async function messageRoutes(app: FastifyInstance) {
       for (const s of states) handledByMessage.set(s.messageId, s.handled);
     }
 
+    // Resolve display context: channel id → name, and mention sender id → name.
+    const channelNameById = new Map(visible.map((ch) => [ch.id, ch.name]));
+    const senderNames = await resolveSenderDisplayNames(
+      mentionRows.map((r) => ({ senderKind: r.senderKind, senderId: r.senderId })),
+    );
+
     type ActivityItem = {
       id: string; message_id: string; handled: boolean; type: string;
-      workroom_id: string; channel_id: string; thread_id: string | null;
+      workroom_id: string; channel_id: string; channel_name: string | null;
+      thread_id: string | null; sender_display_name: string | null;
       title: string; body: string; created_at: Date;
     };
 
@@ -1209,7 +1217,9 @@ export async function messageRoutes(app: FastifyInstance) {
       return {
         id: `act_${r.id}`, message_id: r.id, handled: handledByMessage.get(r.id) ?? false,
         type, workroom_id: r.workroomId, channel_id: r.channelId,
+        channel_name: channelNameById.get(r.channelId) ?? null,
         thread_id: r.parentMessageId ?? null,
+        sender_display_name: senderNames.get(r.senderId) ?? null,
         title: type === 'mention_human' ? 'You were mentioned' : 'Agent mention',
         body: previewText(r.content, 200), created_at: r.createdAt,
       };
@@ -1220,7 +1230,9 @@ export async function messageRoutes(app: FastifyInstance) {
       return {
         id: `act_${r.id}`, message_id: r.id, handled: handledByMessage.get(r.id) ?? false,
         type: done ? 'task_done' : 'task_started',
-        workroom_id: r.workroomId, channel_id: r.channelId, thread_id: r.parentMessageId ?? null,
+        workroom_id: r.workroomId, channel_id: r.channelId,
+        channel_name: channelNameById.get(r.channelId) ?? null,
+        thread_id: r.parentMessageId ?? null, sender_display_name: null,
         title: done ? 'Task completed' : 'New task',
         body: previewText(r.content, 200), created_at: r.createdAt,
       };
