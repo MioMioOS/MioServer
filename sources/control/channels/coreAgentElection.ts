@@ -27,6 +27,7 @@ import { db } from '@/storage/db';
 
 const ELECTION_MODEL = process.env.DOUBAO_MODEL || 'doubao-seed-2-0-pro-260215';
 const ELECTION_TIMEOUT_MS = parseInt(process.env.CORE_ELECTION_TIMEOUT_MS || '8000', 10);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 interface AgentLite {
   id: string;
@@ -116,13 +117,17 @@ export async function electCoreAgent(channelId: string): Promise<string | null> 
     where: { channelId },
     select: { memberId: true },
   });
-  const memberIds = memberRows.map((m) => m.memberId);
+  // Member ids are opaque: agents are uuids, humans are cuids. Querying
+  // ControlAgent (id @db.Uuid) with a cuid throws a uuid-cast error, so filter
+  // to uuid-shaped ids before the lookup.
+  const memberIds = memberRows
+    .map((m) => m.memberId)
+    .filter((id) => UUID_RE.test(id));
   if (memberIds.length === 0) {
     await persist(channelId, null, channel.coreAgentId);
     return null;
   }
 
-  // Keep only members that are agents (member ids are opaque; humans are cuids).
   const agents = await db.controlAgent.findMany({
     where: { id: { in: memberIds } },
     select: { id: true, displayName: true, description: true, createdAt: true },
