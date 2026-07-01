@@ -68,8 +68,10 @@ const CLASSIFIER_MAX_TOKENS = 100;
 const SYSTEM_PROMPT =
   '分类 Slack 消息是否为 task。返回 JSON：' +
   '{"is_task":bool,"assignee_handle":"@xxx"|null,"task_title":"<60字"|null}。' +
-  'actionable 单次请求→true（assignee 是被 @ 的成员 handle）；' +
+  '只有「要求产出/实现/制作/修复一个具体交付物」的单次请求→true（assignee 是被 @ 的成员 handle）；' +
   '状态汇报/确认/闲聊/反馈→false。' +
+  '提问/询问信息/请人答复（如「现在几点」「频道里有几个人」「你觉得呢」「进度如何」）→false——' +
+  '这类是要在频道里直接口头回答的问题，不是需要建 task 的交付工作。' +
   ' CRITICAL: task_title 必须只从 new_message 文本本身提炼，' +
   '绝对不能从 recent 历史里抽内容来填 title。' +
   'recent 只用来辅助判断 new_message 是不是「收到」「好的」这类回应（→false），' +
