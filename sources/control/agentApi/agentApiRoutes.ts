@@ -26,6 +26,8 @@ import { authorizeAgentApi } from './agentApiAuth';
 import { resolveAgentChannelTarget } from './agentApiTargets';
 import { sendMessageTransaction } from '@/control/messages/sendMessageTransaction';
 import { writeEventAndBroadcast } from '@/control/messages/writeEventAndBroadcast';
+import { resolveContentMentions } from '@/control/messages/messageRoutes';
+import { notifyMentionedUsers } from '@/control/notifications/notify';
 import { writeThreadReplyEventAndBroadcast } from '@/control/messages/writeThreadReplyEventAndBroadcast';
 import { classifyAndMaybeCreateTask } from '@/control/classify/classifyAndMaybeCreateTask';
 import { db } from '@/storage/db';
@@ -285,6 +287,12 @@ export async function agentApiRoutes(app: FastifyInstance) {
       // recent inbound) → leave parentMessageId null. Safer default.
     }
 
+    // Resolve @-mentions from the content (agents + HUMANS) the same way the
+    // user send path does — otherwise an agent's "@Kris" is never recorded, so
+    // the human gets no mention activity and no push. (Was: agent sends passed
+    // no mentions at all → user_mentions always empty.)
+    const agentMentions = await resolveContentMentions(channelId, content);
+
     // ── Step 4: send message ──────────────────────────────────────────────────
     const result = await sendMessageTransaction({
       channelId,
@@ -292,6 +300,8 @@ export async function agentApiRoutes(app: FastifyInstance) {
       senderKind: 'agent',
       senderId: agent.id,
       content,
+      mentions: agentMentions.agentIds,
+      userMentions: agentMentions.userIds,
       clientIdempotencyKey,
       attachmentIds,
       parentMessageId,
@@ -398,7 +408,22 @@ export async function agentApiRoutes(app: FastifyInstance) {
         idempotent: result.idempotent,
       });
     } else {
-      await writeEventAndBroadcast(result);
+      // Pass agent mentions so an agent's @-delegation (e.g. a hand-off
+      // "@Backend do X") wakes the named teammate via the wake-set routing.
+      await writeEventAndBroadcast({ ...result, mentions: agentMentions.agentIds });
+    }
+
+    // Push mentioned HUMANS (agent uuid mentions ride the wake set above; humans
+    // need APNs + the mention shows in their activity via user_mentions). Skipped
+    // on idempotent replay so a retried send doesn't double-notify. Fire-and-forget.
+    if (!result.idempotent && agentMentions.userIds.length > 0) {
+      notifyMentionedUsers({
+        mentionedUserIds: agentMentions.userIds,
+        senderUserId: null,
+        target: { workroomId, channelId, messageId: result.id, threadId: parentMessageId },
+        title: 'You were mentioned',
+        body: content.slice(0, 200),
+      }).catch((err) => console.error('[agentApi] mention push failed', err));
     }
 
     // ── Step 7: return { id, seq, routed_to? } ───────────────────────────────

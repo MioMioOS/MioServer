@@ -256,7 +256,7 @@ async function fetchFormattedMessage(id: string) {
  * (displayName || name || email || email-local-part) substring against the
  * channel's members, longest label first to avoid prefix collisions.
  */
-async function resolveContentMentions(
+export async function resolveContentMentions(
   channelId: string,
   content: string,
 ): Promise<{ agentIds: string[]; userIds: string[] }> {
