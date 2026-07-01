@@ -38,6 +38,9 @@ export type WorkroomScopeMode = 'machine' | 'user';
 export interface WorkroomScopeOk {
   ok: true;
   mode: WorkroomScopeMode;
+  /** Viewer identity for per-subscriber channel-visibility filtering:
+   *  User.id (cuid) when mode='user', ControlMachine.id (uuid) when mode='machine'. */
+  viewerId: string;
 }
 
 /**
@@ -62,14 +65,14 @@ export async function tokenInWorkroom(
       where: { userId_workroomId: { userId: session.userId, workroomId } },
     });
     if (!mem) return null;
-    return { ok: true, mode: 'user' };
+    return { ok: true, mode: 'user', viewerId: session.userId };
   }
 
   // ── 2. machine_token ─────────────────────────────────────────────────────
   const machine = await verifyMachineToken(bearerHeader);
   if (machine) {
     const access = await requireMachineAccessToWorkroom(machine, workroomId);
-    if (access.ok) return { ok: true, mode: 'machine' };
+    if (access.ok) return { ok: true, mode: 'machine', viewerId: machine.id };
     // machine token valid but not scoped to this workroom → null (reject)
     return null;
   }

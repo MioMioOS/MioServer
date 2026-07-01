@@ -181,6 +181,10 @@ afterAll(async () => {
   await db.userSession.deleteMany({ where: { userId: { in: [userId, otherUserId] } } }).catch(() => {});
   await db.userWorkroomMembership.deleteMany({ where: { userId: { in: [userId, otherUserId] } } }).catch(() => {});
   await db.user.deleteMany({ where: { id: { in: [userId, otherUserId] } } }).catch(() => {});
+  await db.controlThread.deleteMany({ where: { workroomId: { in: [WORKROOM_ID, OTHER_WORKROOM_ID] } } }).catch(() => {});
+  await db.controlMessage.deleteMany({ where: { workroomId: { in: [WORKROOM_ID, OTHER_WORKROOM_ID] } } }).catch(() => {});
+  await db.controlEventLog.deleteMany({ where: { workroomId: { in: [WORKROOM_ID, OTHER_WORKROOM_ID] } } }).catch(() => {});
+  await db.controlChannel.deleteMany({ where: { workroomId: { in: [WORKROOM_ID, OTHER_WORKROOM_ID] } } }).catch(() => {});
   await db.controlWorkroom.deleteMany({ where: { id: { in: [WORKROOM_ID, OTHER_WORKROOM_ID] } } });
   await db.controlOrg.deleteMany({ where: { id: { in: [ORG_ID, OTHER_ORG_ID] } } });
   await app.close();

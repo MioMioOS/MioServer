@@ -78,7 +78,9 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  await db.controlThread.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlMessage.deleteMany({ where: { workroomId: WORKROOM_ID } });
+  await db.controlEventLog.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlChannel.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.userWorkroomMembership.deleteMany({ where: { workroomId: WORKROOM_ID } });
   await db.controlWorkroom.deleteMany({ where: { id: WORKROOM_ID } });

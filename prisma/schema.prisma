@@ -496,6 +496,12 @@ model ControlChannel {
   /// Monotone message-seq counter (same pool-stability rationale as
   /// ControlWorkroom.eventSeq — replaces FOR UPDATE + MAX(seq) in nextChannelSeq).
   messageSeq     BigInt                 @default(0) @map("message_seq")
+  /// Elected "core agent" for this channel: the single agent that answers
+  /// messages which @-mention nobody. Chosen by an LLM (Doubao) from member
+  /// agents' descriptions whenever the roster/roles change, cached here so the
+  /// per-message routing decision is a cheap lookup. Nullable until first
+  /// election (or when the channel has no agents). ControlAgent.id (uuid).
+  coreAgentId    String?                @map("core_agent_id") @db.Uuid
   workroom       ControlWorkroom        @relation(fields: [workroomId], references: [id])
   members        ControlChannelMember[]
   messages       ControlMessage[]

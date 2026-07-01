@@ -653,7 +653,9 @@ export async function messageRoutes(app: FastifyInstance) {
 
     // Post-commit write-before-broadcast (runs AFTER classifier so the task +
     // system message are persisted before the daemon sees the original message).
-    await writeEventAndBroadcast(result);
+    // Pass the resolved agent mentions so the event can carry the routing set
+    // (mentions → those agents; @-nobody → the channel's core agent).
+    await writeEventAndBroadcast({ ...result, mentions: mergedAgentMentions });
 
     // Task #121 S4: mention push for HUMAN mentions (uuid agent mentions ride the WS
     // broadcast + daemon path; humans need APNs). Mentions are NOT gated by the

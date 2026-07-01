@@ -31,7 +31,10 @@ export interface SendMessageInput {
   senderKind: string;
   senderId: string;
   content: string;
+  /** AGENT mentions (uuid[] — ControlAgent.id). Non-uuid values will crash the DB column. */
   mentions?: string[];
+  /** HUMAN mentions (cuid[] — User.id). Stored in the text[] user_mentions column. (Task #121 S2) */
+  userMentions?: string[];
   attachmentIds?: string[];
   embeddedCardType?: string | null;
   embeddedCardId?: string | null;
@@ -92,6 +95,7 @@ export async function sendMessageTransaction(input: SendMessageInput): Promise<S
     senderId,
     content,
     mentions = [],
+    userMentions = [],
     attachmentIds,
     embeddedCardType = null,
     embeddedCardId = null,
@@ -138,6 +142,7 @@ export async function sendMessageTransaction(input: SendMessageInput): Promise<S
           senderId,
           content,
           mentions,
+          userMentions,
           ...(attachmentIds !== undefined ? { attachmentIds } : {}),
           embeddedCardType,
           embeddedCardId,

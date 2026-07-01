@@ -14,6 +14,7 @@
  */
 
 import { randomUUID } from 'crypto';
+import { db } from '@/storage/db';
 import { publishControlEvent } from '@/control/events/publishControlEvent';
 import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
 import { redactControlText } from '@/control/redaction/redactControlText';
@@ -27,8 +28,36 @@ export async function writeEventAndBroadcast(msg: {
   senderKind: string;
   senderId: string;
   content: string;
+  /** Resolved AGENT mention ids for this message (uuid[]). Drives routing. */
+  mentions?: string[];
 }): Promise<void> {
   const preview = redactControlText(msg.content).slice(0, 120);
+
+  // Per-channel core agent (answers @-nobody messages). Cheap PK lookup; the
+  // daemon reads routing off the event without an extra fetch. Non-fatal if it
+  // fails — routing then treats the channel as having no core.
+  let coreAgentId: string | null = null;
+  try {
+    const ch = await db.controlChannel.findUnique({
+      where: { id: msg.channelId },
+      select: { coreAgentId: true },
+    });
+    coreAgentId = ch?.coreAgentId ?? null;
+  } catch { /* leave null */ }
+
+  // Routing decision (single source of truth): a message that @-mentions
+  // specific agents wakes exactly those; a message that names nobody wakes only
+  // the channel's core agent. The daemon wakes iff selfAgentId ∈ wake_agent_ids.
+  //
+  // IMPORTANT: only stamp wake_agent_ids when routing is KNOWN — i.e. there are
+  // mentions, or a core agent is elected. When a message names nobody AND the
+  // channel has no elected core yet (freshly-created channel, a DM before its
+  // first election, election still in flight), leave it UNSET so the daemon
+  // falls back to its legacy delivery instead of waking nobody.
+  const mentions = msg.mentions ?? [];
+  let wakeAgentIds: string[] | undefined;
+  if (mentions.length > 0) wakeAgentIds = [...new Set(mentions)];
+  else if (coreAgentId) wakeAgentIds = [coreAgentId];
 
   // Step 1: write event to DB (awaited — guarantees persistence before route returns 201).
   const event = await publishControlEvent({
@@ -41,6 +70,9 @@ export async function writeEventAndBroadcast(msg: {
       seq: msg.seq.toString(),
       sender_kind: msg.senderKind,
       sender_id: msg.senderId,
+      core_agent_id: coreAgentId,
+      // JSON.stringify drops undefined → field absent → daemon uses legacy path.
+      ...(wakeAgentIds ? { wake_agent_ids: wakeAgentIds } : {}),
       preview,
     },
   });

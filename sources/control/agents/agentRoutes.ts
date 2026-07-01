@@ -35,6 +35,7 @@ import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { verifyMachineToken } from '@/machines/machineRoutes';
 import { publishControlEvent } from '@/control/events/publishControlEvent';
 import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
+import { reelectForAgent, reelectForChannel } from '@/control/channels/coreAgentElection';
 
 /** A machine is "online" if it was seen within this window (≈2 min). */
 const ONLINE_WINDOW_MS = 2 * 60 * 1000;
@@ -358,6 +359,9 @@ export async function agentRoutes(app: FastifyInstance) {
       });
     }
 
+    // New agent joined its default channel(s) → re-elect their core (off-path).
+    reelectForAgent(agent.id);
+
     // Same wire shape as a GET /members item (+ runtime + model) so it lists immediately.
     return reply.code(201).send({
       id: agent.id,
@@ -493,6 +497,11 @@ export async function agentRoutes(app: FastifyInstance) {
       });
     }
 
+    // Description/role edit can change who the core should be → re-elect the
+    // agent's channels (off-path). Only meaningful when description changed, but
+    // re-electing is cheap (no-op persist when unchanged) so we always fire.
+    reelectForAgent(updated.id);
+
     return reply.send({
       id: updated.id,
       kind: 'agent' as const,
@@ -542,6 +551,20 @@ export async function agentRoutes(app: FastifyInstance) {
       return reply.code(404).send({ error: { code: 'AGENT_NOT_FOUND', message: 'Agent not found in this org' } });
     }
 
+    // Capture the agent's channels BEFORE removing memberships so we can re-elect
+    // their core after it's gone (reelectForAgent would find nothing post-delete).
+    const affectedChannels = (await db.controlChannelMember.findMany({
+      where: { memberId: agentId },
+      select: { channelId: true },
+    })).map((r) => r.channelId);
+
+    // Also clear this agent as any channel's cached core so routing doesn't point
+    // at a deleted agent until the re-election lands.
+    await db.controlChannel.updateMany({
+      where: { coreAgentId: agentId },
+      data: { coreAgentId: null },
+    });
+
     // 1) Drop ALL channel memberships for this agent (opaque actor id == agent id).
     await db.controlChannelMember.deleteMany({ where: { memberId: agentId } });
 
@@ -576,6 +599,9 @@ export async function agentRoutes(app: FastifyInstance) {
         created_at: event.createdAt.toISOString(),
       });
     }
+
+    // Re-elect the core for every channel the deleted agent belonged to (off-path).
+    for (const cid of affectedChannels) reelectForChannel(cid);
 
     return reply.send({ ok: true });
   });

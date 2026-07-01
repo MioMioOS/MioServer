@@ -73,6 +73,10 @@ export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
       }
 
       subscriber.context = `${scope.mode}:${socket.id}`;
+      // Viewer identity powers per-subscriber channel-visibility filtering for
+      // content-bearing events (message previews must not leak across private
+      // channels to subscribers who cannot read them via REST).
+      subscriber.viewer = { kind: scope.mode, id: scope.viewerId };
       workroomBroadcaster.subscribe(msg.workroom_id, subscriber);
       socket.emit('subscribed', { workroom_id: msg.workroom_id });
       console.log(`[WS] ${subscriber.context} subscribed to workroom=${msg.workroom_id}`);

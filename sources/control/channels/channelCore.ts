@@ -29,6 +29,7 @@ import {
   type ControlEventResult,
 } from '@/control/events/publishControlEvent';
 import { workroomBroadcaster, type WorkroomEventPayload } from '@/control/ws/workroomBroadcaster';
+import { reelectForChannel } from './coreAgentElection';
 
 /**
  * A Prisma client usable for tx-aware writes: either the singleton `db` or a `$transaction`
@@ -348,6 +349,9 @@ export async function addMemberCore(input: AddMemberCoreInput): Promise<AddMembe
       client,
     ),
   ];
+
+  // Roster changed → re-elect the channel's core agent (off-path, never blocks).
+  if (memberKind === 'agent') reelectForChannel(channelId);
 
   return { added: true, events };
 }

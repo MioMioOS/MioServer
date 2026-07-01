@@ -21,13 +21,32 @@
  */
 
 import type { Socket } from 'socket.io';
+import { visibleChannels } from '@/control/channels/channelVisibility';
 
 export interface WorkroomSubscriber {
   /** The socket.io socket for this connection. */
   socket: Socket;
   /** Agent or machine session context (for logging). */
   context?: string;
+  /** Viewer identity (set by wsGateway at subscribe) — powers channel-visibility
+   *  filtering for content-bearing events. Absent → treated as cannot-see
+   *  (fail-closed) for filtered topics. */
+  viewer?: { kind: 'user' | 'machine'; id: string };
 }
+
+/**
+ * Topics whose payload carries message CONTENT (a redacted ≤120-char preview).
+ * These are delivered ONLY to subscribers who can see the event's channel —
+ * without this, a guest/member workroom subscriber received previews of
+ * private-channel messages they cannot read via REST (2026-06-12 audit).
+ * Metadata-only topics (task.*, channel.member_*, agent.*, reminder.*) pass
+ * through unfiltered: payloads are ids/status only, and the daemon RELIES on
+ * channel.member_added for its own membership-cache invalidation.
+ */
+const CONTENT_FILTERED_TOPICS = new Set(['message.created', 'thread.reply']);
+
+const VISIBILITY_CACHE_TTL_MS = 30_000;
+interface VisibilityCacheEntry { channelIds: Set<string>; expiresAt: number }
 
 /** The WS event name clients receive for new control plane events. */
 export const WORKROOM_EVENT_TOPIC = 'workroom:event';
@@ -35,6 +54,8 @@ export const WORKROOM_EVENT_TOPIC = 'workroom:event';
 export class WorkroomBroadcaster {
   // workroomId → Set<WorkroomSubscriber>
   private subscriptions = new Map<string, Set<WorkroomSubscriber>>();
+  // Per-subscriber visible-channel cache (30s TTL; invalidated on channel.* events).
+  private visibility = new WeakMap<WorkroomSubscriber, VisibilityCacheEntry>();
 
   /**
    * Register a connection as interested in events for this workroom.
@@ -88,9 +109,66 @@ export class WorkroomBroadcaster {
     const subs = this.subscriptions.get(workroomId);
     if (!subs || subs.size === 0) return;
 
+    // Channel-membership changes invalidate every subscriber's visibility cache
+    // for this workroom (cheap: next filtered event re-resolves, ≤1 query/30s/sub).
+    if (eventPayload.topic.startsWith('channel.')) {
+      for (const sub of subs) this.visibility.delete(sub);
+    }
+
+    const channelId = typeof eventPayload.payload?.channel_id === 'string'
+      ? (eventPayload.payload.channel_id as string)
+      : null;
+    const needsFilter = channelId !== null && CONTENT_FILTERED_TOPICS.has(eventPayload.topic);
+
+    if (!needsFilter) {
+      this.emitTo(workroomId, subs, [...subs], eventPayload);
+      return;
+    }
+
+    // Async visibility resolution; fire-and-forget like the rest of fanout.
+    void this.deliverFiltered(workroomId, subs, channelId, eventPayload).catch((err) => {
+      console.error(`[WorkroomBroadcaster] filtered delivery failed (workroom=${workroomId}):`, (err as Error)?.message);
+    });
+  }
+
+  private async deliverFiltered(
+    workroomId: string,
+    subs: Set<WorkroomSubscriber>,
+    channelId: string,
+    eventPayload: WorkroomEventPayload,
+  ): Promise<void> {
+    const allowed: WorkroomSubscriber[] = [];
+    for (const sub of [...subs]) {
+      if (!sub.viewer) continue; // fail-closed: no identity → no content events
+      let entry = this.visibility.get(sub);
+      if (!entry || entry.expiresAt <= Date.now()) {
+        try {
+          const channels = await visibleChannels(
+            { viewerId: sub.viewer.id, viewerKind: sub.viewer.kind },
+            workroomId,
+          );
+          entry = { channelIds: new Set(channels.map((c) => c.id)), expiresAt: Date.now() + VISIBILITY_CACHE_TTL_MS };
+          this.visibility.set(sub, entry);
+        } catch (err) {
+          // DB hiccup: fail-closed for this event; client catches up via GET.
+          console.error('[WorkroomBroadcaster] visibility resolve failed:', (err as Error)?.message);
+          continue;
+        }
+      }
+      if (entry.channelIds.has(channelId)) allowed.push(sub);
+    }
+    this.emitTo(workroomId, subs, allowed, eventPayload);
+  }
+
+  private emitTo(
+    workroomId: string,
+    subs: Set<WorkroomSubscriber>,
+    targets: WorkroomSubscriber[],
+    eventPayload: WorkroomEventPayload,
+  ): void {
     let sent = 0;
     let failed = 0;
-    for (const sub of subs) {
+    for (const sub of targets) {
       try {
         sub.socket.emit(WORKROOM_EVENT_TOPIC, eventPayload);
         sent++;
@@ -104,7 +182,7 @@ export class WorkroomBroadcaster {
     }
     if (subs.size === 0) this.subscriptions.delete(workroomId);
 
-    console.log(`[WorkroomBroadcaster] broadcast workroom=${workroomId} sent=${sent} failed=${failed}`);
+    console.log(`[WorkroomBroadcaster] broadcast workroom=${workroomId} topic=${eventPayload.topic} sent=${sent}/${targets.length} failed=${failed}`);
   }
 
   /** Current subscriber count for a workroom (useful for health checks + tests). */

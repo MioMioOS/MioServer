@@ -33,6 +33,7 @@ import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { SUMMARY_TERMINAL_STATUSES } from '@/control/actionStatusSets';
 import { serverToSlockStatus } from './slockTaskStatus';
 import { claimControlTaskCas } from './claimControlTaskCas';
+import { notifyTaskDone } from '@/control/notifications/notify';
 
 const NON_CLAIMABLE_STATUSES = ['done', 'canceled'];
 
@@ -315,6 +316,17 @@ export async function taskRoutes(app: FastifyInstance) {
       },
     });
 
+    // Task #121 S4: task-done push. Fires only on the todo/in_progress/in_review → done
+    // EDGE (task.status was non-done above — the TASK_TERMINAL guard rejects already-done
+    // tasks — so this update is the first time it reaches done). Notifies every HUMAN owner
+    // member of the task's workroom; gated by each device's notifyOnCompletion preference
+    // (completion-style signal). Fire-and-forget — never blocks the PATCH response.
+    if (updated.status === 'done' && task.status !== 'done') {
+      void notifyTaskDoneForWorkroom(updated).catch((err: unknown) =>
+        console.error('[tasks] task-done push failed', err),
+      );
+    }
+
     return {
       task_id: updated.id,
       status: updated.status,
@@ -459,5 +471,64 @@ export async function taskRoutes(app: FastifyInstance) {
     }
 
     return { task_id: taskId, unclaimed: true };
+  });
+}
+
+/**
+ * Task #121 S4 helper: resolve recipients + deep-link target for a just-completed task,
+ * then dispatch the task-done push.
+ *
+ * Recipients: every HUMAN owner member of the task's workroom (UserWorkroomMembership,
+ * role 'owner' — the only human role this slice). These are the people who want to know
+ * the work finished. notifyTaskDone() resolves their devices and applies the per-device
+ * notifyOnCompletion gate.
+ *
+ * Deep-link target: the task's channelId (fallback: the workroom's main channel) so the
+ * client can route to the conversation, and messageId = the task's parentMessageId ||
+ * sourceMessageId (the message the task hangs off of) so it can scroll to context.
+ * threadId = parentMessageId when the task is attached to a thread parent.
+ */
+async function notifyTaskDoneForWorkroom(task: {
+  id: string;
+  title: string;
+  workroomId: string;
+  channelId: string | null;
+  parentMessageId: string | null;
+  sourceMessageId: string | null;
+}): Promise<void> {
+  // Human owner members of this workroom.
+  const memberships = await db.userWorkroomMembership.findMany({
+    where: { workroomId: task.workroomId, role: 'owner' },
+    select: { userId: true },
+  });
+  const recipientUserIds = memberships.map((m) => m.userId);
+  if (recipientUserIds.length === 0) return;
+
+  // Resolve a channelId for the deep link: prefer the task's own channel, else the
+  // workroom's 'main' channel (every workroom has one), else any non-archived channel.
+  let channelId = task.channelId;
+  if (!channelId) {
+    const main =
+      (await db.controlChannel.findFirst({
+        where: { workroomId: task.workroomId, type: 'main', archivedAt: null },
+        select: { id: true },
+      })) ??
+      (await db.controlChannel.findFirst({
+        where: { workroomId: task.workroomId, archivedAt: null },
+        orderBy: { createdAt: 'asc' },
+        select: { id: true },
+      }));
+    channelId = main?.id ?? null;
+  }
+  if (!channelId) return; // no routable channel — nothing to deep-link to.
+
+  const messageId = task.parentMessageId ?? task.sourceMessageId ?? task.id;
+  const threadId = task.parentMessageId ?? null;
+
+  await notifyTaskDone({
+    recipientUserIds,
+    target: { workroomId: task.workroomId, channelId, messageId, threadId },
+    title: 'Task completed',
+    body: task.title,
   });
 }

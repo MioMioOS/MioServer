@@ -44,7 +44,7 @@ describe('tokenInWorkroom — user_sess_ branch (Slice 7 B2-e)', () => {
 
     const result = await tokenInWorkroom('user_sess_abc', 'wroom-1');
 
-    expect(result).toEqual({ ok: true, mode: 'user' });
+    expect(result).toMatchObject({ ok: true, mode: 'user' });
     expect(mockResolveUserSession).toHaveBeenCalledWith('Bearer user_sess_abc');
     expect(mockMembershipFindUnique).toHaveBeenCalledWith({
       where: { userId_workroomId: { userId: 'user-1', workroomId: 'wroom-1' } },
@@ -83,7 +83,7 @@ describe('tokenInWorkroom — user_sess_ branch (Slice 7 B2-e)', () => {
 
     const result = await tokenInWorkroom('machine_token_value', 'wroom-1');
 
-    expect(result).toEqual({ ok: true, mode: 'machine' });
+    expect(result).toMatchObject({ ok: true, mode: 'machine' });
     expect(mockResolveUserSession).not.toHaveBeenCalled();
     expect(mockMembershipFindUnique).not.toHaveBeenCalled();
   });

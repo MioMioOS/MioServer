@@ -47,6 +47,7 @@ import {
   writeChannelEventAndBroadcast,
   lookupMemberKind,
 } from '@/control/channels/channelCore';
+import { reelectForChannel } from '@/control/channels/coreAgentElection';
 
 /**
  * Resolved actor for a channel WRITE: who is doing the write (the opaque id used as
@@ -590,6 +591,9 @@ export async function channelRoutes(app: FastifyInstance) {
         channel_id: cid,
         member_id: memberId,
       });
+
+      // Roster changed → re-elect the channel's core agent (off-path).
+      reelectForChannel(cid);
 
       return reply.send({ ok: true });
     },
