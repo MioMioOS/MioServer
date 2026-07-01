@@ -30,6 +30,9 @@ export async function writeEventAndBroadcast(msg: {
   content: string;
   /** Resolved AGENT mention ids for this message (uuid[]). Drives routing. */
   mentions?: string[];
+  /** Explicit wake set (content-routed agent for an @-nobody human message).
+   *  When provided it REPLACES the mentions/core derivation below. */
+  wakeAgentIds?: string[];
 }): Promise<void> {
   const preview = redactControlText(msg.content).slice(0, 120);
 
@@ -56,7 +59,10 @@ export async function writeEventAndBroadcast(msg: {
   // falls back to its legacy delivery instead of waking nobody.
   const mentions = msg.mentions ?? [];
   let wakeAgentIds: string[] | undefined;
-  if (mentions.length > 0) {
+  if (msg.wakeAgentIds) {
+    // Caller already decided the wake set (content routing). Trust it.
+    wakeAgentIds = [...new Set(msg.wakeAgentIds)];
+  } else if (mentions.length > 0) {
     // Named specific agents → wake exactly those.
     wakeAgentIds = [...new Set(mentions)];
   } else if (msg.senderKind === 'user' && coreAgentId) {

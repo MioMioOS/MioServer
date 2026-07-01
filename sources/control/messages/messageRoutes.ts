@@ -55,6 +55,7 @@ import { classifyAndMaybeCreateTask } from '@/control/classify/classifyAndMaybeC
 import { splitMentions } from './splitMentions';
 import { notifyMentionedUsers, type DeepLinkType } from '@/control/notifications/notify';
 import { redactControlText } from '@/control/redaction/redactControlText';
+import { routeMessageToAgent } from '@/control/channels/coreAgentElection';
 
 /**
  * Shape a message body into a short, secret-redacted notification/activity preview.
@@ -639,23 +640,38 @@ export async function messageRoutes(app: FastifyInstance) {
     // insert a system message, and downstream auto-route logic in the agent-api
     // depends on the task already existing when the daemon receives the WS push.
     // Adds ~1.5s to the POST latency — accepted per product spec.
-    if (!result.idempotent) {
-      await classifyAndMaybeCreateTask({
-        workroomId: wid,
-        channelId: cid,
-        messageId: result.id,
-        parentMessageId: null,
-        senderKind,
-        senderId,
-        content: body.content,
-      });
-    }
+    // Content routing (primary path for @-nobody human messages): when a human
+    // named no agent, Doubao picks the teammate whose role fits the message so
+    // it goes straight to the right agent (~0.5s) instead of the core + a slow
+    // hand-off. Runs CONCURRENTLY with the classifier (both ~0.5-1.5s) so it
+    // adds no serial latency. Falls back to the elected core / oldest agent.
+    const needsRouting = !result.idempotent && senderKind === 'user' && mergedAgentMentions.length === 0;
+    const [, routedAgentId] = await Promise.all([
+      result.idempotent
+        ? Promise.resolve(null)
+        : classifyAndMaybeCreateTask({
+            workroomId: wid,
+            channelId: cid,
+            messageId: result.id,
+            parentMessageId: null,
+            senderKind,
+            senderId,
+            content: body.content,
+          }),
+      needsRouting
+        ? routeMessageToAgent(cid, body.content).catch(() => null)
+        : Promise.resolve(null),
+    ]);
 
     // Post-commit write-before-broadcast (runs AFTER classifier so the task +
     // system message are persisted before the daemon sees the original message).
-    // Pass the resolved agent mentions so the event can carry the routing set
-    // (mentions → those agents; @-nobody → the channel's core agent).
-    await writeEventAndBroadcast({ ...result, mentions: mergedAgentMentions });
+    // wakeAgentIds override: the content-routed agent for an @-nobody human msg;
+    // otherwise writeEventAndBroadcast derives it from mentions + core.
+    await writeEventAndBroadcast({
+      ...result,
+      mentions: mergedAgentMentions,
+      ...(routedAgentId ? { wakeAgentIds: [routedAgentId] } : {}),
+    });
 
     // Task #121 S4: mention push for HUMAN mentions (uuid agent mentions ride the WS
     // broadcast + daemon path; humans need APNs). Mentions are NOT gated by the
