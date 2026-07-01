@@ -438,6 +438,11 @@ export async function channelRoutes(app: FastifyInstance) {
       });
     }
 
+    // A DM with an agent peer needs a core so an @-nobody message (the normal
+    // case in a 1:1) still wakes the agent. Election on a 1-agent channel picks
+    // that agent deterministically (no LLM). Off-path.
+    reelectForChannel(channel.id);
+
     return reply.code(201).send({
       id: channel.id,
       peer_member_id: memberId,
