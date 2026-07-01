@@ -56,8 +56,21 @@ export async function writeEventAndBroadcast(msg: {
   // falls back to its legacy delivery instead of waking nobody.
   const mentions = msg.mentions ?? [];
   let wakeAgentIds: string[] | undefined;
-  if (mentions.length > 0) wakeAgentIds = [...new Set(mentions)];
-  else if (coreAgentId) wakeAgentIds = [coreAgentId];
+  if (mentions.length > 0) {
+    // Named specific agents → wake exactly those.
+    wakeAgentIds = [...new Set(mentions)];
+  } else if (msg.senderKind === 'user' && coreAgentId) {
+    // A HUMAN addressed nobody → the channel's core agent fields it.
+    wakeAgentIds = [coreAgentId];
+  } else if (msg.senderKind !== 'user' && coreAgentId) {
+    // An AGENT posted without naming anyone (a status line, a reply). Wake
+    // NOBODY — routing to the core here would make every agent utterance
+    // cascade into a coordinator turn. If an agent wants a teammate to act it
+    // @-mentions them (which takes the mentions branch above). Empty (not unset)
+    // so the daemon treats this as an authoritative "no wake", not a fallback.
+    wakeAgentIds = [];
+  }
+  // else: no core elected yet → leave UNSET so the daemon uses legacy delivery.
 
   // Step 1: write event to DB (awaited — guarantees persistence before route returns 201).
   const event = await publishControlEvent({
