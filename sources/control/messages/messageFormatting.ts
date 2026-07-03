@@ -103,6 +103,7 @@ export type MessageRow = {
   embeddedCardType: string | null;
   embeddedCardId: string | null;
   threadReplyCount: number;
+  lastThreadReplyAt?: Date | null;
   createdAt: Date;
   channelId: string;
   parentMessageId: string | null;
@@ -204,6 +205,8 @@ export function formatMessage(
     embedded_card_id: msg.embeddedCardId,
     thread_reply_count: msg.threadReplyCount,
     reply_count: msg.threadReplyCount,
+    // Slack-style thread summary ("最后回复于 15 小时前") needs the timestamp.
+    last_thread_reply_at: msg.lastThreadReplyAt ? msg.lastThreadReplyAt.toISOString() : null,
     parent_message_id: msg.parentMessageId ?? null,
     attached_task: extras?.attachedTask ?? null,
     created_at: msg.createdAt.toISOString(),

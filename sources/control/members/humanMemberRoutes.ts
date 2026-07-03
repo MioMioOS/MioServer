@@ -27,6 +27,7 @@
  *     and task admin writes stay owner-only via requireUserWrite.
  */
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { onlineUserIds } from '@/control/ws/userPresence';
 import { db } from '@/storage/db';
 import { requireUser } from '@/auth/userSession/requireUser';
 import { generateIdenticon } from '@/control/profile/identicon';
@@ -56,11 +57,14 @@ export async function humanMemberRoutes(app: FastifyInstance) {
       const memberships = await db.userWorkroomMembership.findMany({
         where: { workroomId: wid },
         orderBy: { createdAt: 'asc' },
-        include: { user: { select: { id: true, email: true, displayName: true } } },
+        include: { user: { select: { id: true, email: true, displayName: true, lastSeenAt: true } } },
       });
+      const online = onlineUserIds(wid);
       return {
         human_members: memberships.map((m) => ({
           user_id: m.user.id,
+          online: online.has(m.user.id),
+          last_seen_at: m.user.lastSeenAt ? m.user.lastSeenAt.toISOString() : null,
           email: m.user.email,
           display_name: m.user.displayName,
           avatar: avatarFor(m.user.displayName, m.user.email),

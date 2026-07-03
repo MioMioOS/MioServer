@@ -72,6 +72,9 @@ model User {
   id                String   @id @default(cuid())
   email             String   @unique
   passwordHash      String   @map("password_hash") // bcrypt cost 12
+  /// Human presence: stamped on WS subscribe and on the online→offline
+  /// transition. Null = never connected since the column landed.
+  lastSeenAt        DateTime? @map("last_seen_at")
   /// R1: user-editable display name. Avatar is derived (identicon of displayName||email);
   /// no avatar column yet — add avatar_blob_id only if/when custom upload ships.
   displayName       String?  @map("display_name")

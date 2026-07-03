@@ -195,6 +195,9 @@ export async function searchRoutes(app: FastifyInstance) {
           workroomId: wid,
           channelId: { in: visibleIds },
           parentMessageId: null,
+          // System lifecycle lines ("task #2 → done") are noise here — a search
+          // for "#2" should surface THE TASK (tasks section below) + real talk.
+          senderKind: { not: 'system' },
           content: { contains: q, mode: 'insensitive' },
           ...(since ? { createdAt: { gte: since } } : {}),
           ...senderFilter,
@@ -225,6 +228,43 @@ export async function searchRoutes(app: FastifyInstance) {
       messages = rows.map((m) =>
         formatMessage(m, senderNames, visibleNameById.get(m.channelId) ?? ''),
       );
+    }
+
+    // ── Tasks ─────────────────────────────────────────────────────────────────
+    // "#2" / "2" matches the task number; any text matches the title. This is
+    // what a human searching "#2" actually wants.
+    type TaskHit = {
+      id: string; number: number | null; title: string; status: string;
+      channel_id: string | null; channel_name: string | null;
+      parent_message_id: string | null; assignee: string | null;
+    };
+    let tasks: TaskHit[] = [];
+    if (visibleIds.length > 0) {
+      const numMatch = /^#?(\d+)$/.exec(q.trim());
+      const taskRows = await db.controlTask.findMany({
+        where: {
+          workroomId: wid,
+          channelId: { in: visibleIds },
+          OR: [
+            { title: { contains: q, mode: 'insensitive' } },
+            ...(numMatch ? [{ number: Number(numMatch[1]) }] : []),
+          ],
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 20,
+        select: {
+          id: true, number: true, title: true, status: true, channelId: true,
+          parentMessageId: true, ownerAgent: { select: { displayName: true } },
+        },
+      });
+      tasks = taskRows.map((t) => ({
+        id: t.id, number: t.number, title: t.title,
+        status: (t.status ?? '').toUpperCase(),
+        channel_id: t.channelId,
+        channel_name: t.channelId ? (visibleNameById.get(t.channelId) ?? null) : null,
+        parent_message_id: t.parentMessageId ?? null,
+        assignee: t.ownerAgent?.displayName ?? null,
+      }));
     }
 
     // ── Channels ──────────────────────────────────────────────────────────────
@@ -304,6 +344,8 @@ export async function searchRoutes(app: FastifyInstance) {
       }));
     }
 
-    return { messages, channels, members };
+    return {
+      tasks,
+      messages, channels, members };
   });
 }

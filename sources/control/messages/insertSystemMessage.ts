@@ -25,11 +25,12 @@ export interface InsertSystemMessageInput {
   channelId: string;
   content: string;
   /**
-   * Bug-2 Thread feature: when set, this system message is posted INSIDE the
-   * thread under that parent message (parent_message_id = this id). The
-   * parent's threadReplyCount + lastThreadReplyAt are bumped, and ControlThread
-   * (replyCount/lastReplyAt) is upserted — same bookkeeping as a normal thread
-   * reply. null/undefined → top-level system message (existing behavior).
+   * When set, this system message is posted INSIDE the thread under that parent
+   * message (parent_message_id = this id). ControlThread is upserted and the
+   * reply timestamps freshened so the thread exists and sorts by recency — but
+   * reply COUNTERS are NOT bumped: system events are notifications, not replies
+   * (counting them showed phantom "1 条回复" on task-attach threads).
+   * null/undefined → top-level system message (existing behavior).
    */
   parentMessageId?: string | null;
 }
@@ -99,30 +100,31 @@ export async function insertSystemMessage(
       data: { lastActivityAt: created.createdAt },
     });
 
-    // Bug-2 Thread feature: if this system message is a thread reply, mirror
-    // the bookkeeping sendMessageTransaction does for normal replies — upsert
-    // ControlThread (replyCount, lastReplyAt) and bump the parent message's
-    // threadReplyCount / lastThreadReplyAt. Same $transaction, same FOR-UPDATE
-    // seq serialization so concurrent first-attaches can't double-create the
-    // ControlThread row.
+    // Thread bookkeeping for a system message posted as a thread reply: ensure
+    // the ControlThread row exists (so the thread can be opened) and freshen the
+    // reply timestamps — but do NOT increment replyCount / threadReplyCount.
+    // System events (e.g. "1 new task created") are notifications, not replies:
+    // counting them made the UI say "1 条回复" on threads whose only content is
+    // a task-created line, which reads as a phantom reply. The thread entry
+    // point for attached tasks is the task chip itself, so nothing is lost by
+    // keeping the counter honest. (Same $transaction, same FOR-UPDATE seq
+    // serialization so concurrent first-attaches can't double-create the row.)
     if (parentMessageId) {
       await tx.controlThread.upsert({
         where: { parentMessageId },
         create: {
           parentMessageId,
           workroomId,
-          replyCount: 1,
+          replyCount: 0,
           lastReplyAt: created.createdAt,
         },
         update: {
-          replyCount: { increment: 1 },
           lastReplyAt: created.createdAt,
         },
       });
       await tx.controlMessage.update({
         where: { id: parentMessageId },
         data: {
-          threadReplyCount: { increment: 1 },
           lastThreadReplyAt: created.createdAt,
         },
       });

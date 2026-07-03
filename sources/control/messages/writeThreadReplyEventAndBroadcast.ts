@@ -26,6 +26,10 @@ export async function writeThreadReplyEventAndBroadcast(input: {
   senderId: string;
   content: string;
   idempotent: boolean;
+  /** Thread-owner routing: agent ids that should wake for this reply. Stamped by
+   *  the USER reply route (mentions win; else the parent task's owner). Absent →
+   *  daemon falls back to its legacy context-policy behavior. */
+  wakeAgentIds?: string[];
 }): Promise<void> {
   if (input.idempotent) {
     console.info(
@@ -48,6 +52,7 @@ export async function writeThreadReplyEventAndBroadcast(input: {
       sender_kind: input.senderKind,
       sender_id: input.senderId,
       preview,
+      ...(input.wakeAgentIds !== undefined ? { wake_agent_ids: input.wakeAgentIds } : {}),
     },
   });
 

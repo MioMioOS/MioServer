@@ -42,6 +42,7 @@
 import { Server as HttpServer } from 'http';
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import { tokenInWorkroom } from '@/control/auth/workroomScopeForToken';
+import { userSubscribed, userUnsubscribed } from './userPresence';
 import { workroomBroadcaster, WorkroomSubscriber } from './workroomBroadcaster';
 
 export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
@@ -55,6 +56,8 @@ export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
 
     // Track subscriber handle for cleanup
     const subscriber: WorkroomSubscriber = { socket, context: socket.id };
+    // Human presence: (workroomId → userId) pairs this socket contributes to.
+    const userSubs = new Map<string, string>();
 
     // ── subscribe ────────────────────────────────────────────────────────────
     socket.on('subscribe', async (msg: { workroom_id?: string; token?: string }) => {
@@ -78,6 +81,10 @@ export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
       // channels to subscribers who cannot read them via REST).
       subscriber.viewer = { kind: scope.mode, id: scope.viewerId };
       workroomBroadcaster.subscribe(msg.workroom_id, subscriber);
+      if (scope.mode === 'user' && !userSubs.has(msg.workroom_id)) {
+        userSubs.set(msg.workroom_id, scope.viewerId);
+        userSubscribed(msg.workroom_id, scope.viewerId);
+      }
       socket.emit('subscribed', { workroom_id: msg.workroom_id });
       console.log(`[WS] ${subscriber.context} subscribed to workroom=${msg.workroom_id}`);
     });
@@ -89,6 +96,8 @@ export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
         return;
       }
       workroomBroadcaster.unsubscribe(msg.workroom_id, subscriber);
+      const uid = userSubs.get(msg.workroom_id);
+      if (uid) { userSubs.delete(msg.workroom_id); userUnsubscribed(msg.workroom_id, uid); }
       socket.emit('unsubscribed', { workroom_id: msg.workroom_id });
     });
 
@@ -100,6 +109,8 @@ export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
     // ── disconnect ───────────────────────────────────────────────────────────
     socket.on('disconnect', (reason) => {
       workroomBroadcaster.unsubscribeAll(subscriber);
+      for (const [widKey, uid] of userSubs) userUnsubscribed(widKey, uid);
+      userSubs.clear();
       console.log(`[WS] client disconnected: ${socket.id} reason=${reason}`);
     });
   });

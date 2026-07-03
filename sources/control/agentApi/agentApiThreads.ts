@@ -35,6 +35,8 @@ import { db } from '@/storage/db';
 import { authorizeAgentApi } from './agentApiAuth';
 import { resolveAgentChannelTarget } from './agentApiTargets';
 import { sendMessageTransaction } from '@/control/messages/sendMessageTransaction';
+import { resolveContentMentions } from '@/control/messages/messageRoutes';
+import { notifyMentionedUsers } from '@/control/notifications/notify';
 import { writeThreadReplyEventAndBroadcast } from '@/control/messages/writeThreadReplyEventAndBroadcast';
 import {
   resolveSenderDisplayNames,
@@ -211,6 +213,11 @@ export async function agentApiThreads(app: FastifyInstance) {
         .send({ error: { code: 'NOT_A_MEMBER', message: 'Agent is not a member of this channel' } });
     }
 
+    // Resolve @-mentions in agent THREAD replies too — this path stored empty
+    // mentions, so "@Kris …" inside a task thread never notified the human and
+    // never surfaced in their activity feed (bit us on task #3's review ping).
+    const resolved = await resolveContentMentions(parent.channelId, content);
+
     const result = await sendMessageTransaction({
       channelId: parent.channelId,
       workroomId: parent.workroomId,
@@ -219,6 +226,8 @@ export async function agentApiThreads(app: FastifyInstance) {
       content,
       clientIdempotencyKey,
       parentMessageId: parent.id,
+      mentions: resolved.agentIds,
+      userMentions: resolved.userIds,
       ...(attachmentIds && attachmentIds.length > 0 ? { attachmentIds } : {}),
     });
 
@@ -249,6 +258,16 @@ export async function agentApiThreads(app: FastifyInstance) {
       content,
       idempotent: result.idempotent,
     });
+
+    if (!result.idempotent && resolved.userIds.length > 0) {
+      notifyMentionedUsers({
+        mentionedUserIds: resolved.userIds,
+        senderUserId: null,
+        target: { workroomId: parent.workroomId, channelId: parent.channelId, messageId: result.id, threadId: parent.id },
+        title: 'You were mentioned',
+        body: content.slice(0, 200),
+      }).catch((err) => console.error('[agentApiThreads] mention push failed', err));
+    }
 
     return reply.code(201).send({
       ...(await fetchFormattedMessage(result.id))!,

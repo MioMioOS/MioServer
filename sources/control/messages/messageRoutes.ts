@@ -229,7 +229,7 @@ async function fetchFormattedMessage(id: string) {
       attachmentIds: true,
       embeddedCardType: true,
       embeddedCardId: true,
-      threadReplyCount: true,
+      threadReplyCount: true, lastThreadReplyAt: true,
       createdAt: true,
       channelId: true,
       parentMessageId: true,
@@ -794,7 +794,7 @@ export async function messageRoutes(app: FastifyInstance) {
       select: {
         id: true, seq: true, senderKind: true, senderId: true, content: true,
         mentions: true, attachmentIds: true, embeddedCardType: true, embeddedCardId: true,
-        threadReplyCount: true, createdAt: true, channelId: true, parentMessageId: true,
+        threadReplyCount: true, lastThreadReplyAt: true, createdAt: true, channelId: true, parentMessageId: true,
       },
     });
     const hasMore = rows.length > requestedLimit;
@@ -913,6 +913,22 @@ export async function messageRoutes(app: FastifyInstance) {
       return reply.code(500).send({ error: { code: 'INTERNAL_ERROR', message: 'Internal error' } });
     }
 
+    // Thread-owner routing (human replies only): an un-addressed reply inside a
+    // task thread defaults to the TASK OWNER — no PM relay hop. @-mentions win.
+    let threadWake: string[] | undefined;
+    if (senderKind === 'user') {
+      if (agentMentions.length > 0) {
+        threadWake = agentMentions;
+      } else {
+        const owned = await db.controlTask.findFirst({
+          where: { parentMessageId: parentId, ownerInstanceId: { not: null } },
+          orderBy: { createdAt: 'asc' },
+          select: { ownerInstanceId: true },
+        });
+        if (owned?.ownerInstanceId) threadWake = [owned.ownerInstanceId];
+      }
+    }
+
     // Post-commit write-before-broadcast for thread.reply (skipped on idempotent replay).
     await writeThreadReplyEventAndBroadcast({
       workroomId: wid,
@@ -924,6 +940,7 @@ export async function messageRoutes(app: FastifyInstance) {
       senderId,
       content,
       idempotent: result.idempotent,
+      ...(threadWake !== undefined ? { wakeAgentIds: threadWake } : {}),
     });
 
     // Push @-mentions for thread replies too — without this, mentioning someone
@@ -1150,7 +1167,9 @@ export async function messageRoutes(app: FastifyInstance) {
             where: {
               workroomId: wid,
               channelId: { in: visibleChannelIds },
-              parentMessageId: null,
+              // Thread replies INCLUDED: an @-mention inside a task thread is a
+              // first-class notification (PM pinging the human for review lives
+              // there). thread_id on the item deep-links straight into it.
               OR: mentionOr,
             },
             orderBy: { createdAt: 'desc' },
@@ -1173,10 +1192,10 @@ export async function messageRoutes(app: FastifyInstance) {
         // NB: no parentMessageId filter — task lifecycle system messages are often
         // posted INSIDE the task thread (a reply), so restricting to top-level would
         // drop most "→ in_progress" / "→ done" events.
-        // "开始" = a task actually STARTS work (claimed → in_progress); creation ("📋 …
-        // new task created") is intentionally EXCLUDED (too noisy, not a "start").
+        // ONLY completion surfaces ("任务只有完成的时候才提醒" — start/in_progress
+        // transitions were pure noise in the feed). Creation is excluded too.
         senderKind: 'system',
-        OR: [{ content: { endsWith: '→ in_progress' } }, { content: { endsWith: '→ done' } }],
+        content: { endsWith: '→ done' },
       },
       orderBy: { createdAt: 'desc' },
       take: 50,
@@ -1225,15 +1244,40 @@ export async function messageRoutes(app: FastifyInstance) {
       };
     });
 
+    // Enrich task events with the real task (title, owner, thread anchor) so the
+    // feed can show WHAT completed and clicking can open the task's thread —
+    // "task #3 → done" alone told the user nothing.
+    const taskNumBy = new Map<string, number>();
+    for (const r of taskRows) {
+      const m = /task #(\d+)/.exec(r.content);
+      if (m) taskNumBy.set(r.id, Number(m[1]));
+    }
+    const nums = [...new Set(taskNumBy.values())];
+    const taskMeta = nums.length
+      ? await db.controlTask.findMany({
+          where: { workroomId: wid, number: { in: nums } },
+          select: {
+            number: true, channelId: true, title: true, parentMessageId: true,
+            ownerAgent: { select: { displayName: true } },
+          },
+        })
+      : [];
+    const taskByChanNum = new Map(taskMeta.map((t) => [`${t.channelId}:${t.number}`, t]));
+
     const taskItems: ActivityItem[] = taskRows.map((r) => {
       const done = r.content.trimEnd().endsWith('→ done');
+      const num = taskNumBy.get(r.id);
+      const t = num !== undefined ? taskByChanNum.get(`${r.channelId}:${num}`) : undefined;
       return {
         id: `act_${r.id}`, message_id: r.id, handled: handledByMessage.get(r.id) ?? false,
         type: done ? 'task_done' : 'task_started',
         workroom_id: r.workroomId, channel_id: r.channelId,
         channel_name: channelNameById.get(r.channelId) ?? null,
-        thread_id: r.parentMessageId ?? null, sender_display_name: null,
-        title: done ? 'Task completed' : 'New task',
+        // Prefer the task's own thread anchor: clicking the feed row should land
+        // in the task conversation, not just the channel.
+        thread_id: t?.parentMessageId ?? r.parentMessageId ?? null,
+        sender_display_name: t?.ownerAgent?.displayName ?? null,
+        title: t && num !== undefined ? `#${num} ${t.title}` : (done ? 'Task completed' : 'New task'),
         body: previewText(r.content, 200), created_at: r.createdAt,
       };
     });
@@ -1330,20 +1374,23 @@ export async function messageRoutes(app: FastifyInstance) {
     const uuidCallerKeys = callerKeys.filter((k) => uuidRe.test(k));
     const userMentionKeys = guard.actor.kind === 'user' ? [guard.actor.userId] : [];
 
-    if (uuidCallerKeys.length === 0 && userMentionKeys.length === 0) {
-      return reply.code(200).send({ ok: true, marked: 0 });
-    }
-
     const mentionOr: Prisma.ControlMessageWhereInput[] = [];
     if (uuidCallerKeys.length > 0) mentionOr.push({ mentions: { hasSome: uuidCallerKeys } });
     if (userMentionKeys.length > 0) mentionOr.push({ userMentions: { hasSome: userMentionKeys } });
+
+    // Cover the SAME item set the feed shows: mentions (thread replies included)
+    // PLUS task-completion events. The old version only matched top-level
+    // mentions, so with a feed full of "任务完成" rows the button was a no-op.
+    const orArms: Prisma.ControlMessageWhereInput[] = [
+      ...mentionOr,
+      { senderKind: 'system', content: { endsWith: '→ done' } },
+    ];
 
     const rows = await db.controlMessage.findMany({
       where: {
         workroomId: wid,
         channelId: { in: visibleChannelIds },
-        parentMessageId: null,
-        OR: mentionOr,
+        OR: orArms,
       },
       select: { id: true },
     });
