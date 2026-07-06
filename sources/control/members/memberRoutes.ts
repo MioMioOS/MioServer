@@ -113,7 +113,10 @@ export async function memberRoutes(app: FastifyInstance) {
     }
 
     const agents = await db.controlAgent.findMany({
-      where: { orgId },
+      // machineId null = soft-deleted (the delete route unbinds the machine).
+      // The row is kept so historical messages still resolve the sender name,
+      // but the roster must not resurrect it — "点了移除还在" bug.
+      where: { orgId, machineId: { not: null } },
       select: { id: true, displayName: true, name: true, role: true, status: true, machineId: true, runtime: true, model: true, description: true, capabilities: true },
       orderBy: [{ displayName: 'asc' }],
     });
