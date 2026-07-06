@@ -164,11 +164,11 @@ export async function machineRoutes(app: FastifyInstance) {
    */
   app.post('/api/v1/machines/heartbeat', {
     schema: {
-      body: z.object({ going_offline: z.boolean().optional() }).optional(),
+      body: z.object({ going_offline: z.boolean().optional(), usage: z.record(z.string(), z.unknown()).optional() }).optional(),
     },
   }, async (request, reply) => {
-    const goingOffline =
-      (request.body as { going_offline?: boolean } | undefined)?.going_offline === true;
+    const body = request.body as { going_offline?: boolean; usage?: Record<string, unknown> } | undefined;
+    const goingOffline = body?.going_offline === true;
     // Offline path verifies WITHOUT the implicit bump so the epoch write wins.
     const machine = await verifyMachineToken(request.headers.authorization, {
       bump: !goingOffline,
@@ -176,6 +176,14 @@ export async function machineRoutes(app: FastifyInstance) {
     if (!machine) {
       return reply.code(401).send({
         error: { code: 'INVALID_MACHINE_TOKEN', message: 'Invalid or expired machine token.' },
+      });
+    }
+    if (body?.usage && !goingOffline) {
+      // Daemon-reported Claude/Codex subscription usage — stored verbatim for
+      // display (workroom computers API). Never interpreted server-side.
+      await db.controlMachine.update({
+        where: { id: machine.id },
+        data: { usageSnapshot: body.usage as object },
       });
     }
     if (goingOffline) {

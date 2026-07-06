@@ -10,6 +10,7 @@
  */
 
 import { db } from '@/storage/db';
+import { OFFICIAL_CHANNEL_ID, OFFICIAL_ANNOUNCER_USER_ID, OFFICIAL_ANNOUNCER_NAME } from '@/control/officialChannel';
 import { serverToSlockStatus } from '@/control/tasks/slockTaskStatus';
 
 // ── resolveSenderDisplayNames ────────────────────────────────────────────────
@@ -196,7 +197,10 @@ export function formatMessage(
     seq: msg.seq.toString(),
     sender_kind: msg.senderKind,
     sender_id: msg.senderId,
-    sender_display_name: senderNames.get(msg.senderId) ?? null,
+    sender_display_name:
+      msg.channelId === OFFICIAL_CHANNEL_ID && msg.senderId === OFFICIAL_ANNOUNCER_USER_ID
+        ? OFFICIAL_ANNOUNCER_NAME // 官方频道里 owner 以产品之声出现
+        : senderNames.get(msg.senderId) ?? null,
     content: msg.content,
     mentions: msg.mentions,
     attachment_ids: msg.attachmentIds,

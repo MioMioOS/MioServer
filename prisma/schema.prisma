@@ -435,6 +435,9 @@ model ControlMachine {
   tokenExpiresAt DateTime    @map("token_expires_at")
   boundAt        DateTime?   @map("bound_at") // when bind-org was called
   lastSeenAt     DateTime?   @map("last_seen_at")
+  // Latest Claude/Codex subscription-usage snapshot reported by the daemon's
+  // heartbeat ({sampled_at, claude:{...}, codex:{...}}). Display-only.
+  usageSnapshot  Json?       @map("usage_snapshot")
   createdAt      DateTime    @default(now()) @map("created_at")
 
   sessions      ControlSession[]

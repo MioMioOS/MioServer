@@ -182,6 +182,7 @@ export async function agentRoutes(app: FastifyInstance) {
         platform: true,
         arch: true,
         lastSeenAt: true,
+        usageSnapshot: true,
         // linkedDevices = monitoring Devices bridged to this ControlMachine
         // (Device.controlMachineId). A terminal-only daemon (`mio-agent login`
         // with no MioIsland) has NONE; a MioIsland-managed Mac registers a
@@ -205,6 +206,8 @@ export async function agentRoutes(app: FastifyInstance) {
         // monitoring) from terminal-only daemons, and show a precise last-seen.
         managed_by_mioisland: managed,
         last_seen_at: m.lastSeenAt ? m.lastSeenAt.toISOString() : null,
+        // Claude/Codex subscription usage last reported by this machine's daemon.
+        usage: m.usageSnapshot ?? null,
         capabilities: {
           workspace: true, // it IS a ControlMachine → always a workspace daemon
           monitoring: managed, // session monitoring only when a MioIsland Device is bridged

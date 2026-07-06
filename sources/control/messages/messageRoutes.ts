@@ -327,7 +327,7 @@ export async function messageRoutes(app: FastifyInstance) {
     if (!guard.ok) return reply.code(guard.status).send({ error: guard.error });
 
     // Parse query params.
-    const query = request.query as { after_seq?: string; limit?: string };
+    const query = request.query as { after_seq?: string; before_seq?: string; limit?: string };
 
     let afterSeq: bigint | undefined;
     if (query.after_seq !== undefined) {
@@ -335,6 +335,17 @@ export async function messageRoutes(app: FastifyInstance) {
         return reply.code(400).send({ error: { code: 'INVALID_AFTER_SEQ', message: 'after_seq must be a non-negative integer' } });
       }
       afterSeq = BigInt(query.after_seq);
+    }
+
+    // Upward history paging: before_seq → the page of OLDER messages ending
+    // just before that seq (asc order preserved). Mutually exclusive with
+    // after_seq (before wins if both are sent).
+    let beforeSeq: bigint | undefined;
+    if (query.before_seq !== undefined) {
+      if (!/^\d+$/.test(query.before_seq)) {
+        return reply.code(400).send({ error: { code: 'INVALID_BEFORE_SEQ', message: 'before_seq must be a non-negative integer' } });
+      }
+      beforeSeq = BigInt(query.before_seq);
     }
 
     const requestedLimit = query.limit !== undefined
@@ -355,7 +366,17 @@ export async function messageRoutes(app: FastifyInstance) {
     let page: Awaited<ReturnType<typeof db.controlMessage.findMany>>;
     let hasMore: boolean;
 
-    if (afterSeq !== undefined) {
+    if (beforeSeq !== undefined) {
+      const rows = await db.controlMessage.findMany({
+        where: { channelId: cid, seq: { lt: beforeSeq }, parentMessageId: null },
+        orderBy: { seq: 'desc' },
+        take: requestedLimit + 1,
+      });
+      hasMore = rows.length > requestedLimit;
+      const pageDesc = rows.slice(0, requestedLimit);
+      pageDesc.reverse();
+      page = pageDesc;
+    } else if (afterSeq !== undefined) {
       const rows = await db.controlMessage.findMany({
         // S2 §3/§5: replies (parentMessageId set) are excluded from the main timeline.
         where: { channelId: cid, seq: { gt: afterSeq }, parentMessageId: null },

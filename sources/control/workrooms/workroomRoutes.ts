@@ -16,6 +16,7 @@
  */
 
 import { FastifyInstance } from 'fastify';
+import { OFFICIAL_WORKROOM_ID, OFFICIAL_CHANNEL_ID } from '@/control/officialChannel';
 import { db } from '@/storage/db';
 import { resolveUserSession } from '@/auth/userSession/resolveUserSession';
 import { USER_SESSION_TOKEN_PREFIX } from '@/auth/userSession/tokenMint';
@@ -25,6 +26,17 @@ import { resolveActor } from '@/auth/userOrMachine/resolveActor';
 import { visibleChannels } from '@/control/channels/channelVisibility';
 
 export async function workroomRoutes(app: FastifyInstance) {
+  /**
+   * GET /api/v1/official-channel — where the global announcements channel
+   * lives. Any authenticated user (they are all auto-enrolled members, so the
+   * regular workroom-scoped message APIs work with these ids directly).
+   */
+  app.get('/api/v1/official-channel', async () => ({
+    workroom_id: OFFICIAL_WORKROOM_ID,
+    channel_id: OFFICIAL_CHANNEL_ID,
+    name: '官方',
+  }));
+
   /**
    * POST /api/v1/orgs/:orgId/workrooms
    * Create a new workroom for an org.

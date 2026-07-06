@@ -20,6 +20,7 @@
  *    Solo-owned workrooms are LEFT ORPHANED in this slice — see file footer.
  */
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify';
+import { OFFICIAL_WORKROOM_ID } from '@/control/officialChannel';
 import { Prisma } from '@prisma/client';
 import { db } from '@/storage/db';
 import { verifyPassword, hashPassword, DUMMY_PASSWORD_HASH } from './passwordHash';
@@ -383,6 +384,15 @@ export const userSessionRoutes: FastifyPluginAsync = async (app) => {
             // User row vanished beneath a still-valid session — treat as logged out.
             return reply.code(401).send({ error: { code: 'INVALID_SESSION' } });
         }
+        // Official channel auto-enroll: every user becomes a member of the
+        // global "Mio 官方" workroom on first session load (idempotent upsert,
+        // fire-and-forget — never gates the response).
+        db.userWorkroomMembership.upsert({
+            where: { userId_workroomId: { userId: user.id, workroomId: OFFICIAL_WORKROOM_ID } },
+            create: { userId: user.id, workroomId: OFFICIAL_WORKROOM_ID, role: 'member' },
+            update: {},
+        }).catch(() => { /* official workroom absent in this deployment — fine */ });
+
         const workrooms = await loadWorkrooms(user.id);
         // Sliding refresh — fire-and-forget so the response isn't gated on the
         // write. Throttled to once / 12h per session.
