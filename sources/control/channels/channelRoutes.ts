@@ -199,6 +199,24 @@ async function resolveChannelReadActor(
   return { ok: true, viewerId: machine.id, viewerKind: 'machine' };
 }
 
+/** Per-channel unread counts for a USER viewer: messages newer than the
+ *  caller's read cursor, excluding own + system messages and thread replies. */
+async function unreadCountsFor(userId: string, channelIds: string[]): Promise<Map<string, number>> {
+  if (channelIds.length === 0) return new Map();
+  const rows = await db.$queryRaw<Array<{ channel_id: string; n: bigint }>>`
+    SELECT m.channel_id, count(*)::bigint AS n
+    FROM control_messages m
+    LEFT JOIN control_channel_reads r
+      ON r.channel_id = m.channel_id AND r.user_id = ${userId}
+    WHERE m.channel_id = ANY(${channelIds}::uuid[])
+      AND m.seq > COALESCE(r.last_read_seq, 0)
+      AND m.sender_id <> ${userId}
+      AND m.sender_kind <> 'system'
+      AND m.parent_message_id IS NULL
+    GROUP BY m.channel_id`;
+  return new Map(rows.map((r) => [r.channel_id, Number(r.n)]));
+}
+
 export async function channelRoutes(app: FastifyInstance) {
   /**
    * GET /api/v1/workrooms/:wid/channels
@@ -251,6 +269,9 @@ export async function channelRoutes(app: FastifyInstance) {
     const memberCountMap = new Map<string, number>(
       memberCounts.map((row) => [row.channelId, row._count.channelId]),
     );
+    const unreadMap = guard.viewerKind === 'user'
+      ? await unreadCountsFor(guard.viewerId, channelIds)
+      : new Map<string, number>();
     const totalAttention = needsHumanActions + pendingApprovals;
 
     const responseChannels = channels.map((ch) => ({
@@ -259,7 +280,7 @@ export async function channelRoutes(app: FastifyInstance) {
       type: ch.type,
       visibility: ch.visibility,
       last_activity_at: ch.lastActivityAt?.toISOString() ?? null,
-      unread_count: 0,
+      unread_count: unreadMap.get(ch.id) ?? 0,
       attention_count: totalAttention,
       member_count: memberCountMap.get(ch.id) ?? 0,
     }));
@@ -332,6 +353,9 @@ export async function channelRoutes(app: FastifyInstance) {
       peerInfo.set(u.id, { name: nm, avatar: generateIdenticon(nm) });
     }
 
+    const dmUnread = guard.viewerKind === 'user'
+      ? await unreadCountsFor(callerId, dmChannels.map((c) => c.id))
+      : new Map<string, number>();
     const dms = dmChannels.map((ch) => {
       const peer = ch.members.find((m) => m.memberId !== callerId)?.memberId ?? null;
       const info = peer ? peerInfo.get(peer) : undefined;
@@ -340,12 +364,42 @@ export async function channelRoutes(app: FastifyInstance) {
         peer_member_id: peer,
         peer_display_name: info?.name ?? null,
         peer_avatar: info?.avatar ?? null,
-        unread_count: 0,
+        unread_count: dmUnread.get(ch.id) ?? 0,
         last_activity_at: ch.lastActivityAt?.toISOString() ?? null,
       };
     });
 
     return { dms };
+  });
+
+  /**
+   * POST /api/v1/workrooms/:wid/channels/:cid/read — advance the caller's read
+   * cursor to `seq` (monotone: never moves backwards). User sessions only;
+   * machine/agent readers do not participate in unread accounting.
+   */
+  app.post('/api/v1/workrooms/:wid/channels/:cid/read', async (request, reply) => {
+    const { wid, cid } = request.params as { wid: string; cid: string };
+    const guard = await resolveChannelReadActor(request, wid);
+    if (!guard.ok) return reply.code(guard.status).send({ error: guard.error });
+    if (guard.viewerKind !== 'user') {
+      return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'User sessions only' } });
+    }
+    const body = request.body as { seq?: unknown } | null;
+    let seq: bigint;
+    try { seq = BigInt(String(body?.seq ?? '')); } catch {
+      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'seq is required' } });
+    }
+    const ch = await db.controlChannel.findUnique({ where: { id: cid }, select: { workroomId: true } });
+    if (!ch || ch.workroomId !== wid) {
+      return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+    }
+    // Monotone upsert: GREATEST keeps a stale tab from rolling the cursor back.
+    await db.$executeRaw`
+      INSERT INTO control_channel_reads (channel_id, user_id, last_read_seq, updated_at)
+      VALUES (${cid}::uuid, ${guard.viewerId}, ${seq}, now())
+      ON CONFLICT (channel_id, user_id)
+      DO UPDATE SET last_read_seq = GREATEST(control_channel_reads.last_read_seq, EXCLUDED.last_read_seq), updated_at = now()`;
+    return reply.send({ ok: true });
   });
 
   /**

@@ -665,6 +665,18 @@ model ControlAttachment {
   @@map("control_attachments")
 }
 
+/// Per-user read cursor for a channel (unread badges). Composite PK; no FK to
+/// channels so deletes stay simple (stale rows are harmless and tiny).
+model ControlChannelRead {
+  channelId   String   @map("channel_id") @db.Uuid
+  userId      String   @map("user_id")
+  lastReadSeq BigInt   @default(0) @map("last_read_seq")
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@id([channelId, userId])
+  @@map("control_channel_reads")
+}
+
 /// Thread attached to a workroom message.
 model ControlThread {
   id              String         @id @default(uuid()) @db.Uuid
