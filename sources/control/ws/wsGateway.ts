@@ -42,7 +42,7 @@
 import { Server as HttpServer } from 'http';
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import { tokenInWorkroom } from '@/control/auth/workroomScopeForToken';
-import { userSubscribed, userUnsubscribed } from './userPresence';
+import { userSubscribed, userUnsubscribed, userActivity } from './userPresence';
 import { workroomBroadcaster, WorkroomSubscriber } from './workroomBroadcaster';
 
 export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
@@ -99,6 +99,14 @@ export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
       const uid = userSubs.get(msg.workroom_id);
       if (uid) { userSubs.delete(msg.workroom_id); userUnsubscribed(msg.workroom_id, uid); }
       socket.emit('unsubscribed', { workroom_id: msg.workroom_id });
+    });
+
+    // ── activity(可见页面的活跃心跳;见 userPresence.ts)──────────────────
+    socket.on('activity', (msg: { workroom_id?: string }) => {
+      const wid = msg?.workroom_id;
+      if (!wid) return;
+      const uid = userSubs.get(wid);
+      if (uid) userActivity(wid, uid);
     });
 
     // ── ping ─────────────────────────────────────────────────────────────────

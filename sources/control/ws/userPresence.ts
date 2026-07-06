@@ -15,6 +15,38 @@ import { workroomBroadcaster } from './workroomBroadcaster';
 import { db } from '@/storage/db';
 
 const counts = new Map<string, Map<string, number>>(); // wid → userId → socket refcount
+// 活跃度层:仅"页面可见"的客户端每 60s 上报 activity。连接≠在线——一个后台
+// 挂几小时的标签页会永远保持 socket(见 07-07 xxy 幽灵在线事故),所以在线的
+// 定义 = 有 socket 且 3 分钟内有活跃心跳。
+const lastActive = new Map<string, Map<string, number>>(); // wid → userId → epoch ms
+const ACTIVE_WINDOW_MS = 3 * 60 * 1000;
+
+function isActive(workroomId: string, userId: string): boolean {
+  const t = lastActive.get(workroomId)?.get(userId);
+  return t !== undefined && Date.now() - t < ACTIVE_WINDOW_MS;
+}
+
+/** 客户端活跃心跳(页面可见时每 60s + 变为可见时立即)。不活跃→活跃才广播。 */
+export function userActivity(workroomId: string, userId: string): void {
+  let m = lastActive.get(workroomId);
+  if (!m) { m = new Map(); lastActive.set(workroomId, m); }
+  const wasActive = isActive(workroomId, userId);
+  m.set(userId, Date.now());
+  const connected = (counts.get(workroomId)?.get(userId) ?? 0) > 0;
+  if (!wasActive && connected) broadcast(workroomId, userId, 'online');
+}
+
+// 后台清扫:活跃窗口过期 → 广播 offline(socket 仍在,重新活跃会再上线)。
+setInterval(() => {
+  for (const [wid, m] of lastActive) {
+    for (const [uid, t] of m) {
+      if (Date.now() - t >= ACTIVE_WINDOW_MS) {
+        m.delete(uid);
+        if ((counts.get(wid)?.get(uid) ?? 0) > 0) broadcast(wid, uid, 'offline');
+      }
+    }
+  }
+}, 30_000).unref();
 
 function broadcast(workroomId: string, userId: string, state: 'online' | 'offline'): void {
   const now = new Date();
@@ -38,17 +70,26 @@ export function userSubscribed(workroomId: string, userId: string): void {
   if (!m) { m = new Map(); counts.set(workroomId, m); }
   const n = (m.get(userId) ?? 0) + 1;
   m.set(userId, n);
-  if (n === 1) broadcast(workroomId, userId, 'online');
+  // 订阅本身不再等于在线:等第一个 activity 心跳(页面可见的客户端会在
+  // subscribe ack 后立即发一次)。后台幽灵标签页只订阅、不心跳 → 不上线。
 }
 
 export function userUnsubscribed(workroomId: string, userId: string): void {
   const m = counts.get(workroomId);
   if (!m) return;
   const n = (m.get(userId) ?? 0) - 1;
-  if (n <= 0) { m.delete(userId); broadcast(workroomId, userId, 'offline'); }
-  else m.set(userId, n);
+  if (n <= 0) {
+    m.delete(userId);
+    const wasActive = isActive(workroomId, userId);
+    lastActive.get(workroomId)?.delete(userId);
+    if (wasActive) broadcast(workroomId, userId, 'offline');
+  } else m.set(userId, n);
 }
 
 export function onlineUserIds(workroomId: string): Set<string> {
-  return new Set(counts.get(workroomId)?.keys() ?? []);
+  const ids = new Set<string>();
+  for (const uid of counts.get(workroomId)?.keys() ?? []) {
+    if (isActive(workroomId, uid)) ids.add(uid);
+  }
+  return ids;
 }
