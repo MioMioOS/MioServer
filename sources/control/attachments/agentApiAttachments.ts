@@ -19,6 +19,7 @@
  */
 
 import type { FastifyInstance } from 'fastify';
+import { cosEnabled, presignGet } from '@/blob/cosStorage';
 import { db } from '@/storage/db';
 import { authorizeAgentApi } from '@/control/agentApi/agentApiAuth';
 import { resolveAgentChannelTarget } from '@/control/agentApi/agentApiTargets';
@@ -148,7 +149,7 @@ export async function agentApiAttachments(app: FastifyInstance) {
 
     const attachment = await db.controlAttachment.findUnique({
       where: { id },
-      select: { data: true, channelId: true, filename: true, mimeType: true, sizeBytes: true },
+      select: { data: true, storageKey: true, channelId: true, filename: true, mimeType: true, sizeBytes: true },
     });
 
     if (!attachment) {
@@ -159,6 +160,10 @@ export async function agentApiAttachments(app: FastifyInstance) {
     // attachment by id — including rows created by other writers that may have no
     // inline data. Guard before Buffer.from(null) (which would throw → 500). Treat a
     // data-less row as "not found" for this inline-bytes API.
+    if (!attachment.data && (attachment as { storageKey?: string | null }).storageKey && cosEnabled()) {
+      const url = await presignGet((attachment as { storageKey?: string | null }).storageKey!);
+      return reply.code(302).header('Location', url).send();
+    }
     if (!attachment.data) {
       return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Attachment has no data' } });
     }

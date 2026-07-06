@@ -25,6 +25,7 @@ import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { verifyMachineToken } from '@/machines/machineRoutes';
 // Single source of truth for the image MIME allowlist (defined in blobRoutes.ts).
 import { ALLOWED_MIME } from '@/blob/blobRoutes';
+import { cosEnabled, cosKeyFor, presignPut, presignGet, cosHead } from '@/blob/cosStorage';
 
 const MAX_DECODED_BYTES = 8 * 1024 * 1024;   // same caps as the agent-api upload route
 const MAX_WIRE_BYTES = 12 * 1024 * 1024;
@@ -97,11 +98,11 @@ export async function userAttachments(app: FastifyInstance) {
     }
 
     // ── Step 2: load attachment ──────────────────────────────────────────────
-    let attachment: { data: Uint8Array | null; workroomId: string; filename: string; mimeType: string } | null = null;
+    let attachment: { data: Uint8Array | null; storageKey: string | null; workroomId: string; filename: string; mimeType: string } | null = null;
     try {
       attachment = await db.controlAttachment.findUnique({
         where: { id },
-        select: { data: true, workroomId: true, filename: true, mimeType: true },
+        select: { data: true, storageKey: true, workroomId: true, filename: true, mimeType: true },
       });
     } catch {
       // Malformed uuid → P2023 → uniform 404
@@ -116,6 +117,12 @@ export async function userAttachments(app: FastifyInstance) {
       return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Attachment not found' } });
     }
 
+    // COS-backed rows (storageKey set, no inline bytes) → 302 to a presigned
+    // GET; the client streams straight from COS, server bandwidth untouched.
+    if (!attachment.data && attachment.storageKey && cosEnabled()) {
+      const url = await presignGet(attachment.storageKey);
+      return reply.code(302).header('Location', url).send();
+    }
     // .data is a nullable Bytes column; rows without inline bytes can't serve binary.
     if (!attachment.data) {
       return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Attachment has no data' } });
@@ -231,5 +238,99 @@ export async function userAttachments(app: FastifyInstance) {
       mime_type: body.mime_type,
       size_bytes: buf.length,
     });
+  });
+
+  /**
+   * POST /api/v1/workrooms/:wid/channels/:cid/attachments/presign — COS 直传第一步。
+   *
+   * Body: { filename, mime_type, size_bytes }
+   * 鉴权/频道守卫与上传路由一致。COS 未启用时 404(客户端回退 base64 旧路)。
+   * 建 pending 行(storageKey 就位、data 空)→ 返回 10 分钟预签名 PUT URL。
+   * 直传上限 20 MiB(直连 COS,不再受服务器带宽/body 限制约束)。
+   */
+  app.post('/api/v1/workrooms/:wid/channels/:cid/attachments/presign', async (request, reply) => {
+    const { wid, cid } = request.params as { wid: string; cid: string };
+    if (!cosEnabled()) {
+      return reply.code(404).send({ error: { code: 'COS_DISABLED', message: 'Direct upload not configured' } });
+    }
+    const authHeader = request.headers.authorization;
+    if (!authHeader?.startsWith(`Bearer ${USER_SESSION_TOKEN_PREFIX}`)) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
+    }
+    const session = await resolveUserSession(authHeader);
+    if (!session) {
+      return reply.code(401).send({ error: { code: 'INVALID_SESSION', message: 'Invalid or expired session' } });
+    }
+    const mem = await db.userWorkroomMembership.findUnique({
+      where: { userId_workroomId: { userId: session.userId, workroomId: wid } },
+    });
+    if (!mem) return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
+    let channel: { id: string; workroomId: string; visibility: string } | null = null;
+    try {
+      channel = await db.controlChannel.findUnique({
+        where: { id: cid }, select: { id: true, workroomId: true, visibility: true },
+      });
+    } catch { channel = null; }
+    if (!channel || channel.workroomId !== wid) {
+      return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Channel not found' } });
+    }
+    if (channel.visibility === 'private') {
+      const cm = await db.controlChannelMember.findUnique({
+        where: { channelId_memberId: { channelId: cid, memberId: session.userId } },
+      });
+      if (!cm) return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Forbidden' } });
+    }
+    const body = request.body as { filename?: unknown; mime_type?: unknown; size_bytes?: unknown } | null;
+    if (!body?.filename || typeof body.filename !== 'string' || body.filename.trim() === '') {
+      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'filename is required' } });
+    }
+    if (!body.mime_type || typeof body.mime_type !== 'string' || !ALLOWED_MIME.has(body.mime_type)) {
+      return reply.code(415).send({ error: { code: 'UNSUPPORTED_MIME', message: `Unsupported mime type: ${String(body.mime_type)}` } });
+    }
+    const size = Number(body.size_bytes);
+    if (!Number.isFinite(size) || size <= 0) {
+      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'size_bytes is required' } });
+    }
+    if (size > 20 * 1024 * 1024) {
+      return reply.code(413).send({ error: { code: 'PAYLOAD_TOO_LARGE', message: 'Direct upload exceeds 20 MiB limit' } });
+    }
+    const attachment = await db.controlAttachment.create({
+      data: {
+        workroomId: wid, channelId: cid,
+        uploaderKind: 'user', uploaderId: session.userId,
+        filename: body.filename, mimeType: body.mime_type,
+        sizeBytes: BigInt(size),
+        // pending: storageKey set below (needs id), data stays null
+      },
+    });
+    const key = cosKeyFor(wid, attachment.id, body.filename);
+    await db.controlAttachment.update({ where: { id: attachment.id }, data: { storageKey: key } });
+    const putUrl = await presignPut(key);
+    return reply.code(201).send({ attachment_id: attachment.id, put_url: putUrl });
+  });
+
+  /**
+   * POST /api/v1/workrooms/:wid/attachments/:id/complete — COS 直传第二步。
+   * HEAD 校验对象已真实存在,回填 sizeBytes(以 COS 为准)。
+   */
+  app.post('/api/v1/workrooms/:wid/attachments/:id/complete', async (request, reply) => {
+    const { wid, id } = request.params as { wid: string; id: string };
+    const guard = await resolveAttachmentReadActor(request, wid);
+    if (!guard.ok) {
+      return reply.code(guard.status).send({ error: { code: guard.code, message: guard.message } });
+    }
+    let att: { workroomId: string; storageKey: string | null } | null = null;
+    try {
+      att = await db.controlAttachment.findUnique({ where: { id }, select: { workroomId: true, storageKey: true } });
+    } catch { att = null; }
+    if (!att || att.workroomId !== wid || !att.storageKey) {
+      return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Attachment not found' } });
+    }
+    const head = cosEnabled() ? await cosHead(att.storageKey) : null;
+    if (!head) {
+      return reply.code(409).send({ error: { code: 'NOT_UPLOADED', message: 'Object not found in storage' } });
+    }
+    await db.controlAttachment.update({ where: { id }, data: { sizeBytes: BigInt(head.size) } });
+    return reply.send({ ok: true, size_bytes: head.size });
   });
 }

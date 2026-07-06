@@ -19,6 +19,7 @@
         "@fastify/cors": "^10.0.1",
         "@prisma/client": "^6.11.1",
         "bcrypt": "^6.0.0",
+        "cos-nodejs-sdk-v5": "^2.15.4",
         "fastify": "^5.2.0",
         "fastify-type-provider-zod": "^4.0.2",
         "jose": "^6.2.2",
