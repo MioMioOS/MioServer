@@ -37,6 +37,10 @@ export interface ClassifyMessageArgs {
   // bypassed, so greetings ("@UI hi") still cannot become tasks. The self-loop
   // guard is also still enforced after the override.
   forceTaskOnHandoff?: boolean;
+  // 无 @ 消息:内容路由已选中的 agent 句柄(隐含 assignee)。放行启发式门的
+  // @ 要求(其余检查保留),并在 LLM 未点名 assignee 时作为默认执行人。
+  // 07-07:「给我把项目下载跑一下」无 @ → 被门拦 → 无 task 无 thread 无续做。
+  impliedAssigneeHandle?: string;
 }
 
 export interface ClassifyMessageResult {
@@ -68,7 +72,7 @@ const CLASSIFIER_MAX_TOKENS = 100;
 const SYSTEM_PROMPT =
   '分类 Slack 消息是否为 task。返回 JSON：' +
   '{"is_task":bool,"assignee_handle":"@xxx"|null,"task_title":"<60字"|null}。' +
-  '「要求产出/实现/制作/修复一个具体交付物」的单次请求→true（assignee 是被 @ 的成员 handle）；' +
+  '「要求产出/实现/制作/修复一个具体交付物」的单次请求→true（assignee 是被 @ 的成员 handle；无 @ 时若 routed_to 存在则用它）；' +
   '「要求执行一个具体操作并回报结果」（如：运行命令、切换分支、部署、改配置、拉代码）也→true——' +
   '祈使句+动作+回报=task，即使动作很小；' +
   '发送者自己的状态汇报/收到确认/闲聊/反馈→false。' +
@@ -91,6 +95,9 @@ function buildUserMessage(args: ClassifyMessageArgs): string {
   const lines: string[] = [];
   lines.push(`channel: ${args.channelName}`);
   lines.push(`sender: ${args.senderHandle}`);
+  // 无 @ 消息:内容路由已选中的执行人。不改变"是不是 task"的判断标准,只解决
+  // "是 task 但没人被 @"时 assignee 的归属。
+  if (args.impliedAssigneeHandle) lines.push(`routed_to: ${args.impliedAssigneeHandle}`);
   lines.push('members:');
   for (const m of args.channelMembers) {
     lines.push(`  ${m.handle} (${m.role})`);
@@ -121,12 +128,13 @@ const GREETING_WHITELIST = new Set([
   'thanks', 'thank you', '谢谢', '感谢', '辛苦了', '多谢',
 ]);
 
-function passesHeuristicGate(content: string): boolean {
+function passesHeuristicGate(content: string, hasImpliedAssignee = false): boolean {
   const trimmed = content.trim();
   // Empty / too short → never a task.
   if (trimmed.length < 5) return false;
-  // No @-mention → never a task (Slock-style: tasks require an assignee).
-  if (!/@\S/.test(trimmed)) return false;
+  // No @-mention → never a task, UNLESS content-routing already picked an
+  // assignee (implied). Greeting/emoji checks below still apply either way.
+  if (!/@\S/.test(trimmed) && !hasImpliedAssignee) return false;
   // Strip @-mentions and check what's left.
   const rest = trimmed.replace(/@\S+/g, '').trim().toLowerCase();
   // If after removing @-mentions the body is empty or a pure greeting → not a task.
@@ -144,7 +152,7 @@ export async function classifyMessageForTask(
     `[messageClassifier] fire channel=${args.channelName} sender=${args.senderHandle} content_len=${args.content.length} members=${args.channelMembers.length} recent=${args.recentMessages.length}`,
   );
   // Heuristic pre-filter: reject obvious non-tasks BEFORE spending an LLM call.
-  if (!passesHeuristicGate(args.content)) {
+  if (!passesHeuristicGate(args.content, !!args.impliedAssigneeHandle)) {
     console.info(
       `[messageClassifier] heuristic-gate skip is_task=false (no LLM call)`,
     );

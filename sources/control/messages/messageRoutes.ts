@@ -667,22 +667,24 @@ export async function messageRoutes(app: FastifyInstance) {
     // hand-off. Runs CONCURRENTLY with the classifier (both ~0.5-1.5s) so it
     // adds no serial latency. Falls back to the elected core / oldest agent.
     const needsRouting = !result.idempotent && senderKind === 'user' && mergedAgentMentions.length === 0;
-    const [, routedAgentId] = await Promise.all([
-      result.idempotent
-        ? Promise.resolve(null)
-        : classifyAndMaybeCreateTask({
-            workroomId: wid,
-            channelId: cid,
-            messageId: result.id,
-            parentMessageId: null,
-            senderKind,
-            senderId,
-            content: body.content,
-          }),
-      needsRouting
-        ? routeMessageToAgent(cid, body.content).catch(() => null)
-        : Promise.resolve(null),
-    ]);
+    // 无 @ 消息:先路由(~0.5s)再分类——路由结果作为隐含 assignee 喂给分类器,
+    // 让「无 @ 但明显是派活」的消息也能建任务(07-07:无@→无task→无thread→
+    // agent 说完"我来做"就 idle 没有任务驱动续做)。有 @ 的消息路径不变。
+    const routedAgentId = needsRouting
+      ? await routeMessageToAgent(cid, body.content).catch(() => null)
+      : null;
+    if (!result.idempotent) {
+      await classifyAndMaybeCreateTask({
+        workroomId: wid,
+        channelId: cid,
+        messageId: result.id,
+        parentMessageId: null,
+        senderKind,
+        senderId,
+        content: body.content,
+        impliedAssigneeAgentId: routedAgentId,
+      });
+    }
 
     // Post-commit write-before-broadcast (runs AFTER classifier so the task +
     // system message are persisted before the daemon sees the original message).

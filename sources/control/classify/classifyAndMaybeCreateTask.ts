@@ -42,6 +42,9 @@ export interface ClassifyAndMaybeCreateTaskInput {
   // handoff kept on main), a passing heuristic gate is enough to create a task
   // even if the probabilistic LLM gate declines. See messageClassifier.ts.
   forceTaskOnHandoff?: boolean;
+  // 内容路由为无 @ 消息选中的 agent(uuid)。作为隐含 assignee 放行分类门,
+  // 并在 LLM 未点名执行人时兜底为任务 owner。
+  impliedAssigneeAgentId?: string | null;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -197,6 +200,9 @@ export async function classifyAndMaybeCreateTask(
       resolveSenderHandle(input.senderKind, input.senderId),
     ]);
 
+    const impliedMember = input.impliedAssigneeAgentId
+      ? members.find((m) => m.agentId === input.impliedAssigneeAgentId)
+      : undefined;
     const result = await classifyMessageForTask({
       content: input.content,
       channelName: channel.name,
@@ -204,6 +210,7 @@ export async function classifyAndMaybeCreateTask(
       recentMessages: recent,
       senderHandle,
       forceTaskOnHandoff: input.forceTaskOnHandoff,
+      ...(impliedMember ? { impliedAssigneeHandle: impliedMember.handle } : {}),
     });
 
     if (!result.is_task || !result.task_title) {
@@ -243,6 +250,9 @@ export async function classifyAndMaybeCreateTask(
         );
       }
     }
+
+    // LLM 没点名或没解析出执行人 → 用内容路由选中的 agent 兜底。
+    if (!ownerAgentId && impliedMember?.agentId) ownerAgentId = impliedMember.agentId;
 
     const creatorAgentId =
       input.senderKind === 'agent' && UUID_RE.test(input.senderId) ? input.senderId : null;
