@@ -19,6 +19,8 @@ const SECRET_ID = process.env.COS_SECRET_ID ?? '';
 const SECRET_KEY = process.env.COS_SECRET_KEY ?? '';
 const BUCKET = process.env.COS_BUCKET ?? '';
 const REGION = process.env.COS_REGION ?? '';
+// 可选:自定义加速域(如 image.wdao.chat,CNAME 到桶)。设置后预签名 URL 用它。
+const DOMAIN = process.env.COS_DOMAIN ?? '';
 
 const enabled = !!(SECRET_ID && SECRET_KEY && BUCKET && REGION);
 const cos = enabled ? new COS({ SecretId: SECRET_ID, SecretKey: SECRET_KEY }) : null;
@@ -35,7 +37,10 @@ export function cosKeyFor(workroomId: string, attachmentId: string, filename: st
 function presign(key: string, method: 'PUT' | 'GET', expiresSec: number): Promise<string> {
   return new Promise((resolve, reject) => {
     cos!.getObjectUrl(
-      { Bucket: BUCKET, Region: REGION, Key: key, Method: method, Sign: true, Expires: expiresSec },
+      {
+        Bucket: BUCKET, Region: REGION, Key: key, Method: method, Sign: true, Expires: expiresSec,
+        ...(DOMAIN ? { Domain: DOMAIN, Protocol: 'https:' } : {}),
+      },
       (err, data) => (err ? reject(err) : resolve(data.Url)),
     );
   });

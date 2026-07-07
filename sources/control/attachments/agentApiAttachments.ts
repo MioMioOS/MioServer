@@ -161,8 +161,21 @@ export async function agentApiAttachments(app: FastifyInstance) {
     // inline data. Guard before Buffer.from(null) (which would throw → 500). Treat a
     // data-less row as "not found" for this inline-bytes API.
     if (!attachment.data && (attachment as { storageKey?: string | null }).storageKey && cosEnabled()) {
+      // agent-api 契约是 JSON base64(daemon 逐字段解析),不能 302 —— 07-07
+      // 教训:daemon 跟着重定向拿到二进制,JSON 解析失败,agent 收不到图。
+      // server 侧代取(与 COS 同地域走内网,快且免公网流量)再按原契约返回。
       const url = await presignGet((attachment as { storageKey?: string | null }).storageKey!);
-      return reply.code(302).header('Location', url).send();
+      const r = await fetch(url);
+      if (!r.ok) {
+        return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Attachment bytes unavailable' } });
+      }
+      const buf = Buffer.from(await r.arrayBuffer());
+      return reply.send({
+        filename: attachment.filename,
+        mime_type: attachment.mimeType,
+        size_bytes: buf.length,
+        data_base64: buf.toString('base64'),
+      });
     }
     if (!attachment.data) {
       return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Attachment has no data' } });
