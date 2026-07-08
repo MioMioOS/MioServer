@@ -4,6 +4,8 @@ Self-hosted relay server for [MioIsland](https://github.com/MioMioOS/MioIsland) 
 
 Handles device pairing, real-time session sync via Socket.io, APNs push notifications, and Live Activity updates.
 
+> **Open core.** 这是 MioServer 的公开**开源基础版**,可自托管,按 [CC BY-NC 4.0](LICENSE.md) 授权。持续迭代与生产版本为私有仓 `MioMioOS/MioServer-Online`。
+
 ## Quick Start
 
 ```bash
