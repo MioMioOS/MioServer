@@ -106,7 +106,10 @@ export async function humanMemberRoutes(app: FastifyInstance) {
       }
 
       const created = await db.userWorkroomMembership.create({
-        data: { userId: invitee.id, workroomId: wid, role: 'member' },
+        data: { userId: invitee.id, workroomId: wid, role: 'guest' },
+                // 07-08 隐私修正:受邀真人默认 guest —— 只能看到被明确拉入的
+                // 频道(visibleChannels 的 guest 分支),而不是所有公开频道。
+                // owner 在频道成员弹窗里逐频道拉人。
       });
 
       return reply.code(201).send({
