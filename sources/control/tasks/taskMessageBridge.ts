@@ -17,6 +17,7 @@
 
 import { insertSystemMessage } from '@/control/messages/insertSystemMessage';
 import { writeEventAndBroadcast } from '@/control/messages/writeEventAndBroadcast';
+import { db } from '@/storage/db';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -52,6 +53,31 @@ function composeText(input: TaskLifecycleInput): string {
   return `task #${task.number} → ${task.status}`;
 }
 
+/** 状态变化行升级为全景摘要:✅ 刚完成 · ⏳ 进行中 · 👀 待审 —— 用户不点
+ *  thread 也能看到整个频道的任务面貌(07-08 反馈:主频道全是裸状态行,
+ *  且僵尸任务不可见)。查询失败时回落到单任务行,永不阻塞。 */
+async function composeStatusDigest(channelId: string, task: { number: number; status: string }): Promise<string> {
+  try {
+    const open = await db.controlTask.findMany({
+      where: { channelId, status: { in: ['in_progress', 'in_review', 'todo'] } },
+      select: { number: true, status: true },
+      orderBy: { number: 'asc' },
+    });
+    const others = open.filter((t) => t.number !== task.number);
+    const inProg = others.filter((t) => t.status === 'in_progress').map((t) => `#${t.number}`);
+    const inRev = others.filter((t) => t.status === 'in_review').map((t) => `#${t.number}`);
+    const todo = others.filter((t) => t.status === 'todo').map((t) => `#${t.number}`);
+    const ICON: Record<string, string> = { done: '✅', in_review: '👀', in_progress: '⏳', todo: '📥', canceled: '🚫', closed: '🚫' };
+    const parts = [`${ICON[task.status] ?? ''} #${task.number} → ${task.status}`];
+    if (inProg.length) parts.push(`⏳ 进行中 ${inProg.join(' ')}`);
+    if (inRev.length) parts.push(`👀 待审 ${inRev.join(' ')}`);
+    if (todo.length) parts.push(`📥 排队 ${todo.join(' ')}`);
+    return parts.join(' · ');
+  } catch {
+    return `task #${task.number} → ${task.status}`;
+  }
+}
+
 // ── Bridge ────────────────────────────────────────────────────────────────────
 
 /**
@@ -74,7 +100,9 @@ export async function emitTaskLifecycleMessage(input: TaskLifecycleInput): Promi
   }
 
   const { workroomId, channelId } = input;
-  const content = composeText(input);
+  const content = input.kind === 'status'
+    ? await composeStatusDigest(channelId, input.task)
+    : composeText(input);
 
   try {
     // Step 1: persist the row (row exists before broadcast — write-before-broadcast).

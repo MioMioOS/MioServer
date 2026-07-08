@@ -673,18 +673,11 @@ export async function messageRoutes(app: FastifyInstance) {
     const routedAgentId = needsRouting
       ? await routeMessageToAgent(cid, body.content).catch(() => null)
       : null;
-    if (!result.idempotent) {
-      await classifyAndMaybeCreateTask({
-        workroomId: wid,
-        channelId: cid,
-        messageId: result.id,
-        parentMessageId: null,
-        senderKind,
-        senderId,
-        content: body.content,
-        impliedAssigneeAgentId: routedAgentId,
-      });
-    }
+    // 07-08 架构调整:「是不是任务」的判断权移交给被路由/被 @ 的 agent 本人
+    // (Opus/GPT-5 的判断力 >> doubao-mini;详见任务协议 in systemPrompt)。
+    // 豆包仅保留无 @ 消息的路由职责;agent 用 mio task create --self --attach
+    // 自建任务,thread 锚定与分类器时代完全一致。agent 间显式交接的建任务
+    // 路径(agent-api, forceTaskOnHandoff)不受影响。
 
     // Post-commit write-before-broadcast (runs AFTER classifier so the task +
     // system message are persisted before the daemon sees the original message).

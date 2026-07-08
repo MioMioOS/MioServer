@@ -177,6 +177,7 @@ export async function agentApiTasks(app: FastifyInstance) {
       title?: unknown;
       titles?: unknown;
       attach_to_message_id?: unknown;
+      self?: unknown; // true → 任务归创建者本人,born in_progress(新任务协议:agent 自判自建)
     } | null;
 
     if (!body?.channel || typeof body.channel !== 'string') {
@@ -257,9 +258,10 @@ export async function agentApiTasks(app: FastifyInstance) {
             workroomId,
             channelId,
             title,
-            status: 'todo',
+            status: body.self === true ? 'in_progress' : 'todo',
             number: num,
             creatorInstanceId: auth.agent.id,
+            ...(body.self === true ? { ownerInstanceId: auth.agent.id } : {}),
             // attachToMessageId is gated to single-title creates above, so applying
             // it to every iteration is correct (loop runs exactly once).
             parentMessageId: attachToMessageId,
