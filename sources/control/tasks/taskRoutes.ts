@@ -203,6 +203,7 @@ export async function taskRoutes(app: FastifyInstance) {
           // must not change). The Slock (iOS) vocab is exposed as `slock_status`; the iOS
           // LiveTaskRepository reads `slock_status`.
           id: t.id,
+          number: t.number,
           channel_id: t.channelId,
           slock_status: serverToSlockStatus(t.status),
           assignee_id: t.ownerInstanceId,
