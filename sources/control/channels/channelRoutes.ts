@@ -279,6 +279,7 @@ export async function channelRoutes(app: FastifyInstance) {
       name: ch.name,
       type: ch.type,
       visibility: ch.visibility,
+      linked_channel_id: ch.linkedChannelId,
       last_activity_at: ch.lastActivityAt?.toISOString() ?? null,
       unread_count: unreadMap.get(ch.id) ?? 0,
       attention_count: totalAttention,
@@ -523,6 +524,7 @@ export async function channelRoutes(app: FastifyInstance) {
       visibility?: unknown;
       member_ids?: unknown;
       channel_type?: unknown; // 'standard' | 'client'
+      linked_channel_id?: unknown; // 客户频道关联的内部频道
     } | null;
 
     const name = typeof body?.name === 'string' ? body.name.trim() : '';
@@ -551,6 +553,19 @@ export async function channelRoutes(app: FastifyInstance) {
       : [];
 
     const channelType = body?.channel_type === 'client' ? 'client' : 'standard';
+    // 客户频道必须关联一个同工作区的内部频道(派发目标)。
+    let linkedChannelId: string | null = null;
+    if (channelType === 'client') {
+      const lc = typeof body?.linked_channel_id === 'string' ? body.linked_channel_id : null;
+      if (!lc) {
+        return reply.code(400).send({ error: { code: 'LINKED_REQUIRED', message: '客户频道必须关联一个内部开发频道' } });
+      }
+      const linked = await db.controlChannel.findUnique({ where: { id: lc }, select: { workroomId: true, type: true } });
+      if (!linked || linked.workroomId !== wid || linked.type === 'client' || linked.type === 'dm') {
+        return reply.code(400).send({ error: { code: 'INVALID_LINKED', message: '关联频道无效' } });
+      }
+      linkedChannelId = lc;
+    }
     const { channel, memberCount, events } = await createChannelCore({
       workroomId: wid,
       actorId: actor.actorId,
@@ -559,6 +574,7 @@ export async function channelRoutes(app: FastifyInstance) {
       description,
       memberIds,
       channelType,
+      linkedChannelId,
     });
     broadcastChannelEvents(events);
 

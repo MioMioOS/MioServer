@@ -494,6 +494,8 @@ model ControlChannel {
   name           String
   type           String // "main" | "standard" | "dm"
   visibility     String // "public" | "private"
+  // 客户频道关联的内部开发频道(派发默认/锁定目标)。仅 type='client' 使用。
+  linkedChannelId String?               @map("linked_channel_id") @db.Uuid
   description    String?
   createdBy      String                 @map("created_by") // opaque actor id (non-uuid; e.g. 'system' / operatorSubject)
   archivedAt     DateTime?              @map("archived_at")

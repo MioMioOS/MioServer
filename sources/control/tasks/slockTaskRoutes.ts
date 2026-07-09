@@ -440,9 +440,6 @@ export async function slockTaskRoutes(app: FastifyInstance) {
     const body = request.body as { target_channel_id?: unknown; assignee_agent_id?: unknown } | null;
     const targetChannelId = typeof body?.target_channel_id === 'string' ? body.target_channel_id : null;
     const assigneeId = typeof body?.assignee_agent_id === 'string' ? body.assignee_agent_id : null;
-    if (!targetChannelId) {
-      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'target_channel_id is required' } });
-    }
     const source = await db.controlTask.findUnique({
       where: { id: taskId },
       select: { id: true, workroomId: true, channelId: true, number: true, title: true, description: true, mirrorOfTaskId: true },
@@ -450,8 +447,18 @@ export async function slockTaskRoutes(app: FastifyInstance) {
     if (!source || source.workroomId !== wid || !source.channelId) {
       return reply.code(404).send({ error: { code: 'TASK_NOT_FOUND', message: 'Task not found' } });
     }
+    // 客户频道关联了内部频道 → 强制派发到它(忽略传入的 target,防止误发)。
+    const sourceChannel = await db.controlChannel.findUnique({
+      where: { id: source.channelId }, select: { linkedChannelId: true, type: true },
+    });
+    const effectiveTarget = sourceChannel?.type === 'client' && sourceChannel.linkedChannelId
+      ? sourceChannel.linkedChannelId
+      : targetChannelId;
+    if (!effectiveTarget) {
+      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'target_channel_id is required (客户频道未关联内部频道时必须指定)' } });
+    }
     const target = await db.controlChannel.findUnique({
-      where: { id: targetChannelId }, select: { id: true, workroomId: true, name: true },
+      where: { id: effectiveTarget }, select: { id: true, workroomId: true, name: true },
     });
     if (!target || target.workroomId !== wid) {
       return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Target channel not found' } });

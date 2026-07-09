@@ -27,6 +27,7 @@ export interface VisibleChannel {
   name: string;
   type: string;
   visibility: string;
+  linkedChannelId: string | null;
   description: string | null;
   archivedAt: Date | null;
   createdAt: Date;
