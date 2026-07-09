@@ -522,6 +522,7 @@ export async function channelRoutes(app: FastifyInstance) {
       description?: unknown;
       visibility?: unknown;
       member_ids?: unknown;
+      channel_type?: unknown; // 'standard' | 'client'
     } | null;
 
     const name = typeof body?.name === 'string' ? body.name.trim() : '';
@@ -549,6 +550,7 @@ export async function channelRoutes(app: FastifyInstance) {
         )
       : [];
 
+    const channelType = body?.channel_type === 'client' ? 'client' : 'standard';
     const { channel, memberCount, events } = await createChannelCore({
       workroomId: wid,
       actorId: actor.actorId,
@@ -556,6 +558,7 @@ export async function channelRoutes(app: FastifyInstance) {
       visibility,
       description,
       memberIds,
+      channelType,
     });
     broadcastChannelEvents(events);
 

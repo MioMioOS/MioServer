@@ -10,6 +10,7 @@
  */
 
 import { randomUUID } from 'crypto';
+import { syncMirrorSource } from './mirrorTaskBridge';
 import { publishControlEvent } from '@/control/events/publishControlEvent';
 import { workroomBroadcaster } from '@/control/ws/workroomBroadcaster';
 
@@ -18,6 +19,15 @@ export async function writeTaskEventAndBroadcast(input: {
   topic: 'task.created' | 'task.updated' | 'task.status_changed' | 'task.assigned' | 'task.review_requested';
   payload: Record<string, unknown>;
 }): Promise<void> {
+  // 客户频道任务桥:内部镜像任务的状态变化回流到源需求单。所有状态转换
+  // 都经此函数广播,故在此单点挂桥。fire-and-forget(桥内部自兜错)。
+  if (input.topic === 'task.status_changed') {
+    const tid = input.payload['task_id'];
+    const st = input.payload['status'] ?? input.payload['to'];
+    if (typeof tid === 'string' && typeof st === 'string' && input.payload['source'] !== 'mirror-bridge') {
+      void syncMirrorSource(tid, String(st).toLowerCase());
+    }
+  }
   // Step 1: write event to DB (awaited — guarantees persistence before route returns).
   const event = await publishControlEvent({
     workroomId: input.workroomId,

@@ -169,6 +169,8 @@ export interface CreateChannelCoreInput {
   actorId: string;
   /** Validated, non-empty channel name (validation stays in the route). */
   name: string;
+  /** 频道类型:standard(默认)| client(客户频道,顾问协议+任务桥)。 */
+  channelType?: string;
   /** Validated 'public' | 'private' (validation stays in the route). */
   visibility: 'public' | 'private';
   /** Optional description; defaults to ''. */
@@ -192,7 +194,7 @@ export interface CreateChannelCoreResult {
  * broadcast — returns the event payload(s) for the caller to emit after commit.
  */
 export async function createChannelCore(input: CreateChannelCoreInput): Promise<CreateChannelCoreResult> {
-  const { db: client, workroomId, actorId, name, visibility } = input;
+  const { db: client, workroomId, actorId, name, visibility, channelType } = input;
   const description = input.description ?? '';
   const c = client ?? db;
 
@@ -204,7 +206,7 @@ export async function createChannelCore(input: CreateChannelCoreInput): Promise<
     data: {
       workroomId,
       name,
-      type: 'standard',
+      type: channelType ?? 'standard',
       visibility,
       description,
       createdBy: actorId,

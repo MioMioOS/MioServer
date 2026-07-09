@@ -761,6 +761,9 @@ model ControlTask {
   // Partial unique index (channel_id, number) WHERE both non-null is in the migration SQL — not @@unique here.
   number            Int?
   goalId            String?         @map("goal_id") @db.Uuid
+  // 客户频道任务桥(07-09):内部镜像任务指向客户频道的需求单。内部任务状态
+  // 变化时单向回流到源需求单(粗粒度映射);源单无此字段,天然防环。
+  mirrorOfTaskId    String?         @map("mirror_of_task_id") @db.Uuid
   sourceMessageId   String?         @map("source_message_id") @db.Uuid
   title             String
   description       String          @default("")

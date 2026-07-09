@@ -48,7 +48,7 @@ export async function agentApiChannels(app: FastifyInstance) {
     // ── Step 2: fetch the agent's member channels ─────────────────────────────
     const rows = await db.controlChannelMember.findMany({
       where: { memberId: auth.agent.id },
-      select: { channel: { select: { id: true, name: true } } },
+      select: { channel: { select: { id: true, name: true, type: true } } },
     });
 
     return reply.send({ channels: rows.map((r) => r.channel) });

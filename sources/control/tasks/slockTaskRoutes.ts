@@ -413,6 +413,113 @@ export async function slockTaskRoutes(app: FastifyInstance) {
 
     return reply.code(200).send((await fetchFormattedTask(id))!);
   });
+
+  /**
+   * POST /api/v1/workrooms/:wid/tasks/:taskId/dispatch — 客户需求单派发(07-09)。
+   *
+   * owner 把 client 频道里已批准的需求单派发到内部频道:生成镜像任务
+   * (mirrorOfTaskId → 需求单),指派给执行 agent(born in_progress + task.assigned
+   * 唤醒),需求单转「开发中」并在客户频道发一行进度语。
+   * Auth:user_sess_ workroom OWNER(仅真人可派发,agent/机器不可)。
+   */
+  app.post('/api/v1/workrooms/:wid/tasks/:taskId/dispatch', async (request, reply) => {
+    const { wid, taskId } = request.params as { wid: string; taskId: string };
+    const authHeader = request.headers.authorization;
+    if (!authHeader?.startsWith(`Bearer ${USER_SESSION_TOKEN_PREFIX}`)) {
+      return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
+    }
+    const session = await resolveUserSession(authHeader);
+    if (!session) return reply.code(401).send({ error: { code: 'INVALID_SESSION', message: 'Invalid or expired session' } });
+    const mem = await db.userWorkroomMembership.findUnique({
+      where: { userId_workroomId: { userId: session.userId, workroomId: wid } },
+      select: { role: true },
+    });
+    if (mem?.role !== 'owner') {
+      return reply.code(403).send({ error: { code: 'FORBIDDEN', message: 'Owner only' } });
+    }
+    const body = request.body as { target_channel_id?: unknown; assignee_agent_id?: unknown } | null;
+    const targetChannelId = typeof body?.target_channel_id === 'string' ? body.target_channel_id : null;
+    const assigneeId = typeof body?.assignee_agent_id === 'string' ? body.assignee_agent_id : null;
+    if (!targetChannelId) {
+      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'target_channel_id is required' } });
+    }
+    const source = await db.controlTask.findUnique({
+      where: { id: taskId },
+      select: { id: true, workroomId: true, channelId: true, number: true, title: true, description: true, mirrorOfTaskId: true },
+    });
+    if (!source || source.workroomId !== wid || !source.channelId) {
+      return reply.code(404).send({ error: { code: 'TASK_NOT_FOUND', message: 'Task not found' } });
+    }
+    const target = await db.controlChannel.findUnique({
+      where: { id: targetChannelId }, select: { id: true, workroomId: true, name: true },
+    });
+    if (!target || target.workroomId !== wid) {
+      return reply.code(404).send({ error: { code: 'CHANNEL_NOT_FOUND', message: 'Target channel not found' } });
+    }
+    // 幂等防重派:该需求单已有存活镜像 → 409。
+    const existing = await db.controlTask.findFirst({
+      where: { mirrorOfTaskId: source.id, status: { notIn: ['canceled', 'closed'] } },
+      select: { id: true, number: true },
+    });
+    if (existing) {
+      return reply.code(409).send({ error: { code: 'ALREADY_DISPATCHED', message: `Already dispatched as #${existing.number}` } });
+    }
+
+    let mirror!: { id: string; number: number | null; title: string };
+    await db.$transaction(async (tx) => {
+      const num = await nextChannelTaskNumber(tx, target.id);
+      mirror = await tx.controlTask.create({
+        data: {
+          workroomId: wid,
+          channelId: target.id,
+          number: num,
+          title: source.title,
+          description: `${source.description ?? ''}\n\n[来源:客户需求单 #${source.number ?? '?'}]`.trim(),
+          status: assigneeId ? 'in_progress' : 'todo',
+          ownerInstanceId: assigneeId,
+          mirrorOfTaskId: source.id,
+        },
+        select: { id: true, number: true, title: true },
+      });
+      // 需求单 → 开发中(客户可见的粗状态)。
+      await tx.controlTask.update({ where: { id: source.id }, data: { status: 'in_progress' } });
+    });
+
+    await writeTaskEventAndBroadcast({
+      workroomId: wid,
+      topic: 'task.created',
+      payload: {
+        task_id: mirror.id, channel_id: target.id, workroom_id: wid,
+        title: mirror.title, status: serverToSlockStatus(assigneeId ? 'in_progress' : 'todo'),
+        assignee_id: assigneeId, owner_id: assigneeId, created_by: session.userId, source: 'dispatch',
+      },
+    });
+    if (assigneeId) {
+      await writeTaskEventAndBroadcast({
+        workroomId: wid,
+        topic: 'task.assigned',
+        payload: { task_id: mirror.id, channel_id: target.id, workroom_id: wid, assignee_id: assigneeId, assigner_id: session.userId },
+      });
+    }
+    await emitTaskLifecycleMessage({
+      kind: 'created', workroomId: wid, channelId: target.id,
+      tasks: [{ number: mirror.number ?? 0, title: mirror.title }],
+    });
+    // 客户频道进度语。
+    try {
+      const row = await insertSystemMessage({
+        workroomId: wid, channelId: source.channelId,
+        content: `📌 需求 #${source.number ?? '?'} 已排期,进入开发`,
+      });
+      await writeEventAndBroadcast({
+        id: row.id, seq: row.seq, created_at: row.created_at,
+        workroomId: wid, channelId: source.channelId,
+        senderKind: 'system', senderId: 'system', content: row.content, mentions: [],
+      });
+    } catch { /* 进度语失败不影响派发 */ }
+
+    return reply.send({ ok: true, mirror_task_id: mirror.id, mirror_number: mirror.number });
+  });
 }
 
 // ── Read-auth resolver (user_sess_ member OR machine_token) ──────────────────────
