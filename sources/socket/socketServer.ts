@@ -39,6 +39,8 @@ export function startSocket(server: HttpServer) {
             return;
         }
 
+        console.log(`Socket connection: deviceId=${payload.deviceId}, clientType=${clientType}`);
+
         // ── Subscription check ──────────────────────────────────────────
         // Wrap the whole block in try/catch so a transient Prisma error
         // (connection pool starvation, timeout, transient unavailable) does

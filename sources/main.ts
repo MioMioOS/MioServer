@@ -22,19 +22,19 @@ async function main() {
     startSocket(app.server);
     console.log('Socket.io ready on /v1/updates');
 
-    // Auto-cleanup stale sessions every hour (inactive for >4 hours)
+    // Auto-cleanup stale sessions every hour (inactive for >24 hours)
     setInterval(async () => {
         try {
-            const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000);
+            const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
             const result = await db.session.updateMany({
-                where: { active: true, lastActiveAt: { lt: fourHoursAgo } },
+                where: { active: true, lastActiveAt: { lt: twentyFourHoursAgo } },
                 data: { active: false },
             });
             if (result.count > 0) {
                 console.log(`[Auto-cleanup] Marked ${result.count} stale sessions as inactive`);
                 // Clean orphan Live Activity tokens
                 const inactive = await db.session.findMany({
-                    where: { active: false, lastActiveAt: { lt: fourHoursAgo } },
+                    where: { active: false, lastActiveAt: { lt: twentyFourHoursAgo } },
                     select: { id: true },
                 });
                 const ids = inactive.map(s => s.id);
@@ -58,7 +58,7 @@ async function main() {
             console.error('[Auto-cleanup] Error:', err);
         }
     }, 60 * 60 * 1000); // Run every hour
-    console.log('Auto-cleanup scheduled (hourly, 4h threshold)');
+    console.log('Auto-cleanup scheduled (hourly, 24h threshold)');
 
     // Subscription cleanup: expire trials + send day-2 notifications (every 30 min)
     if (config.enforceSubscription) {

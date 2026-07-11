@@ -1,0 +1,11 @@
+node_modules
+.git
+.claude
+.claude-guardian
+.env
+.env.dev
+.env.example
+*.log
+*.md
+tests
+vitest.config.ts

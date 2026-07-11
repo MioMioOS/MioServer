@@ -149,6 +149,38 @@ export async function devicesRoutes(app: FastifyInstance) {
         }));
     });
 
+    // ─── Mac deviceId lookup for sync-daemon ───────────────────────────────
+    //
+    // sync-daemon needs to create sessions under the Mac's deviceId (not its own),
+    // so that the iPhone's session list (filtered by ownerDeviceId == mac.deviceId)
+    // shows them. This endpoint lets sync-daemon look up the Mac's deviceId
+    // by its shortCode, which is stored in sync-daemon's config alongside jwtSecret.
+
+    app.get('/v1/devices/mac-by-code/:shortCode', {
+        preHandler: authMiddleware,
+        schema: {
+            params: z.object({ shortCode: z.string().min(4).max(12) }),
+        },
+    }, async (request, reply) => {
+        const { shortCode } = request.params as { shortCode: string };
+        const normalized = shortCode.toUpperCase().trim();
+
+        const mac = await db.device.findUnique({
+            where: { shortCode: normalized },
+            select: { id: true, name: true, kind: true },
+        });
+
+        if (!mac) {
+            return reply.code(404).send({ error: 'No Mac found with that shortCode' });
+        }
+
+        if (mac.kind !== 'mac') {
+            return reply.code(400).send({ error: 'That shortCode belongs to a non-Mac device' });
+        }
+
+        return { deviceId: mac.id, name: mac.name };
+    });
+
     // ─────────────────────────── Known projects ───────────────────────────
 
     // Mac uploads recent project paths. Upserts + bumps lastSeenAt.
