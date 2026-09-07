@@ -33,6 +33,7 @@
 
 import { db } from '@/storage/db';
 import { sendPushToDevice, type PushPayload } from '@/push/apns';
+import { sendWebPushToUsers } from '@/push/webpush';
 import { config } from '@/config';
 
 /**
@@ -122,6 +123,16 @@ export async function notifyMentionedUsers(params: {
   const recipients = params.mentionedUserIds.filter((id) => id !== params.senderUserId);
   if (recipients.length === 0) return;
 
+  // Web Push (browser/PWA) — parallel to APNs, same recipients. Not gated by
+  // the iOS device prefs (those are per-APNs-device); a browser subscription
+  // existing IS the opt-in. Fire-and-forget.
+  const webTarget: DeepLinkTarget = { ...params.target, type: 'mention_human' };
+  void sendWebPushToUsers(
+    recipients,
+    { title: params.title, body: params.body, data: buildDeepLinkData(webTarget, params.title, params.body) },
+    params.senderUserId,
+  ).catch((err) => console.error('[notify-mention] web push failed', err));
+
   const deviceIds = await resolveTargetDevices(recipients, /* requireCompletionPref */ false);
   if (deviceIds.length === 0) {
     console.log(`[notify-mention] no active devices for ${recipients.length} mentioned user(s)`);
@@ -143,6 +154,95 @@ export async function notifyMentionedUsers(params: {
       console.error('[notify-mention] push failed', err),
     );
   }
+}
+
+/**
+ * DM push (browser/PWA only) — a direct message has no @-mention but the peer
+ * still wants to know. Resolves the DM channel's other member(s) and web-pushes
+ * them with the sender's name as the title. No-op for non-DM channels and for
+ * agent peers (agent ids never match a WebPushSubscription.userId).
+ *
+ * APNs is intentionally NOT touched here — DM-to-APNs wasn't a prior behavior
+ * and the iOS app has its own delivery. This only lights up the web PWA.
+ */
+export async function notifyDirectMessagePeers(params: {
+  channelId: string;
+  senderUserId?: string | null;
+  target: Omit<DeepLinkTarget, 'type'>;
+  body: string;
+}): Promise<void> {
+  const channel = await db.controlChannel.findUnique({
+    where: { id: params.channelId },
+    select: { visibility: true },
+  });
+  if (channel?.visibility !== 'dm') return;
+
+  const members = await db.controlChannelMember.findMany({
+    where: { channelId: params.channelId },
+    select: { memberId: true },
+  });
+  const peers = members.map((m) => m.memberId).filter((id) => id !== params.senderUserId);
+  if (peers.length === 0) return;
+
+  let title = '新私信';
+  if (params.senderUserId) {
+    const sender = await db.user.findUnique({
+      where: { id: params.senderUserId },
+      select: { displayName: true, email: true },
+    });
+    if (sender) title = sender.displayName || sender.email.split('@')[0];
+  }
+
+  const target: DeepLinkTarget = { ...params.target, type: 'mention_human' };
+  await sendWebPushToUsers(
+    peers,
+    { title, body: params.body, data: buildDeepLinkData(target, title, params.body) },
+    params.senderUserId,
+  );
+}
+
+/**
+ * 客户频道里新建了需求任务 → 通知工作区里的每个人(Web Push)。
+ *
+ * 客户在客户频道向顾问提需求、顾问批准建单时触发。整个内部团队都该知道有新
+ * 客户需求进来,所以推给该工作区的**全部**人类成员(不限 owner)。深链到客户
+ * 频道;进不去的成员点开就停在 app 首页(无害)。APNs 不碰(那是旧 iOS app)。
+ */
+export async function notifyClientTaskCreated(params: {
+  workroomId: string;
+  channelId: string;
+  channelName: string;
+  tasks: Array<{ number: number; title: string }>;
+}): Promise<void> {
+  if (params.tasks.length === 0) return;
+  const memberships = await db.userWorkroomMembership.findMany({
+    where: { workroomId: params.workroomId },
+    select: { userId: true },
+  });
+  const recipientUserIds = memberships.map((m) => m.userId);
+  if (recipientUserIds.length === 0) return;
+
+  const first = params.tasks[0];
+  const title = `新客户需求 · ${params.channelName}`;
+  const body =
+    params.tasks.length === 1
+      ? `#${first.number} ${first.title}`
+      : `${params.tasks.length} 条新需求,例:#${first.number} ${first.title}`;
+  const target: DeepLinkTarget = {
+    type: 'mention_human',
+    workroomId: params.workroomId,
+    channelId: params.channelId,
+    messageId: params.channelId,
+    threadId: null,
+  };
+  await sendWebPushToUsers(recipientUserIds, {
+    title,
+    body,
+    data: buildDeepLinkData(target, title, body),
+  });
+  console.log(
+    `[notify-client-task] workroom=${params.workroomId.slice(0, 8)} channel=${params.channelId.slice(0, 8)} tasks=${params.tasks.length} recipients=${recipientUserIds.length}`,
+  );
 }
 
 /**

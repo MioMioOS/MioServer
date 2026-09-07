@@ -12,6 +12,8 @@ import { devicesRoutes } from '@/devices/devicesRoutes';
 import { computersRoutes } from '@/devices/computersRoutes';
 import { sessionRoutes } from '@/session/sessionRoutes';
 import { pushRoutes } from '@/push/pushRoutes';
+import { webPushRoutes } from '@/push/webPushRoutes';
+import { previewRoutes } from '@/control/preview/previewRoutes';
 import { blobRoutes } from '@/blob/blobRoutes';
 import { capabilityRoutes } from '@/capabilities/capabilityRoutes';
 import { subscriptionRoutes } from '@/subscription/subscriptionRoutes';
@@ -92,6 +94,7 @@ export async function startApi() {
     await app.register(computersRoutes);
     await app.register(sessionRoutes);
     await app.register(pushRoutes);
+    await app.register(webPushRoutes);
     await app.register(blobRoutes);
     await app.register(capabilityRoutes);
     await app.register(subscriptionRoutes);
@@ -131,6 +134,7 @@ await app.register(slockTaskRoutes);
     await app.register(agentApiTyping);
     await app.register(agentApiStatus);
     await app.register(agentApiThreads);
+    await app.register(previewRoutes);
 
     await app.listen({ port: config.port, host: config.host });
     console.log(`CodeLight Server listening on port ${config.port}`);

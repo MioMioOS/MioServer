@@ -26,6 +26,8 @@ import { authorizeAgentApi } from './agentApiAuth';
 import { resolveAgentChannelTarget } from './agentApiTargets';
 import { sendMessageTransaction } from '@/control/messages/sendMessageTransaction';
 import { writeEventAndBroadcast } from '@/control/messages/writeEventAndBroadcast';
+import { insertSystemMessage } from '@/control/messages/insertSystemMessage';
+import { finalizeMentionWake, offlineNotice } from '@/control/messages/finalizeMentionWake';
 import { resolveContentMentions } from '@/control/messages/messageRoutes';
 import { notifyMentionedUsers } from '@/control/notifications/notify';
 import { writeThreadReplyEventAndBroadcast } from '@/control/messages/writeThreadReplyEventAndBroadcast';
@@ -287,11 +289,23 @@ export async function agentApiRoutes(app: FastifyInstance) {
       // recent inbound) → leave parentMessageId null. Safer default.
     }
 
-    // Resolve @-mentions from the content (agents + HUMANS) the same way the
-    // user send path does — otherwise an agent's "@Kris" is never recorded, so
-    // the human gets no mention activity and no push. (Was: agent sends passed
-    // no mentions at all → user_mentions always empty.)
-    const agentMentions = await resolveContentMentions(channelId, content);
+    // Resolve @-mentions from the content, then HARD-DROP any human mentions:
+    // an agent must NEVER `@`-ping a real person (it fires a notification and
+    // pushes a decision onto a human, which the operator explicitly forbids —
+    // seen 08-14: PM kept ending replies with "@Andy 确认一下…"). Agents address
+    // humans in plain language; `@`-mentions survive ONLY for agent-to-agent
+    // handoffs. So userIds is forced empty here — no push, no mention activity,
+    // no wake for any human named in an agent's message.
+    const resolvedMentions = await resolveContentMentions(channelId, content);
+    const agentMentions = { agentIds: resolvedMentions.agentIds, userIds: [] as string[] };
+
+    // Handoff robustness: disambiguate same-name targets to the LIVE one, and flag
+    // any handoff that landed on an OFFLINE teammate so the sending agent is told
+    // instead of the @-delegation silently vanishing (the fire-and-forget gap).
+    const handoff = await finalizeMentionWake({
+      agentMatches: resolvedMentions.agentMatches,
+      allMentionedAgentIds: agentMentions.agentIds,
+    });
 
     // ── Step 4: send message ──────────────────────────────────────────────────
     const result = await sendMessageTransaction({
@@ -410,7 +424,29 @@ export async function agentApiRoutes(app: FastifyInstance) {
     } else {
       // Pass agent mentions so an agent's @-delegation (e.g. a hand-off
       // "@Backend do X") wakes the named teammate via the wake-set routing.
-      await writeEventAndBroadcast({ ...result, mentions: agentMentions.agentIds });
+      // wakeAgentIds is the disambiguated set (same-name duplicates pruned to live).
+      await writeEventAndBroadcast({
+        ...result,
+        mentions: agentMentions.agentIds,
+        ...(agentMentions.agentIds.length > 0 ? { wakeAgentIds: handoff.wakeAgentIds } : {}),
+      });
+    }
+
+    // Offline handoff report: if the delegated teammate isn't reachable, post a
+    // channel notice (in-thread if this was a thread reply) so the sender knows
+    // the hand-off didn't land, rather than waiting forever on a dead teammate.
+    if (!result.idempotent && handoff.offlineLabels.length > 0) {
+      try {
+        const sysRow = await insertSystemMessage({
+          workroomId,
+          channelId,
+          content: offlineNotice(handoff.offlineLabels),
+          parentMessageId: parentMessageId ?? null,
+        });
+        await writeEventAndBroadcast(sysRow);
+      } catch (err) {
+        console.error('[agentApi] offline-handoff notice failed', err);
+      }
     }
 
     // Push mentioned HUMANS (agent uuid mentions ride the wake set above; humans

@@ -24,7 +24,7 @@ import { db } from '@/storage/db';
 import { authorizeAgentApi } from '@/control/agentApi/agentApiAuth';
 import { resolveAgentChannelTarget } from '@/control/agentApi/agentApiTargets';
 // Single source of truth for the image MIME allowlist (defined in blobRoutes.ts).
-import { ALLOWED_MIME } from '@/blob/blobRoutes';
+import { isAllowedAttachmentMime } from '@/blob/blobRoutes';
 
 const MAX_DECODED_BYTES = 8 * 1024 * 1024;  // 8 MiB cap on the decoded image bytes
 // Per-route request bodyLimit on the raw (base64) wire body. base64 inflates bytes by ~4/3,
@@ -92,7 +92,7 @@ export async function agentApiAttachments(app: FastifyInstance) {
     const dataBase64 = body.data_base64;
 
     // ── Step 3: validate MIME ─────────────────────────────────────────────────
-    if (!ALLOWED_MIME.has(mimeType)) {
+    if (!isAllowedAttachmentMime(mimeType)) {
       return reply.code(415).send({ error: { code: 'UNSUPPORTED_MIME', message: `Unsupported mime type: ${mimeType}` } });
     }
 

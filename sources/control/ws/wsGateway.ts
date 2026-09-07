@@ -42,6 +42,7 @@
 import { Server as HttpServer } from 'http';
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import { tokenInWorkroom } from '@/control/auth/workroomScopeForToken';
+import { registerMachineSocket, unregisterMachineSocket } from '@/control/preview/previewTunnel';
 import { userSubscribed, userUnsubscribed, userActivity } from './userPresence';
 import { workroomBroadcaster, WorkroomSubscriber } from './workroomBroadcaster';
 
@@ -49,6 +50,9 @@ export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
   const io = new SocketIOServer(httpServer, {
     path: '/api/v1/ws/control',
     cors: { origin: '*', methods: ['GET', 'POST'] },
+    // Preview reverse-tunnel carries base64 HTML/JS/CSS/image frames over ack;
+    // 12 MiB covers typical dev-server assets (default is only 1 MiB).
+    maxHttpBufferSize: 12 * 1024 * 1024,
   });
 
   io.on('connection', (socket: Socket) => {
@@ -58,6 +62,9 @@ export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
     const subscriber: WorkroomSubscriber = { socket, context: socket.id };
     // Human presence: (workroomId → userId) pairs this socket contributes to.
     const userSubs = new Map<string, string>();
+    // Preview reverse-tunnel: when a MACHINE (daemon) subscribes, remember its
+    // socket so /preview/* can proxy HTTP into that machine's localhost.
+    let boundMachineId: string | null = null;
 
     // ── subscribe ────────────────────────────────────────────────────────────
     socket.on('subscribe', async (msg: { workroom_id?: string; token?: string }) => {
@@ -84,6 +91,10 @@ export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
       if (scope.mode === 'user' && !userSubs.has(msg.workroom_id)) {
         userSubs.set(msg.workroom_id, scope.viewerId);
         userSubscribed(msg.workroom_id, scope.viewerId);
+      }
+      if (scope.mode === 'machine') {
+        boundMachineId = scope.viewerId;
+        registerMachineSocket(scope.viewerId, socket);
       }
       socket.emit('subscribed', { workroom_id: msg.workroom_id });
       console.log(`[WS] ${subscriber.context} subscribed to workroom=${msg.workroom_id}`);
@@ -119,6 +130,7 @@ export function attachControlPlaneWs(httpServer: HttpServer): SocketIOServer {
       workroomBroadcaster.unsubscribeAll(subscriber);
       for (const [widKey, uid] of userSubs) userUnsubscribed(widKey, uid);
       userSubs.clear();
+      if (boundMachineId) unregisterMachineSocket(boundMachineId, socket);
       console.log(`[WS] client disconnected: ${socket.id} reason=${reason}`);
     });
   });

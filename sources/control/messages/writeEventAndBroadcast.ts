@@ -30,6 +30,10 @@ export async function writeEventAndBroadcast(msg: {
   content: string;
   /** Resolved AGENT mention ids for this message (uuid[]). Drives routing. */
   mentions?: string[];
+  /** Resolved HUMAN mention ids (cuid[]). When a human @-mentions ONLY other
+   *  humans (no agent named), we do NOT wake any AI — it's a person-to-person
+   *  ping, the mentioned human just gets a notification. */
+  userMentions?: string[];
   /** Explicit wake set (content-routed agent for an @-nobody human message).
    *  When provided it REPLACES the mentions/core derivation below. */
   wakeAgentIds?: string[];
@@ -65,6 +69,11 @@ export async function writeEventAndBroadcast(msg: {
   } else if (mentions.length > 0) {
     // Named specific agents → wake exactly those.
     wakeAgentIds = [...new Set(mentions)];
+  } else if (msg.senderKind === 'user' && (msg.userMentions?.length ?? 0) > 0) {
+    // 真人 @ 真人(点名了人类、没点名任何 agent)→ 不唤醒任何 AI。这是人对人
+    // 的招呼,被 @ 的人收到手机通知即可(notifyMentionedUsers 另行处理)。
+    // 空数组(非 unset)= 权威「不唤醒」,daemon 不走 legacy 兜底。
+    wakeAgentIds = [];
   } else if (msg.senderKind === 'user' && coreAgentId) {
     // A HUMAN addressed nobody → the channel's core agent fields it.
     wakeAgentIds = [coreAgentId];

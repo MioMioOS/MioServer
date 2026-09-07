@@ -24,7 +24,7 @@ import { USER_SESSION_TOKEN_PREFIX } from '@/auth/userSession/tokenMint';
 import { requireMachineAccessToWorkroom } from '@/control/auth/machineAccess';
 import { verifyMachineToken } from '@/machines/machineRoutes';
 // Single source of truth for the image MIME allowlist (defined in blobRoutes.ts).
-import { ALLOWED_MIME } from '@/blob/blobRoutes';
+import { isAllowedAttachmentMime } from '@/blob/blobRoutes';
 import { cosEnabled, cosKeyFor, presignPut, presignGet, cosHead } from '@/blob/cosStorage';
 
 const MAX_DECODED_BYTES = 8 * 1024 * 1024;   // same caps as the agent-api upload route
@@ -207,7 +207,7 @@ export async function userAttachments(app: FastifyInstance) {
     if (!body.data_base64 || typeof body.data_base64 !== 'string') {
       return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'data_base64 is required' } });
     }
-    if (!ALLOWED_MIME.has(body.mime_type)) {
+    if (!isAllowedAttachmentMime(body.mime_type)) {
       return reply.code(415).send({ error: { code: 'UNSUPPORTED_MIME', message: `Unsupported mime type: ${body.mime_type}` } });
     }
     const buf = Buffer.from(body.data_base64, 'base64');
@@ -246,7 +246,7 @@ export async function userAttachments(app: FastifyInstance) {
    * Body: { filename, mime_type, size_bytes }
    * 鉴权/频道守卫与上传路由一致。COS 未启用时 404(客户端回退 base64 旧路)。
    * 建 pending 行(storageKey 就位、data 空)→ 返回 10 分钟预签名 PUT URL。
-   * 直传上限 20 MiB(直连 COS,不再受服务器带宽/body 限制约束)。
+   * 直传上限 60 MiB(直连 COS,不再受服务器带宽/body 限制约束)。
    */
   app.post('/api/v1/workrooms/:wid/channels/:cid/attachments/presign', async (request, reply) => {
     const { wid, cid } = request.params as { wid: string; cid: string };
@@ -284,15 +284,15 @@ export async function userAttachments(app: FastifyInstance) {
     if (!body?.filename || typeof body.filename !== 'string' || body.filename.trim() === '') {
       return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'filename is required' } });
     }
-    if (!body.mime_type || typeof body.mime_type !== 'string' || !ALLOWED_MIME.has(body.mime_type)) {
+    if (!isAllowedAttachmentMime(body.mime_type)) {
       return reply.code(415).send({ error: { code: 'UNSUPPORTED_MIME', message: `Unsupported mime type: ${String(body.mime_type)}` } });
     }
     const size = Number(body.size_bytes);
     if (!Number.isFinite(size) || size <= 0) {
       return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'size_bytes is required' } });
     }
-    if (size > 20 * 1024 * 1024) {
-      return reply.code(413).send({ error: { code: 'PAYLOAD_TOO_LARGE', message: 'Direct upload exceeds 20 MiB limit' } });
+    if (size > 60 * 1024 * 1024) {
+      return reply.code(413).send({ error: { code: 'PAYLOAD_TOO_LARGE', message: 'Direct upload exceeds 60 MiB limit' } });
     }
     const attachment = await db.controlAttachment.create({
       data: {

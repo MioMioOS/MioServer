@@ -15,6 +15,17 @@ export const ALLOWED_MIME = new Set([
     'image/gif',
 ]);
 
+/**
+ * Chat attachments accept ANY file type (pdf, docs, code, csv, archives, …) so
+ * agents can Read whatever the user drops into a channel. Unlike the legacy
+ * /v1/blobs image path (ALLOWED_MIME), the only guard here is a non-empty mime
+ * string; size caps still apply at each route. Callers should default an empty
+ * browser mime to 'application/octet-stream'.
+ */
+export function isAllowedAttachmentMime(mime: unknown): mime is string {
+    return typeof mime === 'string' && mime.trim().length > 0;
+}
+
 export async function blobRoutes(app: FastifyInstance) {
     // Raw binary body parser for blob uploads
     app.addContentTypeParser(

@@ -278,6 +278,23 @@ model PushToken {
   @@unique([deviceId, token])
 }
 
+/// Web Push (VAPID) subscription for the browser/PWA client (codelight-web).
+/// One row per browser push endpoint; a user may have several (phone PWA,
+/// desktop browser, …). Keyed by endpoint (unique) so re-subscribe upserts.
+/// Dead endpoints (404/410 on send) are pruned by the sender.
+model WebPushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  ua        String? // user-agent snapshot, for debugging which device
+  createdAt DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  @@index([userId])
+}
+
 /// Live Activity push token (scoped to a session).
 /// iOS generates a token per active Live Activity.
 model LiveActivityToken {

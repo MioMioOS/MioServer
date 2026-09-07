@@ -39,9 +39,11 @@ import { claimControlTaskCas, NON_CLAIMABLE_STATUSES } from '@/control/tasks/cla
 import { validateTaskTransition } from '@/control/tasks/taskTransition';
 import { decideReviewGate, resolveTaskReviewer } from '@/control/tasks/taskReview';
 import { emitTaskLifecycleMessage } from '@/control/tasks/taskMessageBridge';
+import { notifyClientTaskCreated } from '@/control/notifications/notify';
 import { writeTaskEventAndBroadcast } from '@/control/tasks/writeTaskEventAndBroadcast';
 import { serverToSlockStatus } from '@/control/tasks/slockTaskStatus';
 import { insertSystemMessage } from '@/control/messages/insertSystemMessage';
+import { sendMessageTransaction } from '@/control/messages/sendMessageTransaction';
 import { writeEventAndBroadcast } from '@/control/messages/writeEventAndBroadcast';
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -275,7 +277,49 @@ export async function agentApiTasks(app: FastifyInstance) {
     // ── Step 5: emit 📋 task lifecycle bridge message (best-effort) ───────────
     // Only emit when ≥1 task created (guard is also inside emitTaskLifecycleMessage,
     // but we make the intent explicit here).
-    if (createdTasks.length > 0) {
+    // Promote a thread-buried task to a top-level task. When the attach target is
+    // ITSELF a thread reply, anchoring the task there hides its card inside another
+    // thread — it never shows in the main channel. Re-anchor it to a fresh top-level
+    // "📋 new task created" message so it appears as a normal top-level task (own
+    // card + own thread), exactly like a task created outside a thread.
+    // Give every task a clean TOP-LEVEL home so it shows as a real card + its own
+    // thread in the main channel (like #4). If the attach target is missing, OR is
+    // itself a thread reply (anchoring there would bury the task), the server posts
+    // a fresh main-channel message AS THE CREATING AGENT whose content IS the task
+    // title, and anchors the task to it. `effectiveParentId` is returned so the
+    // agent replies into the task's OWN new thread — not the thread it was
+    // triggered from (fixes: PM kept replying in the old sub-thread).
+    let promoted = false;
+    let effectiveParentId: string | null = attachToMessageId;
+    if (createdTasks.length === 1) {
+      const t = createdTasks[0];
+      let needsAnchor = !attachToMessageId;
+      if (attachToMessageId) {
+        const attachMsg = await db.controlMessage.findUnique({
+          where: { id: attachToMessageId },
+          select: { parentMessageId: true },
+        });
+        if (attachMsg?.parentMessageId) needsAnchor = true; // nested → don't bury
+      }
+      if (needsAnchor) {
+        try {
+          const res = await sendMessageTransaction({
+            channelId, workroomId, senderKind: 'agent', senderId: auth.agent.id,
+            content: t.title,
+          });
+          if (res.ok) {
+            await db.controlTask.update({ where: { id: t.id }, data: { parentMessageId: res.id } });
+            await writeEventAndBroadcast({ ...res, mentions: [] });
+            effectiveParentId = res.id;
+            promoted = true;
+          }
+        } catch (err) {
+          console.error('[agentApiTasks] top-level task anchor failed (falling back):', err);
+        }
+      }
+    }
+
+    if (createdTasks.length > 0 && !promoted) {
       await emitTaskLifecycleMessage({
         kind: 'created',
         workroomId,
@@ -283,11 +327,32 @@ export async function agentApiTasks(app: FastifyInstance) {
         tasks: createdTasks.map((t) => ({ number: t.number, title: t.title })),
       });
     }
+    if (createdTasks.length > 0) {
 
-    // ── Step 5b (Bug-2 Thread): when attached, post a system_task_created
-    // message INSIDE the thread of the parent so reply_count increments and
-    // iOS surfaces the thread. Best-effort: failure must not roll back the task.
-    if (attachToMessageId && createdTasks.length === 1) {
+      // 客户频道里建的需求任务 → 通知工作区里的每个人(Web Push)。best-effort。
+      try {
+        const ch = await db.controlChannel.findUnique({
+          where: { id: channelId },
+          select: { type: true, name: true },
+        });
+        if (ch?.type === 'client') {
+          await notifyClientTaskCreated({
+            workroomId,
+            channelId,
+            channelName: ch.name,
+            tasks: createdTasks.map((t) => ({ number: t.number, title: t.title })),
+          });
+        }
+      } catch (err) {
+        console.error('[agentApiTasks] client-task notify failed (non-fatal)', err);
+      }
+    }
+
+    // ── Step 5b (Bug-2 Thread): when attached to a TOP-LEVEL message, post a
+    // system_task_created message INSIDE its thread so reply_count increments and
+    // iOS surfaces the thread. Skipped when the task was PROMOTED (attach target
+    // was a thread reply → we already made a top-level card its home). Best-effort.
+    if (attachToMessageId && createdTasks.length === 1 && !promoted) {
       const t = createdTasks[0];
       try {
         const sysRow = await insertSystemMessage({
@@ -302,13 +367,18 @@ export async function agentApiTasks(app: FastifyInstance) {
       }
     }
 
-    // ── Step 6: return { tasks: [{ id, number }] } ────────────────────────────
+    // ── Step 6: return tasks + the task's REAL thread anchor ───────────────────
+    // parent_message_id is where the task's own thread lives — the agent MUST use
+    // it for `mio message reply --parent …`, NOT the message it attached to (which
+    // may have been re-anchored to a fresh top-level message above).
     return reply.code(201).send({
+      parent_message_id: effectiveParentId,
       tasks: createdTasks.map((t) => ({
         id: t.id,
         number: t.number,
         title: t.title,
         status: 'todo',
+        parent_message_id: effectiveParentId,
         owner_instance_id: null,
         owner_display_name: null,
         assignee_id: null,

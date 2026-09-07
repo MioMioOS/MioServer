@@ -53,7 +53,9 @@ import { writeThreadReplyEventAndBroadcast } from './writeThreadReplyEventAndBro
 import { resolveSenderDisplayNames, formatMessage, resolveAttachedTasks, resolveAttachmentMetadata } from './messageFormatting';
 import { classifyAndMaybeCreateTask } from '@/control/classify/classifyAndMaybeCreateTask';
 import { splitMentions } from './splitMentions';
-import { notifyMentionedUsers, type DeepLinkType } from '@/control/notifications/notify';
+import { insertSystemMessage } from './insertSystemMessage';
+import { finalizeMentionWake, offlineNotice } from './finalizeMentionWake';
+import { notifyMentionedUsers, notifyDirectMessagePeers, type DeepLinkType } from '@/control/notifications/notify';
 import { redactControlText } from '@/control/redaction/redactControlText';
 import { routeMessageToAgent } from '@/control/channels/coreAgentElection';
 
@@ -256,10 +258,37 @@ async function fetchFormattedMessage(id: string) {
  * (displayName || name || email || email-local-part) substring against the
  * channel's members, longest label first to avoid prefix collisions.
  */
+export interface ContentMentionResult {
+  agentIds: string[];
+  userIds: string[];
+  /**
+   * Per matched AGENT label, the candidate agent ids. `ids.length > 1` means a
+   * same-name collision in this channel (two agents share the label) — callers
+   * disambiguate the WAKE via liveness (see finalizeMentionWake). Empty for the
+   * uuid-picker path (client sent ids, not text).
+   */
+  agentMatches: Array<{ label: string; ids: string[] }>;
+}
+
+const MENTION_ESCAPE_RE = /[.*+?^${}()|[\]\\]/g;
+
+/**
+ * Build a boundary-safe `@label` matcher. Fixes the old `content.includes('@'+label)`
+ * substring bug two ways:
+ *   - RIGHT boundary `(?![\p{L}\p{N}_])` → `@Back` no longer matches inside `@Backend`,
+ *     and `@Backend` no longer matches inside `@BackendTeam`.
+ *   - LEFT guard `(?<![\p{L}\p{N}_@.])` → an email like `a@Backend.io` won't false-fire.
+ * Case-insensitive so `@backend` == `@Backend`.
+ */
+function mentionRegex(label: string, global: boolean): RegExp {
+  const esc = label.replace(MENTION_ESCAPE_RE, '\\$&');
+  return new RegExp(`(?<![\\p{L}\\p{N}_@.])@${esc}(?![\\p{L}\\p{N}_])`, global ? 'giu' : 'iu');
+}
+
 export async function resolveContentMentions(
   channelId: string,
   content: string,
-): Promise<{ agentIds: string[]; userIds: string[] }> {
+): Promise<ContentMentionResult> {
   const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const members = await db.controlChannelMember.findMany({
     where: { channelId },
@@ -268,8 +297,15 @@ export async function resolveContentMentions(
   const agentMemberIds = members.map((m) => m.memberId).filter((id) => uuidRe.test(id));
   const userMemberIds = members.map((m) => m.memberId).filter((id) => !uuidRe.test(id));
 
-  // (label → id, kind) pairs across agents + users; match longest labels first.
-  const pairs: Array<{ label: string; id: string; kind: 'agent' | 'user' }> = [];
+  // Group by normalised label so a same-name collision keeps ALL its candidate ids
+  // together (one match → every agent sharing that label is a candidate).
+  const groups = new Map<string, { label: string; agentIds: string[]; userIds: string[] }>();
+  const bucket = (label: string) => {
+    const key = label.toLowerCase();
+    let g = groups.get(key);
+    if (!g) { g = { label, agentIds: [], userIds: [] }; groups.set(key, g); }
+    return g;
+  };
 
   if (agentMemberIds.length > 0) {
     const agents = await db.controlAgent.findMany({
@@ -279,7 +315,7 @@ export async function resolveContentMentions(
     for (const a of agents) {
       for (const label of [a.displayName, a.name]) {
         const t = label?.trim();
-        if (t) pairs.push({ label: t, id: a.id, kind: 'agent' });
+        if (t) bucket(t).agentIds.push(a.id);
       }
     }
   }
@@ -292,17 +328,38 @@ export async function resolveContentMentions(
       const labels = [u.displayName?.trim(), u.email, u.email.split('@')[0]].filter(
         (x): x is string => !!x,
       );
-      for (const label of labels) pairs.push({ label, id: u.id, kind: 'user' });
+      for (const label of labels) bucket(label).userIds.push(u.id);
     }
   }
 
-  pairs.sort((x, y) => y.label.length - x.label.length);
+  return matchMentionGroups(content, [...groups.values()]);
+}
+
+/**
+ * Pure matching core (no DB): given @-mention label groups, resolve which fire in
+ * `content` using boundary-safe matching + longest-first span consumption. Exported
+ * for unit tests (the boundary/consumption edge cases live here).
+ */
+export function matchMentionGroups(
+  content: string,
+  groups: Array<{ label: string; agentIds: string[]; userIds: string[] }>,
+): ContentMentionResult {
+  // Longest label first + consume matched spans, so a shorter label ("@UI") can't
+  // re-match inside an already-claimed longer mention ("@UI设计师").
+  const sorted = [...groups].sort((a, b) => b.label.length - a.label.length);
   const agentIds = new Set<string>();
   const userIds = new Set<string>();
-  for (const { label, id, kind } of pairs) {
-    if (content.includes('@' + label)) (kind === 'agent' ? agentIds : userIds).add(id);
+  const agentMatches: Array<{ label: string; ids: string[] }> = [];
+  let work = content;
+  for (const g of sorted) {
+    if (!mentionRegex(g.label, false).test(work)) continue;
+    const ids = [...new Set(g.agentIds)];
+    for (const id of ids) agentIds.add(id);
+    for (const id of g.userIds) userIds.add(id);
+    if (ids.length > 0) agentMatches.push({ label: g.label, ids });
+    work = work.replace(mentionRegex(g.label, true), (m) => ' '.repeat(m.length));
   }
-  return { agentIds: [...agentIds], userIds: [...userIds] };
+  return { agentIds: [...agentIds], userIds: [...userIds], agentMatches };
 }
 
 export async function messageRoutes(app: FastifyInstance) {
@@ -622,6 +679,14 @@ export async function messageRoutes(app: FastifyInstance) {
     const mergedAgentMentions = [...new Set([...agentMentions, ...contentMentions.agentIds])];
     const mergedUserMentions = [...new Set([...userMentions, ...contentMentions.userIds])];
 
+    // Handoff robustness (#1 disambiguation + #3 offline pre-check): decide who to
+    // actually WAKE (prune same-name duplicates to the live one) and which mentions
+    // landed on an offline target so we can tell the sender instead of dropping.
+    const finalized = await finalizeMentionWake({
+      agentMatches: contentMentions.agentMatches,
+      allMentionedAgentIds: mergedAgentMentions,
+    });
+
     // S8 human-attachment sends: attachment_ids ride the same wire field agents use.
     const att = await validateAttachmentIds(body.attachment_ids, wid, senderKind, senderId);
     if (!att.ok) {
@@ -666,7 +731,10 @@ export async function messageRoutes(app: FastifyInstance) {
     // it goes straight to the right agent (~0.5s) instead of the core + a slow
     // hand-off. Runs CONCURRENTLY with the classifier (both ~0.5-1.5s) so it
     // adds no serial latency. Falls back to the elected core / oldest agent.
-    const needsRouting = !result.idempotent && senderKind === 'user' && mergedAgentMentions.length === 0;
+    // 真人 @ 真人(点名了人类、没点名 agent)不自动路由到 AI——人对人的招呼,
+    // 只发通知不唤醒 AI 思考。无任何 @ 的消息仍走自动路由。
+    const needsRouting = !result.idempotent && senderKind === 'user'
+      && mergedAgentMentions.length === 0 && mergedUserMentions.length === 0;
     // 无 @ 消息:先路由(~0.5s)再分类——路由结果作为隐含 assignee 喂给分类器,
     // 让「无 @ 但明显是派活」的消息也能建任务(07-07:无@→无task→无thread→
     // agent 说完"我来做"就 idle 没有任务驱动续做)。有 @ 的消息路径不变。
@@ -686,8 +754,31 @@ export async function messageRoutes(app: FastifyInstance) {
     await writeEventAndBroadcast({
       ...result,
       mentions: mergedAgentMentions,
-      ...(routedAgentId ? { wakeAgentIds: [routedAgentId] } : {}),
+      userMentions: mergedUserMentions,
+      // Wake precedence: content-routed pick (no-mention path) > disambiguated
+      // mention wake (prunes same-name duplicates to the live one) > default.
+      ...(routedAgentId
+        ? { wakeAgentIds: [routedAgentId] }
+        : mergedAgentMentions.length > 0
+          ? { wakeAgentIds: finalized.wakeAgentIds }
+          : {}),
     });
+
+    // #3: a mention that landed on an offline agent would silently drop — tell the
+    // channel instead. Skipped on idempotent replay (no double-notice).
+    if (!result.idempotent && finalized.offlineLabels.length > 0) {
+      try {
+        const sysRow = await insertSystemMessage({
+          workroomId: wid,
+          channelId: cid,
+          content: offlineNotice(finalized.offlineLabels),
+          parentMessageId: null,
+        });
+        await writeEventAndBroadcast(sysRow);
+      } catch (err) {
+        app.log.warn({ err }, 'offline-mention notice failed (non-fatal)');
+      }
+    }
 
     // Task #121 S4: mention push for HUMAN mentions (uuid agent mentions ride the WS
     // broadcast + daemon path; humans need APNs). Mentions are NOT gated by the
@@ -702,6 +793,19 @@ export async function messageRoutes(app: FastifyInstance) {
         title: 'You were mentioned',
         body: previewText(body.content, 200),
       }).catch((err) => console.error('[messages] mention push failed', err));
+    }
+
+    // DM push (web/PWA): a direct message has no @-mention but the peer still
+    // wants a notification. Self-gates on channel.visibility==='dm'. Skipped on
+    // idempotent replay. Fire-and-forget.
+    if (!result.idempotent) {
+      const senderUserId = senderKind === 'user' ? senderId : null;
+      notifyDirectMessagePeers({
+        channelId: cid,
+        senderUserId,
+        target: { workroomId: wid, channelId: cid, messageId: result.id, threadId: null },
+        body: previewText(body.content, 200),
+      }).catch((err) => console.error('[messages] dm push failed', err));
     }
 
     // S2 §2-C: return the FULL message wire shape (re-fetched) + idempotent flag.
@@ -935,6 +1039,9 @@ export async function messageRoutes(app: FastifyInstance) {
     if (senderKind === 'user') {
       if (agentMentions.length > 0) {
         threadWake = agentMentions;
+      } else if (userMentions.length > 0) {
+        // 真人 @ 真人(thread 内也一样)→ 不唤醒 owner,只给被 @ 的人发通知。
+        threadWake = [];
       } else {
         const owned = await db.controlTask.findFirst({
           where: { parentMessageId: parentId, ownerInstanceId: { not: null } },
