@@ -14,7 +14,26 @@
  * Re-used by Task 1.3 (history route).
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { db } from '@/storage/db';
+
+/**
+ * Per-request "which channel is this agent session in" hint, sent by the daemon
+ * as `X-Mio-Channel-Hint: <channel uuid>` (set from api.ts's onRequest hook).
+ *
+ * Why: targets are `#name`, and an agent that belongs to two channels with the
+ * same name got 409 AMBIGUOUS_CHANNEL for every send / read / search / task call
+ * — with no way to say "the one I'm talking in". The daemon knows which channel
+ * each runtime session belongs to, so it passes that along; the hint is used
+ * ONLY to break a tie between same-named channels the agent is a member of.
+ */
+export const channelHintStore = new AsyncLocalStorage<string | undefined>();
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Normalise the raw header value into a hint (undefined when absent/invalid). */
+export function parseChannelHint(raw: unknown): string | undefined {
+  return typeof raw === 'string' && UUID_RE.test(raw) ? raw.toLowerCase() : undefined;
+}
 
 // ── Result types ──────────────────────────────────────────────────────────────
 
@@ -88,6 +107,12 @@ export async function resolveAgentChannelTarget(
   }
 
   if (members.length > 1) {
+    // Same-named channels: the session's own channel wins the tie.
+    const hint = channelHintStore.getStore();
+    const hinted = hint ? members.find((m) => m.channelId.toLowerCase() === hint) : undefined;
+    if (hinted) {
+      return { ok: true, channelId: hinted.channelId, workroomId: hinted.channel.workroomId };
+    }
     return {
       ok: false,
       status: 409,

@@ -41,6 +41,7 @@ import { operatorWriteRoutes } from '@/control/operatorSessions/operatorWriteRou
 import { machineEnrollmentRoutes } from '@/control/operatorSessions/machineEnrollmentRoutes';
 import { explanationRoutes } from '@/control/llm/explanationRoutes';
 import { agentApiRoutes } from '@/control/agentApi/agentApiRoutes';
+import { channelHintStore, parseChannelHint } from '@/control/agentApi/agentApiTargets';
 import { agentApiTasks } from '@/control/agentApi/agentApiTasks';
 import { agentApiReminders } from '@/control/agentApi/agentApiReminders';
 import { agentApiChannels } from '@/control/agentApi/agentApiChannels';
@@ -76,6 +77,14 @@ export async function startApi() {
     // Request logging
     app.addHook('onRequest', async (request) => {
         console.log(`${request.method} ${request.url}`);
+    });
+
+    // Agent sessions tell us which channel they are in (X-Mio-Channel-Hint) so
+    // `#name` targets stay resolvable when the agent is in two same-named
+    // channels. Scoped to the rest of this request via AsyncLocalStorage; must be
+    // registered BEFORE the routes (Fastify applies hooks to later routes).
+    app.addHook('onRequest', (request, _reply, done) => {
+        channelHintStore.run(parseChannelHint(request.headers['x-mio-channel-hint']), done);
     });
 
     app.get('/health', async () => ({ status: 'ok' }));

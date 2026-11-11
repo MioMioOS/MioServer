@@ -131,11 +131,15 @@ export async function userAttachments(app: FastifyInstance) {
     // ── Step 3: send binary ──────────────────────────────────────────────────
     const buf = Buffer.from(attachment.data as Uint8Array);
     // Escape any quotes/backslashes in the filename so the header stays valid.
-    const safeFilename = attachment.filename.replace(/["\\]/g, '_');
+    // HTTP header values must be latin1: a non-ASCII filename (e.g. Chinese) used
+    // to throw ERR_INVALID_CHAR and 500 the whole download. Send an ASCII
+    // fallback plus the real name in RFC 5987 form (filename*=UTF-8''…).
+    const asciiFilename = attachment.filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+    const utf8Filename = encodeURIComponent(attachment.filename).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
     return reply
       .code(200)
       .header('Content-Type', attachment.mimeType)
-      .header('Content-Disposition', `inline; filename="${safeFilename}"`)
+      .header('Content-Disposition', `inline; filename="${asciiFilename}"; filename*=UTF-8''${utf8Filename}`)
       .header('Content-Length', String(buf.length))
       .send(buf);
   });

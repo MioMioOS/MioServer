@@ -507,6 +507,9 @@ export async function agentApiRoutes(app: FastifyInstance) {
    *   403 AGENT_NOT_OWNED
    *   404 NOT_A_MEMBER         — agent not a member of any channel by that name
    *   404 MESSAGE_NOT_FOUND    — around short id does not resolve
+   *
+   *   q=<keywords> — keyword search across the channel (incl. thread replies); all
+   *   whitespace-separated keywords must match. Takes precedence over after_seq/around.
    *   409 AMBIGUOUS_CHANNEL    — agent is a member of >1 channel with that name
    */
   app.get('/internal/agent-api/history', async (request, reply) => {
@@ -524,6 +527,7 @@ export async function agentApiRoutes(app: FastifyInstance) {
       after_seq?: string;
       around?: string;
       limit?: string;
+      q?: string;
     };
 
     if (!query.channel || typeof query.channel !== 'string') {
@@ -577,7 +581,30 @@ export async function agentApiRoutes(app: FastifyInstance) {
       parentMessageId: true,
     } as const;
 
-    if (query.after_seq !== undefined) {
+    const keywords = typeof query.q === 'string'
+      ? query.q.split(/\s+/).map((k) => k.trim()).filter((k) => k.length > 0).slice(0, 6)
+      : [];
+
+    if (keywords.length > 0) {
+      // ── Mode 0: q — keyword search over this channel's whole history ───────
+      // Every keyword must appear (case-insensitive substring). Thread replies
+      // are included: "what did we decide about X" is as often answered in a
+      // thread as on the main timeline. Newest matches win when over the limit;
+      // returned seq-ascending like every other mode.
+      const rows = await db.controlMessage.findMany({
+        where: {
+          channelId,
+          senderKind: { not: 'system' },
+          AND: keywords.map((k) => ({ content: { contains: k, mode: 'insensitive' as const } })),
+        },
+        orderBy: { seq: 'desc' },
+        take: limitRaw + 1,
+        select: MESSAGE_SELECT,
+      });
+      hasMore = rows.length > limitRaw;
+      page = rows.slice(0, limitRaw).reverse();
+
+    } else if (query.after_seq !== undefined) {
       // ── Mode 1: after_seq — forward page ──────────────────────────────────
       if (!/^\d+$/.test(query.after_seq)) {
         return reply.code(400).send({ error: { code: 'INVALID_QUERY', message: 'after_seq must be a non-negative integer' } });

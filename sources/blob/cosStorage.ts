@@ -36,10 +36,24 @@ export function cosKeyFor(workroomId: string, attachmentId: string, filename: st
 
 function presign(key: string, method: 'PUT' | 'GET', expiresSec: number): Promise<string> {
   return new Promise((resolve, reject) => {
+    // COS_DOMAIN (image.wdao.chat) is a custom CNAME to the bucket. Two problems
+    // sank it, so we route EVERYTHING to the default COS endpoint
+    // (<bucket>.cos.<region>.myqcloud.com) for now:
+    //   1. It never accepted PUT (CDN/CNAME is read-only) → every >8 MiB browser
+    //      upload silently fell back to the 8 MiB base64 path and failed.
+    //   2. 2026-10-14: its TLS certificate EXPIRED → any HTTPS fetch to it fails
+    //      cert verification ("fetch failed" server-side, cert error in browsers).
+    //      That 500'd agent attachment delivery (server fetches bytes internally
+    //      to re-serve as base64) and broke in-browser image display/download.
+    // The default endpoint has valid TLS, accepts PUT, and its bucket CORS already
+    // allows the app origin. Re-enable the custom domain (for GET only) by
+    // restoring `method === 'GET' && !!DOMAIN` once image.wdao.chat serves a
+    // valid certificate again.
+    const useDomain = false && method === 'GET' && !!DOMAIN;
     cos!.getObjectUrl(
       {
         Bucket: BUCKET, Region: REGION, Key: key, Method: method, Sign: true, Expires: expiresSec,
-        ...(DOMAIN ? { Domain: DOMAIN, Protocol: 'https:' } : {}),
+        ...(useDomain ? { Domain: DOMAIN, Protocol: 'https:' } : {}),
       },
       (err, data) => (err ? reject(err) : resolve(data.Url)),
     );
