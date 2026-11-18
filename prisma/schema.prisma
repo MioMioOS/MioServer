@@ -1348,3 +1348,41 @@ model ControlMessageReaction {
   @@index([messageId])
   @@map("control_message_reactions")
 }
+
+/// Live terminal view (CLI mode). One row per stream event a runtime produced in
+/// a channel session: assistant text, thinking, a tool call, its result, shell
+/// output. Owner-only to read; purged after 2 days (see cliRoutes.ts).
+/// Plain FK columns, no relations — rows are disposable.
+model ControlCliEvent {
+  id         BigInt   @id @default(autoincrement())
+  workroomId String   @map("workroom_id") @db.Uuid
+  channelId  String   @map("channel_id") @db.Uuid
+  agentId    String   @map("agent_id") @db.Uuid
+  kind       String // text | thinking | tool_use | tool_result | input | shell_cmd | shell_out | shell_exit | system
+  payload    Json
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([channelId, id])
+  @@index([createdAt])
+  @@map("control_cli_events")
+}
+
+/// Something the workspace owner typed into the terminal view, waiting for the
+/// agent's daemon to pick it up. The WS tick that announces it carries no text
+/// (other members are on the same socket); the daemon fetches it over its
+/// machine-authenticated channel. Purged after 2 days.
+model ControlCliInput {
+  id         String    @id @default(uuid()) @db.Uuid
+  workroomId String    @map("workroom_id") @db.Uuid
+  channelId  String    @map("channel_id") @db.Uuid
+  agentId    String    @map("agent_id") @db.Uuid
+  kind       String // prompt | shell | command
+  text       String
+  createdBy  String    @map("created_by")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  consumedAt DateTime? @map("consumed_at")
+
+  @@index([agentId, consumedAt])
+  @@index([createdAt])
+  @@map("control_cli_inputs")
+}

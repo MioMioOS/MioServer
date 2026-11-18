@@ -53,6 +53,7 @@ import { preparedActionOperatorRoutes } from '@/control/actions/preparedActionOp
 import { agentApiProfile } from '@/control/profile/agentApiProfile';
 import { agentApiTyping } from '@/control/agentApi/agentApiTyping';
 import { agentApiStatus } from '@/control/agentApi/agentApiStatus';
+import { cliRoutes } from '@/control/cli/cliRoutes';
 import { agentApiThreads } from '@/control/agentApi/agentApiThreads';
 import { registerEmptyJsonBodyParser } from '@/jsonBodyParser';
 import { provisionCredentialStore } from '@/control/credentials/provisionCredentialStore';
@@ -144,6 +145,7 @@ await app.register(slockTaskRoutes);
     await app.register(agentApiStatus);
     await app.register(agentApiThreads);
     await app.register(previewRoutes);
+    await app.register(cliRoutes);
 
     await app.listen({ port: config.port, host: config.host });
     console.log(`CodeLight Server listening on port ${config.port}`);
