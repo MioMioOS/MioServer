@@ -558,11 +558,11 @@ export async function channelRoutes(app: FastifyInstance) {
     if (channelType === 'client') {
       const lc = typeof body?.linked_channel_id === 'string' ? body.linked_channel_id : null;
       if (!lc) {
-        return reply.code(400).send({ error: { code: 'LINKED_REQUIRED', message: '客户频道必须关联一个内部开发频道' } });
+        return reply.code(400).send({ error: { code: 'LINKED_REQUIRED', message: 'a client channel must be linked to an internal dev channel' } });
       }
       const linked = await db.controlChannel.findUnique({ where: { id: lc }, select: { workroomId: true, type: true } });
       if (!linked || linked.workroomId !== wid || linked.type === 'client' || linked.type === 'dm') {
-        return reply.code(400).send({ error: { code: 'INVALID_LINKED', message: '关联频道无效' } });
+        return reply.code(400).send({ error: { code: 'INVALID_LINKED', message: 'the linked channel is invalid' } });
       }
       linkedChannelId = lc;
     }

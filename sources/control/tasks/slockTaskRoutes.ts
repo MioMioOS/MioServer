@@ -455,7 +455,7 @@ export async function slockTaskRoutes(app: FastifyInstance) {
       ? sourceChannel.linkedChannelId
       : targetChannelId;
     if (!effectiveTarget) {
-      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'target_channel_id is required (客户频道未关联内部频道时必须指定)' } });
+      return reply.code(400).send({ error: { code: 'INVALID_BODY', message: 'target_channel_id is required when the client channel has no linked internal channel' } });
     }
     const target = await db.controlChannel.findUnique({
       where: { id: effectiveTarget }, select: { id: true, workroomId: true, name: true },
