@@ -1358,7 +1358,7 @@ model ControlCliEvent {
   workroomId String   @map("workroom_id") @db.Uuid
   channelId  String   @map("channel_id") @db.Uuid
   agentId    String   @map("agent_id") @db.Uuid
-  kind       String // text | thinking | tool_use | tool_result | input | shell_cmd | shell_out | shell_exit | system
+  kind       String // text | thinking | tool_use | tool_result | input | shell_cmd | shell_out | shell_exit | system | turn | file
   payload    Json
   createdAt  DateTime @default(now()) @map("created_at")
 
@@ -1376,11 +1376,13 @@ model ControlCliInput {
   workroomId String    @map("workroom_id") @db.Uuid
   channelId  String    @map("channel_id") @db.Uuid
   agentId    String    @map("agent_id") @db.Uuid
-  kind       String // prompt | shell | command
+  kind       String // prompt | shell | command | file
   text       String
   createdBy  String    @map("created_by")
   createdAt  DateTime  @default(now()) @map("created_at")
   consumedAt DateTime? @map("consumed_at")
+  /// Extras for the daemon: { attachment_ids: string[] } for a prompt with files.
+  meta       Json?
 
   @@index([agentId, consumedAt])
   @@index([createdAt])
